@@ -1,20 +1,54 @@
-//! Vector index — exhaustive cosine for now; HNSW lands in Phase 2.2.
+//! Vector index — HNSW (Hierarchical Navigable Small World).
+//!
+//! Phase 2.2 — backed by [`hnsw_rs`] cosine HNSW. Sub-linear search
+//! latency that scales to multi-million points.
+//!
+//! Tunables (compile-time constants for now; per-table config in Phase 3):
+//! - `M = 16`            — max graph degree per layer
+//! - `EF_CONSTRUCTION`   — build-time candidate-pool size (200)
+//! - `EF_SEARCH`         — query-time candidate-pool size (64)
+//! - `MAX_LAYERS`        — HNSW layer cap (16)
+//! - `MAX_ELEMENTS`      — pre-allocated capacity (1 M)
+//!
+//! [`hnsw_rs`]: https://crates.io/crates/hnsw_rs
 
 use duxx_core::{Error, Result};
+use hnsw_rs::prelude::{DistCosine, Hnsw};
+use parking_lot::RwLock;
 
-/// Exhaustive cosine vector index. Linear-scan, suitable up to ~10 k vectors.
+const M: usize = 16;
+const MAX_ELEMENTS: usize = 1_000_000;
+const MAX_LAYERS: usize = 16;
+const EF_CONSTRUCTION: usize = 200;
+const EF_SEARCH: usize = 64;
+
+/// HNSW vector index over cosine distance.
 ///
-/// Replaced by `hnsw_rs::Hnsw` in Phase 2.2 — same public API, sub-linear
-/// search.
-#[derive(Debug, Clone)]
+/// `hnsw_rs::Hnsw` uses `usize` internal point ids; we map them onto the
+/// caller's `u64` ids via an internal `Vec<u64>`.
 pub struct VectorIndex {
     dim: usize,
-    vectors: Vec<(u64, Vec<f32>)>,
+    inner: RwLock<HnswInner>,
+}
+
+struct HnswInner {
+    hnsw: Hnsw<'static, f32, DistCosine>,
+    next_internal: usize,
+    /// internal index → external id
+    id_map: Vec<u64>,
 }
 
 impl VectorIndex {
     pub fn new(dim: usize) -> Self {
-        Self { dim, vectors: Vec::new() }
+        let hnsw = Hnsw::new(M, MAX_ELEMENTS, MAX_LAYERS, EF_CONSTRUCTION, DistCosine);
+        Self {
+            dim,
+            inner: RwLock::new(HnswInner {
+                hnsw,
+                next_internal: 0,
+                id_map: Vec::new(),
+            }),
+        }
     }
 
     pub fn dim(&self) -> usize {
@@ -29,32 +63,54 @@ impl VectorIndex {
                 vec.len()
             )));
         }
-        self.vectors.push((id, vec));
+        let mut inner = self.inner.write();
+        let internal = inner.next_internal;
+        inner.id_map.push(id);
+        inner.next_internal += 1;
+        // hnsw_rs copies the slice contents internally on insert.
+        inner.hnsw.insert((&vec, internal));
         Ok(())
     }
 
     /// Top-`k` ids by cosine similarity, descending.
+    ///
+    /// `hnsw_rs` returns *distance* (1 − cos for `DistCosine`); we flip
+    /// to similarity so higher = better, matching the prior placeholder.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        let mut scored: Vec<(u64, f32)> = self
-            .vectors
-            .iter()
-            .map(|(id, v)| (*id, cosine(query, v)))
-            .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        scored
+        let inner = self.inner.read();
+        let neighbours = inner.hnsw.search(query, k, EF_SEARCH);
+        neighbours
+            .into_iter()
+            .filter_map(|n| {
+                let id = inner.id_map.get(n.d_id)?;
+                let similarity = 1.0 - n.distance;
+                Some((*id, similarity))
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.vectors.len()
+        self.inner.read().id_map.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.len() == 0
+    }
+}
+
+impl std::fmt::Debug for VectorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorIndex")
+            .field("dim", &self.dim)
+            .field("len", &self.len())
+            .finish_non_exhaustive()
     }
 }
 
 /// Cosine similarity between two equal-length vectors.
+///
+/// Kept as a free function for callers that want it without going through
+/// the index (e.g. unit tests, ad-hoc rerankers).
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());
     let mut dot = 0.0f32;
@@ -80,12 +136,31 @@ mod tests {
     }
 
     #[test]
-    fn vector_index_finds_self_first() {
+    fn hnsw_finds_self_first() {
         let mut idx = VectorIndex::new(3);
         idx.insert(1, vec![1.0, 0.0, 0.0]).unwrap();
         idx.insert(2, vec![0.0, 1.0, 0.0]).unwrap();
-        let hits = idx.search(&[1.0, 0.0, 0.0], 2);
-        assert_eq!(hits[0].0, 1);
+        idx.insert(3, vec![0.0, 0.0, 1.0]).unwrap();
+        let hits = idx.search(&[1.0, 0.0, 0.0], 3);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, 1, "self should be top-1");
+    }
+
+    #[test]
+    fn hnsw_orders_by_similarity() {
+        let mut idx = VectorIndex::new(3);
+        // Two clusters: near (1,0,0) and near (0,1,0).
+        idx.insert(1, vec![1.0, 0.0, 0.0]).unwrap();
+        idx.insert(2, vec![0.95, 0.1, 0.0]).unwrap();
+        idx.insert(3, vec![0.0, 1.0, 0.0]).unwrap();
+        let hits = idx.search(&[1.0, 0.0, 0.0], 3);
+        assert!(hits.len() >= 2);
+        // Doc 3 should rank below 1 and 2.
+        let doc3 = hits.iter().position(|h| h.0 == 3);
+        let doc1 = hits.iter().position(|h| h.0 == 1).unwrap();
+        if let Some(p3) = doc3 {
+            assert!(doc1 < p3);
+        }
     }
 
     #[test]
@@ -93,5 +168,14 @@ mod tests {
         let mut idx = VectorIndex::new(3);
         let err = idx.insert(1, vec![1.0, 0.0]).unwrap_err();
         assert!(matches!(err, Error::Index(_)));
+    }
+
+    #[test]
+    fn len_tracks_inserts() {
+        let mut idx = VectorIndex::new(2);
+        assert_eq!(idx.len(), 0);
+        idx.insert(1, vec![1.0, 0.0]).unwrap();
+        idx.insert(2, vec![0.0, 1.0]).unwrap();
+        assert_eq!(idx.len(), 2);
     }
 }

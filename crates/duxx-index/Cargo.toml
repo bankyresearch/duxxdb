@@ -13,3 +13,4 @@ duxx-core.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 tantivy.workspace = true
+hnsw_rs.workspace = true
