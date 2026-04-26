@@ -1,0 +1,24 @@
+[package]
+name = "duxx-cli"
+description = "duxx — interactive shell and admin CLI for DuxxDB."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "duxx"
+path = "src/main.rs"
+
+[[example]]
+name = "chatbot_memory"
+path = "examples/chatbot_memory.rs"
+
+[dependencies]
+duxx-core.workspace = true
+duxx-memory.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

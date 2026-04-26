@@ -1,0 +1,43 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# (Note: the project-level `.cargo/config.toml` IS committed — it pins
+# the Windows toolchain workaround. Don't ignore the whole .cargo dir.)
+
+# Runtime data
+data/
+*.redb
+*.lance
+*.wal
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python bindings
+bindings/python/target/
+bindings/python/dist/
+bindings/python/*.egg-info/
+bindings/python/__pycache__/
+
+# Node bindings
+bindings/node/node_modules/
+bindings/node/dist/
+bindings/node/*.node
+
+# Claude Code session metadata
+.claude/
+
+# OS
+*.swp
+*.swo

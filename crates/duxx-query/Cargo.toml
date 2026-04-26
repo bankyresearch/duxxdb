@@ -1,0 +1,15 @@
+[package]
+name = "duxx-query"
+description = "DuxxDB hybrid query engine — vector + BM25 fused via Reciprocal Rank Fusion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duxx-core.workspace = true
+duxx-index.workspace = true
+duxx-storage.workspace = true
+tracing.workspace = true

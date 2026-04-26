@@ -1,0 +1,18 @@
+DuxxDB
+Copyright 2026 DuxxDB Contributors
+
+This product includes software developed as part of the DuxxDB project
+(https://github.com/duxxdb/duxxdb).
+
+Licensed under the Apache License, Version 2.0. See LICENSE for details.
+
+----------------------------------------------------------------------
+This product integrates or depends on the following Apache 2.0 projects:
+  * Apache Arrow (https://arrow.apache.org)
+  * Apache DataFusion (https://github.com/apache/datafusion)
+  * Lance (https://github.com/lancedb/lance) — LanceDB, Inc.
+  * usearch (https://github.com/unum-cloud/usearch) — Unum Cloud
+  * tantivy (https://github.com/quickwit-oss/tantivy) — Quickwit
+  * redb (https://github.com/cberner/redb) — Christopher Berner
+Each project is licensed under its own terms; see its repository for
+full license text.

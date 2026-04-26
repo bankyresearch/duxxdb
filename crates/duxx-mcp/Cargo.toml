@@ -1,0 +1,17 @@
+[package]
+name = "duxx-mcp"
+description = "Model Context Protocol server for DuxxDB. Phase-3."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duxx-core.workspace = true
+duxx-memory.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

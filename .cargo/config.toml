@@ -1,0 +1,29 @@
+# Cargo configuration for the DuxxDB workspace.
+#
+# We build with the GNU (MinGW-w64) toolchain on Windows while the
+# Visual Studio Windows SDK is not installed. This avoids the
+# MSVC link.exe → missing kernel32.lib problem. The rustup-provided
+# `stable-x86_64-pc-windows-gnu` toolchain ships its own linker
+# (ld.exe) and import libs, so builds work out of the box.
+#
+# To switch back to MSVC later (after installing the Windows 11 SDK):
+#   1. rustup default stable-x86_64-pc-windows-msvc
+#   2. reintroduce the [target.x86_64-pc-windows-msvc] linker override
+#      and run builds from a VS Developer Command Prompt (or via
+#      scripts/build.bat).
+
+[build]
+# Parallel codegen + incremental for faster dev rebuilds.
+incremental = true
+
+# NOTE ON THE GNU TOOLCHAIN ON WINDOWS
+#
+# rustup's bundled "self-contained" mingw under
+#   $(rustc --print sysroot)/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained/
+# is incomplete on Windows — `dlltool.exe` is there but tries to spawn
+# `gcc`/`as` which aren't.
+#
+# Workaround: install full WinLibs MinGW via:
+#   winget install BrechtSanders.WinLibs.POSIX.MSVCRT
+# and run cargo via `scripts/build.sh` (Git Bash) or the same PATH prefix.
+# See docs/SETUP.md for details.

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/duxx-core",
+    "crates/duxx-storage",
+    "crates/duxx-index",
+    "crates/duxx-query",
+    "crates/duxx-memory",
+    "crates/duxx-reactive",
+    "crates/duxx-server",
+    "crates/duxx-mcp",
+    "crates/duxx-cli",
+    "crates/duxx-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["DuxxDB Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/duxxdb/duxxdb"
+homepage = "https://github.com/duxxdb/duxxdb"
+readme = "README.md"
+
+[workspace.dependencies]
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+bytes = "1"
+parking_lot = "0.12"
+
+# Internal crates (consumed by siblings)
+duxx-core = { path = "crates/duxx-core", version = "0.1.0" }
+duxx-storage = { path = "crates/duxx-storage", version = "0.1.0" }
+duxx-index = { path = "crates/duxx-index", version = "0.1.0" }
+duxx-query = { path = "crates/duxx-query", version = "0.1.0" }
+duxx-memory = { path = "crates/duxx-memory", version = "0.1.0" }
+duxx-reactive = { path = "crates/duxx-reactive", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+opt-level = 3
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+debug = 1

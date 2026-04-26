@@ -1,0 +1,14 @@
+[package]
+name = "duxx-index"
+description = "DuxxDB index layer — vector (HNSW placeholder) and text (BM25 placeholder)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duxx-core.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true

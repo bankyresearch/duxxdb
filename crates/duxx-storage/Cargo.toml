@@ -1,0 +1,18 @@
+[package]
+name = "duxx-storage"
+description = "DuxxDB storage engine — columnar table with mixed scalar, text, and vector columns."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duxx-core.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
