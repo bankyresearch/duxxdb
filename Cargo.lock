@@ -432,12 +432,13 @@ dependencies = [
 name = "duxx-mcp"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "duxx-core",
  "duxx-memory",
  "serde",
  "serde_json",
- "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -476,10 +477,14 @@ dependencies = [
 name = "duxx-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bytes",
  "duxx-core",
  "duxx-memory",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [package]
 name = "duxx-server"
-description = "DuxxDB network daemon — gRPC + RESP3. Phase-3."
+description = "DuxxDB network daemon \u2014 Phase 3.2 RESP2/3 TCP server (Valkey/Redis-compatible)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,19 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "duxx-server"
+path = "src/main.rs"
+
 [dependencies]
 duxx-core.workspace = true
 duxx-memory.workspace = true
 tokio.workspace = true
+bytes.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
