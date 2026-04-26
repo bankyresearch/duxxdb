@@ -40,9 +40,32 @@ Goal: working in-process database with hybrid search on 1M rows.
 
 ---
 
-## Phase 2 — Agent primitives (Week 3)
+## Phase 2 — Production indices (in progress)
 
-- [ ] `duxx-memory::MEMORY` — auto-embedding on insert
+- [x] **2.1** — Replace placeholder `TextIndex` with [tantivy] BM25
+- [x] **2.2** — Replace placeholder `VectorIndex` with [hnsw_rs] HNSW
+- [x] **2.5** — Batched tantivy commits + auto-flush on read
+      (≈30× bulk-insert speedup)
+- [ ] **2.3** — Lance-backed `Table` for durable storage. See
+      [PHASE_2_3_PLAN.md](./PHASE_2_3_PLAN.md). Deferred to its own
+      session because of the dependency footprint and FFI risk on
+      Windows + mingw.
+
+[tantivy]: https://github.com/quickwit-oss/tantivy
+[hnsw_rs]: https://crates.io/crates/hnsw_rs
+
+**Measured (Phase 2.5, debug release, single thread, 100 k vector capacity):**
+- recall  @ 100 docs:   123 µs median
+- recall  @ 1 k docs:   166 µs median
+- recall  @ 10 k docs:  373 µs median   (target: < 10 ms — beating 25×)
+- bulk insert 100 docs: 14 ms total
+- bulk insert 1 k  docs: 342 ms total
+
+---
+
+## Phase 2.6 — Agent primitives (next)
+
+- [ ] `duxx-memory::Memory` — auto-embedding on insert
 - [ ] `duxx-memory::TOOL_CACHE` — exact + semantic-near-hit lookup
 - [ ] `duxx-memory::SESSION` — hot KV with auto-flush
 - [ ] Pluggable embedding providers: OpenAI, Cohere, local BGE
