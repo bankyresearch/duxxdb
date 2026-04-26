@@ -77,12 +77,16 @@ Goal: working in-process database with hybrid search on 1M rows.
 ## Phase 3 — Server + bindings (Phase 3.1 done; rest planned)
 
 - [x] **3.1** — `duxx-mcp` JSON-RPC 2.0 stdio server with `remember` /
-      `recall` / `stats` tools. **Working today** — connect any MCP
-      agent (Claude Desktop, Cline) by pointing its config at the
-      `duxx-mcp` binary.
-- [ ] **3.2** — `duxx-server` gRPC + RESP3 daemon
-- [ ] **3.3** — Python bindings (`bindings/python`, PyO3 + maturin)
+      `recall` / `stats` tools. Connect any MCP agent (Claude Desktop,
+      Cline) by pointing its config at the `duxx-mcp` binary.
+- [x] **3.2** — `duxx-server` RESP2/3 daemon (Valkey/Redis-compatible).
+      `valkey-cli`, `redis-cli`, redis-rs / node-redis / go-redis all
+      work unchanged.
+- [x] **3.3** — Python bindings (`bindings/python`, PyO3 + maturin
+      abi3-py38). Single wheel works on Python 3.8 through 3.13.
+      `pip install duxxdb && import duxxdb`.
 - [ ] **3.4** — TypeScript bindings (`bindings/node`, napi-rs)
+- [ ] **3.5** — gRPC daemon for typed cross-language streaming
 
 ---
 

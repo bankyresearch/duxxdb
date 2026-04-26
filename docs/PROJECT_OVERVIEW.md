@@ -252,13 +252,38 @@ redis-cli -p 6379
 3) "{\"table\":\"memory\",\"row_id\":7,\"kind\":\"insert\"}"
 ```
 
+### ✅ Phase 3.3 — Python bindings
+
+[`bindings/python`](../bindings/python) ships a PyO3 + maturin
+extension module compiled against the stable Python ABI
+(`abi3-py38`). One wheel works on **Python 3.8 through 3.13**.
+
+```bash
+cd bindings/python
+maturin build --release
+pip install ../../target/wheels/duxxdb-0.1.0-cp38-abi3-*.whl
+```
+
+```python
+import duxxdb
+store = duxxdb.MemoryStore(dim=4)
+store.remember(key="alice", text="hello", embedding=[1.0, 0.0, 0.0, 0.0])
+hits = store.recall(key="alice", query="hello",
+                    embedding=[1.0, 0.0, 0.0, 0.0], k=5)
+print(hits[0])
+# <MemoryHit id=1 score=0.0328 text="hello">
+```
+
+Also available: `duxxdb.ToolCache` (semantic-near-hit) and
+`duxxdb.SessionStore` (sliding-TTL KV).
+
 ### 🚧 Still to do
 
 | Phase | Component | Status |
 |---|---|---|
 | 2.3 | Lance-backed `Table` (durable storage) | Plan written ([PHASE_2_3_PLAN.md](PHASE_2_3_PLAN.md)); next session |
-| 3.3 | Python bindings (PyO3 + maturin) | Designed |
 | 3.4 | TypeScript bindings (napi-rs) | Designed |
+| 3.5 | gRPC daemon for typed cross-language streaming | Designed |
 | 4.5 | Pattern-subscribe (`PSUBSCRIBE`), per-key filters | Designed |
 | 4.5 | Comparative bench vs Redis / Qdrant / pgvector / LanceDB | Designed |
 | 5 | Lakehouse cold-tier export (Iceberg / Delta) | Designed |
