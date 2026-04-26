@@ -53,11 +53,17 @@ hits = db.recall(user="user_42", query="refund issue", k=10)
 
 ---
 
-## Architecture
+## Documentation
 
-See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the full design.
+- **[docs/PROJECT_OVERVIEW.md](./docs/PROJECT_OVERVIEW.md)** — capabilities, competitive landscape, install + quickstart, performance numbers. **Start here.**
+- **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)** — full system design.
+- **[docs/SETUP.md](./docs/SETUP.md)** — install log + cross-platform notes.
+- **[docs/ROADMAP.md](./docs/ROADMAP.md)** — phased plan + status.
+- **[docs/PHASE_2_3_PLAN.md](./docs/PHASE_2_3_PLAN.md)** — Lance integration plan for the next session.
 
-Short version: Rust workspace, embedded-first, Lance for storage, usearch for vectors, tantivy for BM25, DataFusion for SQL, all glued together with a DuxxDB-native hybrid query planner. Server mode (gRPC + RESP3 + MCP) ships in Phase 3.
+## Architecture (short version)
+
+Rust workspace, embedded-first. tantivy BM25 + hnsw_rs HNSW shipping today; Lance for storage, DataFusion for SQL, gRPC + RESP3 + MCP server in subsequent phases.
 
 ---
 
