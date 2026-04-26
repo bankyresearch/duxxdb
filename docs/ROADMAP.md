@@ -99,17 +99,22 @@ Goal: working in-process database with hybrid search on 1M rows.
 
 ---
 
-## Phase 4 — Reactive + benchmark (Week 6)
+## Phase 4 — Reactive subscriptions (mostly done)
 
-- [ ] `duxx-reactive`: WAL tailer + subscriptions
-- [ ] `SUBSCRIBE` over gRPC streaming + MCP SSE
-- [ ] `duxx-bench`:
-  - [ ] Micro: insert, point-read, vector-search, hybrid recall
-  - [ ] Comparison: Redis, Qdrant, pgvector, LanceDB on identical workload
-- [ ] Public benchmark report (Markdown + charts)
-- [ ] **v0.1.0 release tag**
+- [x] `duxx-reactive::ChangeBus` over `tokio::sync::broadcast`
+- [x] `MemoryStore::subscribe()` + `remember()` publishes `ChangeEvent`
+- [x] `SUBSCRIBE` / `UNSUBSCRIBE` over RESP — verified live with
+      Python clients across two connections
+- [x] Redis pub/sub `message`-format pushes carrying JSON ChangeEvents
+- [x] Phase 4 micro-benchmarks: hybrid recall, single insert, bulk insert
+- [ ] WAL tailer (durable resume tokens) — depends on Phase 2.3 (Lance)
+- [ ] Comparative benchmarks vs Redis/Qdrant/pgvector/LanceDB on
+      identical workloads
+- [ ] Pattern subscribe (`PSUBSCRIBE`) + per-key filtering — Phase 4.5
+- [ ] **v0.1.0 release tag** — after Phase 2.3 lands
 
-**Exit criterion:** published benchmark showing we meet or beat all targets in ARCHITECTURE §1.
+**Status:** the in-process reactive path works end to end. Network
+durability (resume after crash) waits on Lance.
 
 ---
 

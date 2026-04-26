@@ -207,15 +207,60 @@ Cline, …) at it, and you get three tools: `remember`, `recall`, `stats`.
 }
 ```
 
+### ✅ Phase 3.2 — RESP2/3 TCP server
+
+[`duxx-server`](../crates/duxx-server) ships a `valkey-cli` /
+`redis-cli` compatible TCP server. Standard commands (`PING`,
+`HELLO`, `COMMAND`, `INFO`, `SET`, `GET`, `DEL`, `QUIT`) plus DuxxDB
+extensions (`REMEMBER`, `RECALL`, `SUBSCRIBE`, `UNSUBSCRIBE`).
+
+```bash
+duxx-server --addr 127.0.0.1:6379
+redis-cli -p 6379
+> REMEMBER alice "I lost my wallet"
+(integer) 1
+> RECALL alice "wallet" 2
+1) 1) (integer) 1
+   2) "0.032787"
+   3) "I lost my wallet"
+```
+
+### ✅ Phase 4 (in-process) — Reactive subscriptions
+
+`MemoryStore::remember()` publishes a `ChangeEvent` to a
+`tokio::sync::broadcast` bus. RESP clients can `SUBSCRIBE memory` and
+receive Redis-format push messages whenever any other connection
+writes a memory.
+
+```bash
+# terminal 1
+redis-cli -p 6379
+> SUBSCRIBE memory
+1) "subscribe"
+2) "memory"
+3) (integer) 1
+# now waiting for events…
+
+# terminal 2
+redis-cli -p 6379
+> REMEMBER alice "fresh memory"
+(integer) 7
+
+# terminal 1 immediately receives:
+1) "message"
+2) "memory"
+3) "{\"table\":\"memory\",\"row_id\":7,\"kind\":\"insert\"}"
+```
+
 ### 🚧 Still to do
 
 | Phase | Component | Status |
 |---|---|---|
-| 2.3 | Lance-backed `Table` | Plan written ([PHASE_2_3_PLAN.md](PHASE_2_3_PLAN.md)); next session |
-| 3.2 | gRPC + RESP3 server | Designed |
+| 2.3 | Lance-backed `Table` (durable storage) | Plan written ([PHASE_2_3_PLAN.md](PHASE_2_3_PLAN.md)); next session |
 | 3.3 | Python bindings (PyO3 + maturin) | Designed |
 | 3.4 | TypeScript bindings (napi-rs) | Designed |
-| 4 | Reactive subscriptions over hybrid filters, comparative bench | Designed |
+| 4.5 | Pattern-subscribe (`PSUBSCRIBE`), per-key filters | Designed |
+| 4.5 | Comparative bench vs Redis / Qdrant / pgvector / LanceDB | Designed |
 | 5 | Lakehouse cold-tier export (Iceberg / Delta) | Designed |
 | 6 | Distributed mode, RBAC, observability | Future |
 
