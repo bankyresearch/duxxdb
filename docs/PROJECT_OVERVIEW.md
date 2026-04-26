@@ -320,7 +320,9 @@ Full architecture spec: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 |                       | Vector ANN | BM25 | Structured | Embedded | Server | Reactive | Agent prims | MCP | License | Lang |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|---|---|
-| **Redis / DiceDB**    | ✗      | ✗    | ⚠         | ✗       | ✅      | ✅       | ✗          | ✗  | BSD/AGPL | C / Go |
+| **Redis** (post-2024) | ✗      | ✗    | ⚠         | ✗       | ✅      | ✅       | ✗          | ✗  | RSALv2/SSPL (non-OSS) | C |
+| **Valkey**            | ⚠ (module) | ⚠ (module) | ⚠ | ✗       | ✅      | ✅       | ✗          | ✗  | BSD-3 | C |
+| **DiceDB**            | ✗      | ✗    | ⚠         | ✗       | ✅      | ✅       | ✗          | ✗  | AGPL | Go |
 | **Qdrant**            | ✅      | ⚠    | ⚠         | ✗       | ✅      | ⚠       | ✗          | ✗  | Apache 2 | Rust |
 | **Pinecone**          | ✅      | ✗    | ⚠         | ✗       | ✅      | ✗       | ✗          | ✗  | Proprietary | (closed) |
 | **Milvus**            | ✅      | ⚠    | ✅         | ✗       | ✅      | ✗       | ✗          | ✗  | Apache 2 | Go / C++ |
@@ -334,9 +336,11 @@ Full architecture spec: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ### When each one is the right choice
 
-- **Pure KV with reactive (sessions only):** Redis or DiceDB. They're
-  battle-tested at this single job; we don't try to replace them
-  unless you're tired of the multi-store glue.
+- **Pure KV with reactive (sessions only):** **Valkey** is now the
+  default open-source answer (BSD-3, Linux Foundation, AWS/Google/Snap
+  backed) — Redis 7.2.4 fork after Redis Labs went non-OSS in 2024.
+  DiceDB if you want reactive-first design. We don't try to replace
+  any of them at the raw KV job; we coexist (see below).
 - **Pure vector search at scale:** Qdrant if you're already in Rust,
   Pinecone if you want hosted, Milvus if you need distributed.
 - **You're already on Postgres:** pgvector. Don't add another store.
@@ -345,6 +349,33 @@ Full architecture spec: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 - **Pre-built RAG with batteries:** ChromaDB, LlamaIndex+Postgres.
 - **Building an agent and starting fresh:** **DuxxDB.** Single dep,
   hybrid retrieval, no glue, agent primitives.
+
+### Coexistence with Valkey / Redis / DiceDB
+
+DuxxDB is **not** trying to be the new KV cache. Valkey already wins
+at that job — battle-tested at hyperscale, decade of operational
+experience, every cloud has managed offerings.
+
+The clean architecture:
+
+```
+┌──────────────────────────────────┐
+│ Valkey / Redis (RESP3)           │  ← session blobs, rate limits,
+│ ~50 µs reads, distributed        │     pubsub, dedup keys
+└─────────┬────────────────────────┘
+          │
+          ▼
+┌──────────────────────────────────┐
+│ DuxxDB                            │  ← agent memory, tool cache,
+│ ~200 µs hybrid recall             │     hybrid recall, MCP
+└──────────────────────────────────┘
+```
+
+**Wire-protocol bonus:** [Phase 3.2](ROADMAP.md) ships a RESP3
+TCP server. That means **`valkey-cli`, `redis-cli`, and any RESP
+client speak DuxxDB out of the box**. Custom commands (`REMEMBER`,
+`RECALL`) live alongside standard `PING` / `SET` / `GET` so existing
+Redis muscle-memory transfers. Engineers don't learn a new client.
 
 ### Honest weaknesses today
 
