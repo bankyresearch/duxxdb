@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 duxx-core.workspace = true
 duxx-memory.workspace = true
+duxx-reactive.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true

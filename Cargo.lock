@@ -448,9 +448,12 @@ dependencies = [
  "duxx-core",
  "duxx-index",
  "duxx-query",
+ "duxx-reactive",
  "duxx-storage",
  "parking_lot",
  "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 
@@ -481,6 +484,7 @@ dependencies = [
  "bytes",
  "duxx-core",
  "duxx-memory",
+ "duxx-reactive",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

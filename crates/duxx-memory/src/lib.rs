@@ -14,10 +14,12 @@ pub mod tool_cache;
 use duxx_core::Result;
 use duxx_index::{TextIndex, VectorIndex};
 use duxx_query::{hybrid_recall, RecallHit};
+use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::broadcast;
 
 pub use session::{SessionStore, DEFAULT_TTL as DEFAULT_SESSION_TTL};
 pub use tool_cache::{HitKind, ToolCache, ToolCacheHit, DEFAULT_NEAR_HIT_THRESHOLD};
@@ -69,6 +71,7 @@ struct Inner {
     vector_index: RwLock<VectorIndex>,
     text_index: RwLock<TextIndex>,
     next_id: RwLock<u64>,
+    bus: ChangeBus,
 }
 
 impl MemoryStore {
@@ -86,8 +89,19 @@ impl MemoryStore {
                 vector_index: RwLock::new(VectorIndex::with_capacity(dim, capacity)),
                 text_index: RwLock::new(TextIndex::new()),
                 next_id: RwLock::new(1),
+                bus: ChangeBus::default(),
             }),
         }
+    }
+
+    /// Subscribe to change events on this store. Each `remember` call
+    /// publishes one [`ChangeEvent`] (table = `"memory"`).
+    ///
+    /// The receiver lives behind a [`tokio::sync::broadcast`] channel —
+    /// slow subscribers may miss messages if the buffer (default 1024)
+    /// is exceeded.
+    pub fn subscribe(&self) -> broadcast::Receiver<ChangeEvent> {
+        self.inner.bus.subscribe()
     }
 
     pub fn dim(&self) -> usize {
@@ -121,14 +135,21 @@ impl MemoryStore {
         self.inner.text_index.write().insert(id, text.clone())?;
         let mem = Memory {
             id,
-            key,
-            text,
+            key: key.clone(),
+            text: text.clone(),
             embedding,
             importance: 1.0,
             created_at: Instant::now(),
         };
         self.inner.by_id.write().insert(id, mem);
-        tracing::debug!(id, "remembered");
+        // Publish a change event. Lossy by design — slow subscribers
+        // may miss events; durability is the storage layer's job.
+        self.inner.bus.publish(ChangeEvent {
+            table: "memory".to_string(),
+            row_id: id,
+            kind: ChangeKind::Insert,
+        });
+        tracing::debug!(id, key = %key, "remembered");
         Ok(id)
     }
 

@@ -27,10 +27,12 @@
 pub mod resp;
 
 use duxx_memory::{MemoryStore, SessionStore};
+use duxx_reactive::{ChangeEvent, ChangeKind};
 use resp::RespValue;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 
 pub const SERVER_NAME: &str = "duxxdb";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -108,23 +110,42 @@ impl Server {
     async fn handle_connection(&self, mut socket: TcpStream) -> anyhow::Result<()> {
         let mut buf = bytes::BytesMut::with_capacity(4096);
         let mut out = Vec::with_capacity(1024);
+        // None until the client SUBSCRIBEs; Some after.
+        let mut sub_rx: Option<broadcast::Receiver<ChangeEvent>> = None;
+        let mut sub_channel: Option<String> = None;
 
         loop {
-            // Try to drain any complete commands already in `buf`.
+            // Drain any complete commands already in `buf`.
             loop {
                 match resp::parse(&mut buf) {
                     Ok(Some(v)) => {
                         out.clear();
-                        let resp = self.dispatch(v);
-                        let close = matches!(resp, Response::CloseAfter(_));
-                        let value = match resp {
-                            Response::Reply(v) | Response::CloseAfter(v) => v,
-                        };
-                        value.write_to(&mut out);
-                        socket.write_all(&out).await?;
-                        if close {
-                            socket.shutdown().await.ok();
-                            return Ok(());
+                        let action = self.dispatch_with_sub(v, sub_channel.as_deref());
+                        match action {
+                            Response::Reply(value) => {
+                                value.write_to(&mut out);
+                                socket.write_all(&out).await?;
+                            }
+                            Response::CloseAfter(value) => {
+                                value.write_to(&mut out);
+                                socket.write_all(&out).await?;
+                                socket.shutdown().await.ok();
+                                return Ok(());
+                            }
+                            Response::Subscribe { channel, ack } => {
+                                ack.write_to(&mut out);
+                                socket.write_all(&out).await?;
+                                if sub_rx.is_none() {
+                                    sub_rx = Some(self.memory.subscribe());
+                                }
+                                sub_channel = Some(channel);
+                            }
+                            Response::Unsubscribe { ack } => {
+                                ack.write_to(&mut out);
+                                socket.write_all(&out).await?;
+                                sub_rx = None;
+                                sub_channel = None;
+                            }
                         }
                     }
                     Ok(None) => break, // need more bytes
@@ -137,15 +158,53 @@ impl Server {
                 }
             }
 
-            // Read more from the socket.
-            let n = socket.read_buf(&mut buf).await?;
-            if n == 0 {
-                return Ok(()); // peer closed
+            // Wait for the next event: either more bytes, or a published
+            // ChangeEvent (only when subscribed).
+            match sub_rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        read = socket.read_buf(&mut buf) => {
+                            let n = read?;
+                            if n == 0 { return Ok(()); }
+                        }
+                        recv = rx.recv() => {
+                            match recv {
+                                Ok(event) => {
+                                    out.clear();
+                                    push_event_message(
+                                        sub_channel.as_deref().unwrap_or("memory"),
+                                        &event,
+                                    ).write_to(&mut out);
+                                    socket.write_all(&out).await?;
+                                }
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    tracing::warn!(missed = n, "subscriber lagged; events lost");
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    sub_rx = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let n = socket.read_buf(&mut buf).await?;
+                    if n == 0 { return Ok(()); }
+                }
             }
         }
     }
 
-    fn dispatch(&self, value: RespValue) -> Response {
+    /// Pure dispatch — no subscription side-effects. Used by tests.
+    pub fn dispatch(&self, value: RespValue) -> Response {
+        self.dispatch_with_sub(value, None)
+    }
+
+    /// Dispatch in connection context. `sub_channel` is `Some` while
+    /// the connection is in subscribe mode; certain commands reply
+    /// differently (e.g. `SUBSCRIBE` to an already-subscribed channel
+    /// is idempotent).
+    fn dispatch_with_sub(&self, value: RespValue, sub_channel: Option<&str>) -> Response {
         let args = match value {
             RespValue::Array(items) => items,
             other => return Response::Reply(err(format!("ERR expected array, got {other:?}"))),
@@ -157,6 +216,19 @@ impl Server {
             Some(s) => s.to_ascii_uppercase(),
             None => return Response::Reply(err("ERR command name must be a string")),
         };
+
+        // While subscribed, only a few commands are valid (matches Redis).
+        if sub_channel.is_some() {
+            match cmd.as_str() {
+                "SUBSCRIBE" | "UNSUBSCRIBE" | "PING" | "QUIT" => {} // allowed
+                other => {
+                    return Response::Reply(err(format!(
+                        "ERR can't execute '{other}' in subscribe mode"
+                    )));
+                }
+            }
+        }
+
         match cmd.as_str() {
             "PING" => self.cmd_ping(&args),
             "HELLO" => self.cmd_hello(&args),
@@ -168,6 +240,8 @@ impl Server {
             "DEL" => self.cmd_del(&args),
             "REMEMBER" => self.cmd_remember(&args),
             "RECALL" => self.cmd_recall(&args),
+            "SUBSCRIBE" => self.cmd_subscribe(&args),
+            "UNSUBSCRIBE" => self.cmd_unsubscribe(&args, sub_channel),
             other => Response::Reply(err(format!("ERR unknown command '{other}'"))),
         }
     }
@@ -292,6 +366,42 @@ impl Server {
         }
     }
 
+    fn cmd_subscribe(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR SUBSCRIBE expects 1 arg: channel"));
+        }
+        let channel = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR SUBSCRIBE channel must be a string")),
+        };
+        // Redis convention: ack is a 3-element array (subscribe, channel, count).
+        let ack = RespValue::Array(vec![
+            RespValue::bulk("subscribe"),
+            RespValue::bulk(channel.clone()),
+            RespValue::Integer(1),
+        ]);
+        Response::Subscribe { channel, ack }
+    }
+
+    fn cmd_unsubscribe(&self, args: &[RespValue], current: Option<&str>) -> Response {
+        // UNSUBSCRIBE without args clears all; with channel arg, just that one.
+        let channel = if args.len() >= 2 {
+            arg_string(&args[1]).unwrap_or("").to_string()
+        } else {
+            current.unwrap_or("").to_string()
+        };
+        let ack = RespValue::Array(vec![
+            RespValue::bulk("unsubscribe"),
+            if channel.is_empty() {
+                RespValue::Null
+            } else {
+                RespValue::bulk(channel)
+            },
+            RespValue::Integer(0),
+        ]);
+        Response::Unsubscribe { ack }
+    }
+
     fn cmd_recall(&self, args: &[RespValue]) -> Response {
         if args.len() < 3 {
             return Response::Reply(err("ERR RECALL expects: key query [k]"));
@@ -344,11 +454,34 @@ impl Default for Server {
     }
 }
 
-/// What `dispatch` returns: a reply value, plus a hint on whether to
-/// close the connection after writing it.
-enum Response {
+/// What `dispatch` returns. The connection-loop interprets each variant.
+pub enum Response {
+    /// Write the value, keep the connection open.
     Reply(RespValue),
+    /// Write the value, then close the connection.
     CloseAfter(RespValue),
+    /// Write the ack, then move into subscribe mode for `channel`.
+    Subscribe { channel: String, ack: RespValue },
+    /// Write the ack, then leave subscribe mode.
+    Unsubscribe { ack: RespValue },
+}
+
+/// Build the Redis pub/sub `message` push for one ChangeEvent.
+fn push_event_message(channel: &str, event: &ChangeEvent) -> RespValue {
+    let kind = match event.kind {
+        ChangeKind::Insert => "insert",
+        ChangeKind::Update => "update",
+        ChangeKind::Delete => "delete",
+    };
+    let payload = format!(
+        r#"{{"table":"{}","row_id":{},"kind":"{}"}}"#,
+        event.table, event.row_id, kind
+    );
+    RespValue::Array(vec![
+        RespValue::bulk("message"),
+        RespValue::bulk(channel.to_string()),
+        RespValue::bulk(payload),
+    ])
 }
 
 fn simple(s: &str) -> RespValue {
@@ -392,7 +525,10 @@ mod tests {
 
     fn dispatch_array(server: &Server, items: Vec<RespValue>) -> RespValue {
         match server.dispatch(RespValue::Array(items)) {
-            Response::Reply(v) | Response::CloseAfter(v) => v,
+            Response::Reply(v)
+            | Response::CloseAfter(v)
+            | Response::Subscribe { ack: v, .. }
+            | Response::Unsubscribe { ack: v } => v,
         }
     }
 
@@ -494,14 +630,89 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_returns_three_element_ack() {
+        let s = Server::new();
+        let resp = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("SUBSCRIBE"),
+            RespValue::bulk("memory"),
+        ]));
+        match resp {
+            Response::Subscribe { channel, ack } => {
+                assert_eq!(channel, "memory");
+                if let RespValue::Array(items) = ack {
+                    assert_eq!(items.len(), 3);
+                    assert_eq!(items[0], RespValue::bulk("subscribe"));
+                    assert_eq!(items[1], RespValue::bulk("memory"));
+                    assert_eq!(items[2], RespValue::Integer(1));
+                } else {
+                    panic!("ack is not array");
+                }
+            }
+            other => panic!("expected Subscribe, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn unsubscribe_returns_ack() {
+        let s = Server::new();
+        let resp = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("UNSUBSCRIBE"),
+            RespValue::bulk("memory"),
+        ]));
+        assert!(matches!(resp, Response::Unsubscribe { .. }));
+    }
+
+    #[test]
+    fn remember_publishes_to_subscribers() {
+        let s = Server::new();
+        let mut rx = s.memory().subscribe();
+        // Synchronous remember publishes a ChangeEvent.
+        s.memory()
+            .remember("u", "test memory", vec![0.0; DEFAULT_DIM])
+            .unwrap();
+        let event = rx.try_recv().expect("expected published event");
+        assert_eq!(event.table, "memory");
+        assert_eq!(event.row_id, 1);
+    }
+
+    #[test]
+    fn push_event_message_format() {
+        let event = ChangeEvent {
+            table: "memory".to_string(),
+            row_id: 42,
+            kind: ChangeKind::Insert,
+        };
+        let msg = push_event_message("memory", &event);
+        if let RespValue::Array(items) = msg {
+            assert_eq!(items[0], RespValue::bulk("message"));
+            assert_eq!(items[1], RespValue::bulk("memory"));
+            if let RespValue::BulkString(b) = &items[2] {
+                let s = std::str::from_utf8(b).unwrap();
+                assert!(s.contains(r#""row_id":42"#));
+                assert!(s.contains(r#""kind":"insert""#));
+            } else {
+                panic!("expected bulk payload");
+            }
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    #[test]
     fn pipelined_dispatch_via_codec() {
         // Multi-line input; each command produces one response.
         let s = Server::new();
         let mut buf = BytesMut::from(&b"PING\r\nINFO\r\n"[..]);
         let v1 = resp::parse(&mut buf).unwrap().unwrap();
         let v2 = resp::parse(&mut buf).unwrap().unwrap();
-        let r1 = match s.dispatch(v1) { Response::Reply(v) | Response::CloseAfter(v) => v };
-        let r2 = match s.dispatch(v2) { Response::Reply(v) | Response::CloseAfter(v) => v };
+        let unwrap = |r| match r {
+            Response::Reply(v)
+            | Response::CloseAfter(v)
+            | Response::Subscribe { ack: v, .. }
+            | Response::Unsubscribe { ack: v } => v,
+        };
+        let r1 = unwrap(s.dispatch(v1));
+        let r2 = unwrap(s.dispatch(v2));
         assert_eq!(r1, simple("PONG"));
         assert!(matches!(r2, RespValue::BulkString(_)));
     }
