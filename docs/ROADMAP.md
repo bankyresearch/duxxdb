@@ -63,15 +63,26 @@ Goal: working in-process database with hybrid search on 1M rows.
 
 ---
 
-## Phase 2.6 — Agent primitives (next)
+## Phase 2.6 — Agent primitives ✅ Done
 
-- [ ] `duxx-memory::Memory` — auto-embedding on insert
-- [ ] `duxx-memory::TOOL_CACHE` — exact + semantic-near-hit lookup
-- [ ] `duxx-memory::SESSION` — hot KV with auto-flush
-- [ ] Pluggable embedding providers: OpenAI, Cohere, local BGE
-- [ ] Importance decay worker
+- [x] `duxx-memory::ToolCache` — exact + semantic-near-hit (cosine ≥ 0.95)
+- [x] `duxx-memory::SessionStore` — sliding-TTL KV with lazy eviction
+- [x] `Memory::effective_importance(half_life)` — exponential decay
+- [x] `MemoryStore::recall_decayed()` — recall reranked by decayed importance
+- [ ] Pluggable embedding providers (OpenAI, Cohere, local BGE) — Phase 3
+- [ ] Background decay worker (currently lazy on read) — future
 
-**Exit criterion:** `TOOL_CACHE` demo showing a cache hit on a paraphrased query.
+---
+
+## Phase 3 — Server + bindings (Phase 3.1 done; rest planned)
+
+- [x] **3.1** — `duxx-mcp` JSON-RPC 2.0 stdio server with `remember` /
+      `recall` / `stats` tools. **Working today** — connect any MCP
+      agent (Claude Desktop, Cline) by pointing its config at the
+      `duxx-mcp` binary.
+- [ ] **3.2** — `duxx-server` gRPC + RESP3 daemon
+- [ ] **3.3** — Python bindings (`bindings/python`, PyO3 + maturin)
+- [ ] **3.4** — TypeScript bindings (`bindings/node`, napi-rs)
 
 ---
 

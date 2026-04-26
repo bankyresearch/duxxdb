@@ -179,14 +179,43 @@ What ships in Phase 2 (current state, all green, all tested):
   documented end-to-end (the journey is in
   [SETUP.md](SETUP.md))
 
-### 🚧 In progress / planned
+### ✅ Phase 2.6 — Agent primitives (added after the comparison matrix)
+
+- **`ToolCache`** — exact-hash and semantic-near-hit (cosine ≥ 0.95)
+  lookup, per-entry TTL, purge.
+- **`SessionStore`** — sliding-TTL KV. Reads bump last-access; lazy
+  eviction.
+- **Importance decay** — `Memory::effective_importance(half_life)` and
+  `MemoryStore::recall_decayed()` reranks recall hits by exponentially
+  decayed importance.
+
+### ✅ Phase 3.1 — MCP stdio server
+
+[`duxx-mcp`](../crates/duxx-mcp) ships a working JSON-RPC 2.0 server
+over stdio. Build the binary, point any MCP agent (Claude Desktop,
+Cline, …) at it, and you get three tools: `remember`, `recall`, `stats`.
+
+```jsonc
+// Claude Desktop / Cline config
+{
+  "mcpServers": {
+    "duxxdb": {
+      "command": "/path/to/duxx-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+### 🚧 Still to do
 
 | Phase | Component | Status |
 |---|---|---|
-| 2.3 | Lance-backed `Table` | Plan written ([PHASE_2_3_PLAN.md](PHASE_2_3_PLAN.md)); deferred to its own session |
-| 2.6 | `TOOL_CACHE` semantic-near-hit, `SESSION` KV, importance decay | Designed |
-| 3 | gRPC + RESP3 server, MCP server, Python + TypeScript bindings | Designed |
-| 4 | Reactive subscriptions over hybrid filters, full bench suite vs Redis/Qdrant | Designed |
+| 2.3 | Lance-backed `Table` | Plan written ([PHASE_2_3_PLAN.md](PHASE_2_3_PLAN.md)); next session |
+| 3.2 | gRPC + RESP3 server | Designed |
+| 3.3 | Python bindings (PyO3 + maturin) | Designed |
+| 3.4 | TypeScript bindings (napi-rs) | Designed |
+| 4 | Reactive subscriptions over hybrid filters, comparative bench | Designed |
 | 5 | Lakehouse cold-tier export (Iceberg / Delta) | Designed |
 | 6 | Distributed mode, RBAC, observability | Future |
 
