@@ -1,0 +1,23 @@
+[package]
+name = "duxxdb-py"
+description = "Python bindings for DuxxDB \u2014 hybrid agent-native database."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# Compiles to a Python extension module named "duxxdb".
+# The extension-module feature is enabled at build time by maturin
+# (see pyproject.toml [tool.maturin].features).
+name = "duxxdb"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+duxx-core.workspace = true
+duxx-memory.workspace = true
+duxx-reactive.workspace = true
+pyo3.workspace = true
