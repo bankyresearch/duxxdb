@@ -1,13 +1,15 @@
 //! # duxx-memory
 //!
-//! High-level primitives for AI-agent use cases: `MemoryStore`,
-//! `ToolCache`, `Session`. These are what chatbots and voice bots talk
-//! to directly. Internally they compose `duxx-storage`, `duxx-index`,
-//! and `duxx-query`.
-//!
-//! Phase 1: everything in-memory; vector and text indices are the
-//! placeholder implementations from `duxx-index`. Replaced transparently
-//! in Phase 2.
+//! Agent-facing primitives:
+//! - [`MemoryStore`] — long-term semantic memory with hybrid recall and
+//!   exponential importance decay.
+//! - [`ToolCache`] — exact + semantic-near-hit cache for expensive tool
+//!   calls.
+//! - [`SessionStore`] — hot KV with sliding TTL for per-conversation
+//!   working state.
+
+pub mod session;
+pub mod tool_cache;
 
 use duxx_core::Result;
 use duxx_index::{TextIndex, VectorIndex};
@@ -15,30 +17,46 @@ use duxx_query::{hybrid_recall, RecallHit};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+
+pub use session::{SessionStore, DEFAULT_TTL as DEFAULT_SESSION_TTL};
+pub use tool_cache::{HitKind, ToolCache, ToolCacheHit, DEFAULT_NEAR_HIT_THRESHOLD};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// A single stored memory record.
+/// A single stored memory.
 #[derive(Debug, Clone)]
 pub struct Memory {
     pub id: u64,
     pub key: String,
     pub text: String,
     pub embedding: Vec<f32>,
+    /// Base importance, set at insert time. The *effective* importance
+    /// returned at recall time is computed via [`Memory::effective_importance`]
+    /// and decays exponentially with age.
     pub importance: f32,
+    pub created_at: Instant,
 }
 
-/// A recall result — a `Memory` paired with its fused score.
+impl Memory {
+    /// Importance decayed by elapsed time, half-life style.
+    ///
+    /// `effective = importance * 2^(-age / half_life)`
+    pub fn effective_importance(&self, half_life: std::time::Duration) -> f32 {
+        let age = self.created_at.elapsed().as_secs_f32();
+        let half = half_life.as_secs_f32().max(1e-3);
+        self.importance * 2.0_f32.powf(-age / half)
+    }
+}
+
+/// Recall result — a memory paired with its (decayed) score.
 #[derive(Debug, Clone)]
 pub struct MemoryHit {
     pub memory: Memory,
     pub score: f32,
 }
 
-/// An in-memory memory store partitioned by logical key (user / agent / session).
-///
-/// Writes update both the vector index and the text index atomically,
-/// so recalls are always consistent.
+/// Long-term semantic memory store.
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
     inner: Arc<Inner>,
@@ -59,9 +77,7 @@ impl MemoryStore {
         Self::with_capacity(dim, 100_000)
     }
 
-    /// Create a store with an explicit vector-index capacity. Use a
-    /// smaller value when memory is tight (benchmarks, embedded use)
-    /// or a larger one when you expect millions of memories per store.
+    /// Create a store with an explicit vector-index capacity.
     pub fn with_capacity(dim: usize, capacity: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -86,9 +102,7 @@ impl MemoryStore {
         self.len() == 0
     }
 
-    /// Insert a new memory, updating all indices.
-    ///
-    /// Returns the assigned id. `embedding.len()` must equal `self.dim()`.
+    /// Insert a new memory. `embedding.len()` must match `self.dim()`.
     pub fn remember(
         &self,
         key: impl Into<String>,
@@ -111,16 +125,14 @@ impl MemoryStore {
             text,
             embedding,
             importance: 1.0,
+            created_at: Instant::now(),
         };
         self.inner.by_id.write().insert(id, mem);
         tracing::debug!(id, "remembered");
         Ok(id)
     }
 
-    /// Hybrid recall over vector + text indices, fused with RRF.
-    ///
-    /// `_key` is accepted for API symmetry and to make partition-by-key
-    /// filtering easy to wire up once `duxx-query` supports pushdown.
+    /// Hybrid recall (vector + BM25, RRF-fused).
     pub fn recall(
         &self,
         _key: &str,
@@ -142,6 +154,27 @@ impl MemoryStore {
             }
         }
         Ok(out)
+    }
+
+    /// Recall with importance-decay reranking.
+    ///
+    /// First runs hybrid recall, then multiplies each hit's RRF score
+    /// by the memory's effective importance (exponential half-life).
+    pub fn recall_decayed(
+        &self,
+        key: &str,
+        query_text: &str,
+        query_vec: &[f32],
+        k: usize,
+        half_life: std::time::Duration,
+    ) -> Result<Vec<MemoryHit>> {
+        let mut hits = self.recall(key, query_text, query_vec, k * 2)?;
+        for h in &mut hits {
+            h.score *= h.memory.effective_importance(half_life);
+        }
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(k);
+        Ok(hits)
     }
 }
 
@@ -180,5 +213,18 @@ mod tests {
         let hits = s.recall("u1", q, &embed(q, DIM), 5).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].memory.text.contains("refund"));
+    }
+
+    #[test]
+    fn effective_importance_decays() {
+        // Half-life 1ms → after a few ms, importance should be near zero.
+        let s = MemoryStore::new(8);
+        let id = s
+            .remember("u", "test", embed("test", 8))
+            .unwrap();
+        let m = s.inner.by_id.read().get(&id).cloned().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let eff = m.effective_importance(std::time::Duration::from_millis(1));
+        assert!(eff < 0.01, "effective importance after many half-lives: {eff}");
     }
 }
