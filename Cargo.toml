@@ -45,6 +45,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 bytes = "1"
 parking_lot = "0.12"
 
+# Indexing engines (Phase 2)
+tantivy = "0.22"
+hnsw_rs = "0.3"
+
 # Internal crates (consumed by siblings)
 duxx-core = { path = "crates/duxx-core", version = "0.1.0" }
 duxx-storage = { path = "crates/duxx-storage", version = "0.1.0" }
