@@ -1,12 +1,16 @@
-//! Tantivy-backed BM25 text index.
+//! Tantivy-backed BM25 text index with batched commits.
 //!
-//! Phase 2: an in-RAM tantivy index. Auto-commits on every insert —
-//! correct but slow under high write rates. Phase 2.5 batches commits.
+//! Phase 2.5: instead of committing tantivy on every `insert` (slow:
+//! ~4 ms each), we commit every `commit_every` inserts. Reads (`search`,
+//! `len`) auto-flush any pending writes so the "insert-then-search"
+//! contract still holds.
 //!
-//! Phase 3+: optional disk-backed mode with WAL and incremental indexing.
+//! Defaults to `commit_every = 100`. Override at construction with
+//! [`TextIndex::with_commit_every`].
 
 use duxx_core::{Error, Result};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tantivy::{
     collector::TopDocs,
@@ -16,27 +20,34 @@ use tantivy::{
     Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument,
 };
 
+/// Default insert count between forced commits.
+pub const DEFAULT_COMMIT_EVERY: usize = 100;
+
 /// BM25 full-text index, in-memory, Send + Sync.
-///
-/// `insert` is `&mut self` for API symmetry with `VectorIndex`; internally
-/// the writer is wrapped in `Arc<Mutex<_>>` so calls serialize even if the
-/// caller cheats and goes through `&self` via `RwLock::read()`.
 pub struct TextIndex {
     id_field: Field,
     text_field: Field,
     index: Index,
     writer: Arc<Mutex<IndexWriter>>,
     reader: IndexReader,
+    pending: AtomicUsize,
+    commit_every: usize,
 }
 
 impl TextIndex {
-    /// Construct a fresh in-RAM index. Panics on init failure (which would
-    /// indicate a tantivy bug, not a user error).
+    /// Build with the default commit threshold ([`DEFAULT_COMMIT_EVERY`]).
     pub fn new() -> Self {
-        Self::try_new().expect("tantivy in-RAM index init must not fail")
+        Self::with_commit_every(DEFAULT_COMMIT_EVERY)
     }
 
-    fn try_new() -> Result<Self> {
+    /// Build with a custom commit threshold. Use a low value (1) when
+    /// every insert must be immediately durable; higher values amortize
+    /// commit overhead across batches.
+    pub fn with_commit_every(commit_every: usize) -> Self {
+        Self::try_with(commit_every).expect("tantivy in-RAM index init must not fail")
+    }
+
+    fn try_with(commit_every: usize) -> Result<Self> {
         let mut sb = Schema::builder();
         let id_field = sb.add_u64_field("id", STORED | INDEXED | FAST);
         let text_field = sb.add_text_field("text", TEXT);
@@ -58,21 +69,43 @@ impl TextIndex {
             index,
             writer: Arc::new(Mutex::new(writer)),
             reader,
+            pending: AtomicUsize::new(0),
+            commit_every: commit_every.max(1),
         })
     }
 
-    /// Insert a document and commit so it's immediately searchable.
+    /// Insert a document. Commits if the threshold is reached.
     pub fn insert(&mut self, id: u64, text: String) -> Result<()> {
         let mut w = self.writer.lock();
         w.add_document(doc!(self.id_field => id, self.text_field => text))
             .map_err(|e| Error::Index(format!("add_document: {e}")))?;
-        w.commit()
-            .map_err(|e| Error::Index(format!("commit: {e}")))?;
+        let n = self.pending.fetch_add(1, Ordering::SeqCst) + 1;
+        if n >= self.commit_every {
+            w.commit()
+                .map_err(|e| Error::Index(format!("commit: {e}")))?;
+            self.pending.store(0, Ordering::SeqCst);
+        }
         Ok(())
     }
 
-    /// BM25 search; returns `(id, score)` pairs descending by score.
+    /// Force-commit any pending writes. Idempotent.
+    pub fn flush(&self) -> Result<()> {
+        if self.pending.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        let mut w = self.writer.lock();
+        w.commit()
+            .map_err(|e| Error::Index(format!("commit: {e}")))?;
+        self.pending.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// BM25 search; auto-flushes pending writes first.
     pub fn search(&self, query: &str, k: usize) -> Vec<(u64, f32)> {
+        if let Err(e) = self.flush() {
+            tracing::warn!("flush before search failed: {e}");
+            return Vec::new();
+        }
         if let Err(e) = self.reader.reload() {
             tracing::warn!("tantivy reader reload failed: {e}");
             return Vec::new();
@@ -103,8 +136,11 @@ impl TextIndex {
             .collect()
     }
 
-    /// Number of committed documents.
+    /// Number of documents — auto-flushes pending writes first.
     pub fn len(&self) -> usize {
+        if self.flush().is_err() {
+            return 0;
+        }
         if self.reader.reload().is_err() {
             return 0;
         }
@@ -126,6 +162,7 @@ impl std::fmt::Debug for TextIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextIndex")
             .field("len", &self.len())
+            .field("commit_every", &self.commit_every)
             .finish_non_exhaustive()
     }
 }
@@ -152,7 +189,7 @@ mod tests {
         idx.insert(3, "weather forecast".into()).unwrap();
         let hits = idx.search("refund", 10);
         assert_eq!(hits.len(), 2, "doc 3 should be filtered out");
-        assert_eq!(hits[0].0, 1, "doc 1 has higher term frequency");
+        assert_eq!(hits[0].0, 1);
     }
 
     #[test]
@@ -169,5 +206,26 @@ mod tests {
         idx.insert(1, "one".into()).unwrap();
         idx.insert(2, "two".into()).unwrap();
         assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn batched_inserts_searchable_via_auto_flush() {
+        // commit_every=10 means doc 1 isn't auto-committed by insert,
+        // but search must still find it via auto-flush.
+        let mut idx = TextIndex::with_commit_every(10);
+        idx.insert(1, "single doc".into()).unwrap();
+        let hits = idx.search("single", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 1);
+    }
+
+    #[test]
+    fn explicit_flush_makes_writes_durable() {
+        let mut idx = TextIndex::with_commit_every(1000);
+        for i in 0..50u64 {
+            idx.insert(i, format!("doc {i}")).unwrap();
+        }
+        idx.flush().unwrap();
+        assert_eq!(idx.len(), 50);
     }
 }

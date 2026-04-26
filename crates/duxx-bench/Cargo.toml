@@ -9,8 +9,19 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
+[[bench]]
+name = "recall"
+path = "benches/recall.rs"
+harness = false
+
 [dependencies]
 duxx-core.workspace = true
 duxx-index.workspace = true
 duxx-memory.workspace = true
 duxx-query.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true

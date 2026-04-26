@@ -17,7 +17,7 @@ use hnsw_rs::prelude::{DistCosine, Hnsw};
 use parking_lot::RwLock;
 
 const M: usize = 16;
-const MAX_ELEMENTS: usize = 1_000_000;
+const DEFAULT_MAX_ELEMENTS: usize = 100_000;
 const MAX_LAYERS: usize = 16;
 const EF_CONSTRUCTION: usize = 200;
 const EF_SEARCH: usize = 64;
@@ -39,8 +39,15 @@ struct HnswInner {
 }
 
 impl VectorIndex {
+    /// Construct with the default capacity ([`DEFAULT_MAX_ELEMENTS`]).
     pub fn new(dim: usize) -> Self {
-        let hnsw = Hnsw::new(M, MAX_ELEMENTS, MAX_LAYERS, EF_CONSTRUCTION, DistCosine);
+        Self::with_capacity(dim, DEFAULT_MAX_ELEMENTS)
+    }
+
+    /// Construct with an explicit `capacity`. `hnsw_rs` cannot grow past
+    /// the cap, so size for the largest workload you expect.
+    pub fn with_capacity(dim: usize, capacity: usize) -> Self {
+        let hnsw = Hnsw::new(M, capacity, MAX_LAYERS, EF_CONSTRUCTION, DistCosine);
         Self {
             dim,
             inner: RwLock::new(HnswInner {

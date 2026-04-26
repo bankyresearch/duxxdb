@@ -54,13 +54,20 @@ struct Inner {
 }
 
 impl MemoryStore {
-    /// Create a store for vectors of the given dimension.
+    /// Create a store with the default vector-index capacity.
     pub fn new(dim: usize) -> Self {
+        Self::with_capacity(dim, 100_000)
+    }
+
+    /// Create a store with an explicit vector-index capacity. Use a
+    /// smaller value when memory is tight (benchmarks, embedded use)
+    /// or a larger one when you expect millions of memories per store.
+    pub fn with_capacity(dim: usize, capacity: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
                 dim,
                 by_id: RwLock::new(HashMap::new()),
-                vector_index: RwLock::new(VectorIndex::new(dim)),
+                vector_index: RwLock::new(VectorIndex::with_capacity(dim, capacity)),
                 text_index: RwLock::new(TextIndex::new()),
                 next_id: RwLock::new(1),
             }),
