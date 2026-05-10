@@ -13,8 +13,12 @@ members = [
     "crates/duxx-bench",
     "crates/duxx-embed",
     "bindings/python",
-    "bindings/node",
 ]
+# bindings/node is intentionally NOT a workspace member: napi-build
+# needs `libnode.dll.a` on Windows-mingw which rustup's bundle doesn't
+# ship, so a workspace-wide `cargo build` would fail on that platform.
+# Build it from its own directory instead: `cd bindings/node && npm run build`.
+exclude = ["bindings/node"]
 
 [workspace.package]
 version = "0.1.0"

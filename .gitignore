@@ -34,6 +34,9 @@ bindings/python/__pycache__/
 bindings/node/node_modules/
 bindings/node/dist/
 bindings/node/*.node
+bindings/node/index.js
+bindings/node/index.d.ts
+bindings/node/target/
 
 # Claude Code session metadata
 .claude/
