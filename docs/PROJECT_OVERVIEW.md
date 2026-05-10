@@ -343,7 +343,7 @@ Glob patterns: `*` matches any sequence, `?` matches one char,
 | 2.4 | Cross-restart importance decay (Unix-epoch timestamps) | ✅ Shipped |
 | 3.5 | gRPC daemon for typed cross-language streaming | ✅ Shipped |
 | 4.6 | Comparative bench vs LanceDB (embedded) | ✅ Shipped — see [bench/comparative/](../bench/comparative/) |
-| 4.7 | Network comparative bench vs Redis / Qdrant / pgvector | Designed; harness ready, client wiring TODO |
+| 4.7 | Network comparative bench vs Redis / Qdrant / pgvector | ✅ Wired + DuxxDB-gRPC measured (2385 µs p50 recall over localhost). Redis/Qdrant/pgvector backends ready; need Docker daemon up to run. |
 | 5 | Lakehouse cold-tier export (Iceberg / Delta) | Designed |
 | 6 | Distributed mode, RBAC, observability | Future |
 | Lance | As an alternate `Storage` impl alongside redb | Designed; not blocking, redb covers durability |

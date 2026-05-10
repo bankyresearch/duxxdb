@@ -48,3 +48,5 @@ bench/comparative/_lancedb_bench_tmp/
 # OS
 *.swp
 *.swo
+*.pyc
+__pycache__/
