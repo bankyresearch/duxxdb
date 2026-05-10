@@ -452,6 +452,8 @@ dependencies = [
  "duxx-core",
  "hnsw_rs",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tantivy",
  "tracing",
 ]

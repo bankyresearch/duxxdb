@@ -79,13 +79,31 @@ impl Server {
     }
 
     /// Build with an embedder AND a durable storage backend (redb,
-    /// or any other `Storage` impl). Memories survive process restart.
+    /// or any other `Storage` impl). Memories survive process restart;
+    /// indices are kept in memory and rebuilt from the row store on open.
     pub fn with_provider_and_storage(
         embedder: Arc<dyn Embedder>,
         storage: Arc<dyn duxx_storage::Storage>,
     ) -> anyhow::Result<Self> {
         let dim = embedder.dim();
         let memory = MemoryStore::with_storage(dim, 100_000, storage)?;
+        Ok(Self {
+            memory,
+            sessions: SessionStore::new(),
+            embedder,
+            dim,
+        })
+    }
+
+    /// Build with an embedder AND a fully-persistent on-disk store at `dir`.
+    /// Both the row store (redb) AND the indices (tantivy + HNSW dump)
+    /// are persisted, so reopens skip the rebuild.
+    pub fn open_at(
+        embedder: Arc<dyn Embedder>,
+        dir: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let dim = embedder.dim();
+        let memory = MemoryStore::open_at(dim, 100_000, dir)?;
         Ok(Self {
             memory,
             sessions: SessionStore::new(),

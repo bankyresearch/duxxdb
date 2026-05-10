@@ -10,10 +10,12 @@
 
 use duxx_core::{Error, Result};
 use parking_lot::Mutex;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tantivy::{
     collector::TopDocs,
+    directory::MmapDirectory,
     doc,
     query::QueryParser,
     schema::{Field, Schema, Value, FAST, INDEXED, STORED, TEXT},
@@ -48,12 +50,39 @@ impl TextIndex {
     }
 
     fn try_with(commit_every: usize) -> Result<Self> {
-        let mut sb = Schema::builder();
-        let id_field = sb.add_u64_field("id", STORED | INDEXED | FAST);
-        let text_field = sb.add_text_field("text", TEXT);
-        let schema = sb.build();
-
+        let (id_field, text_field, schema) = build_schema();
         let index = Index::create_in_ram(schema);
+        Self::from_index(index, id_field, text_field, commit_every)
+    }
+
+    /// Open a disk-backed tantivy index at `dir`. The directory is
+    /// created if missing. Reopening an existing dir restores the
+    /// previously written state — the writer queue is empty, so the
+    /// caller can immediately commit new docs without rebuild.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_commit_every(dir, DEFAULT_COMMIT_EVERY)
+    }
+
+    pub fn open_with_commit_every(
+        dir: impl AsRef<Path>,
+        commit_every: usize,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(dir.as_ref())
+            .map_err(|e| Error::Index(format!("create tantivy dir: {e}")))?;
+        let (id_field, text_field, schema) = build_schema();
+        let mmap = MmapDirectory::open(dir.as_ref())
+            .map_err(|e| Error::Index(format!("tantivy mmap dir: {e}")))?;
+        let index = Index::open_or_create(mmap, schema)
+            .map_err(|e| Error::Index(format!("tantivy open_or_create: {e}")))?;
+        Self::from_index(index, id_field, text_field, commit_every)
+    }
+
+    fn from_index(
+        index: Index,
+        id_field: Field,
+        text_field: Field,
+        commit_every: usize,
+    ) -> Result<Self> {
         let writer: IndexWriter = index
             .writer(50_000_000)
             .map_err(|e| Error::Index(format!("tantivy writer: {e}")))?;
@@ -152,6 +181,16 @@ impl TextIndex {
     }
 }
 
+/// Build the canonical (id_field, text_field, schema) triple. Matches
+/// the on-disk schema so re-opens succeed.
+fn build_schema() -> (Field, Field, Schema) {
+    let mut sb = Schema::builder();
+    let id_field = sb.add_u64_field("id", STORED | INDEXED | FAST);
+    let text_field = sb.add_text_field("text", TEXT);
+    let schema = sb.build();
+    (id_field, text_field, schema)
+}
+
 impl Default for TextIndex {
     fn default() -> Self {
         Self::new()
@@ -227,5 +266,31 @@ mod tests {
         }
         idx.flush().unwrap();
         assert_eq!(idx.len(), 50);
+    }
+
+    #[test]
+    fn disk_backed_index_persists_across_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "duxx-tantivy-persist-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut idx = TextIndex::open(&dir).unwrap();
+            idx.insert(1, "refund my order".into()).unwrap();
+            idx.insert(2, "weather forecast".into()).unwrap();
+            idx.flush().unwrap();
+            assert_eq!(idx.len(), 2);
+        } // drop closes index
+        {
+            let idx = TextIndex::open(&dir).unwrap();
+            assert_eq!(idx.len(), 2, "data should survive reopen");
+            let hits = idx.search("refund", 5);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].0, 1);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

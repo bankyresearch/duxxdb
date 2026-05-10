@@ -100,6 +100,23 @@ struct Inner {
     storage: Option<Arc<dyn Storage>>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // In persistent mode, the disk-backed tantivy index batches
+        // commits via `commit_every` (default 100). On graceful
+        // shutdown we MUST flush the pending writes so the on-disk
+        // index matches `vector_index` — otherwise the next open will
+        // see an empty tantivy and trigger a full rebuild that
+        // double-inserts every memory.
+        if self.storage.is_some() {
+            if let Err(e) = self.text_index.read().flush() {
+                tracing::warn!(error = %e, "MemoryStore Drop: tantivy flush failed");
+            }
+        }
+        // VectorIndex's own Drop dumps HNSW to disk.
+    }
+}
+
 /// Wire format for persisted memories. `created_at_unix_ns` is stored
 /// so importance decay continues across process restart (Phase 2.4).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -156,10 +173,10 @@ impl MemoryStore {
     /// into the in-memory cache and rebuilt into the vector / text
     /// indices. Subsequent `remember` calls write through to `storage`.
     ///
-    /// Cold start cost is roughly proportional to the corpus size —
-    /// expect ~250 µs per memory on NVMe (HNSW insert + tantivy add).
-    /// At 1 M rows that's ~5 minutes; Phase 2.3.5 will persist the
-    /// indices alongside the rows to skip rebuild.
+    /// Cold start cost is proportional to the corpus size — full HNSW
+    /// + tantivy rebuild from rows. For persisted indices that skip
+    /// the rebuild on graceful-shutdown reopens, use
+    /// [`MemoryStore::open_at`] instead.
     pub fn with_storage(
         dim: usize,
         capacity: usize,
@@ -295,6 +312,104 @@ impl MemoryStore {
     /// Whether this store has a durable backing.
     pub fn is_persistent(&self) -> bool {
         self.inner.storage.is_some()
+    }
+
+    /// Open a fully-persistent store rooted at `dir`. Three artifacts
+    /// share the directory:
+    ///
+    /// - `<dir>/store.redb`  — row store (redb)
+    /// - `<dir>/tantivy/`    — disk-backed BM25 index
+    /// - `<dir>/hnsw/`       — HNSW dump + id-map sidecar
+    ///
+    /// Reopening an existing dir after a graceful shutdown skips the
+    /// expensive HNSW + tantivy rebuild — both indices come back ready
+    /// to query in milliseconds. After a hard kill / panic-abort the
+    /// HNSW dump may be missing or stale; we detect that by comparing
+    /// `vector_index.len()` to the row count and rebuild from the row
+    /// store when they disagree.
+    #[cfg(feature = "redb-store")]
+    pub fn open_at(
+        dim: usize,
+        capacity: usize,
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        use duxx_index::{TextIndex, VectorIndex};
+
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir).map_err(|e| {
+            duxx_core::Error::Storage(format!("create memory dir {dir:?}: {e}"))
+        })?;
+
+        // 1. Open the three on-disk artifacts.
+        let storage: Arc<dyn Storage> =
+            Arc::new(duxx_storage::RedbStorage::open(dir.join("store.redb"))?);
+        let text_index = TextIndex::open(dir.join("tantivy"))?;
+        let vector_index = VectorIndex::open(dim, capacity, dir.join("hnsw"))?;
+
+        // 2. Decide: do the indices already match the row store?
+        //    If yes, we can skip the rebuild. If not (fresh dir, missing
+        //    dump, or stale after a crash), full rebuild is the safe choice.
+        let row_count = storage.len()?;
+        let indices_intact =
+            row_count > 0 && vector_index.len() == row_count && text_index.len() == row_count;
+
+        // 3. Walk the row store. Always rebuild `by_id` (it's not persisted
+        //    independently). Only re-insert into the indices if they're
+        //    NOT intact.
+        let mut by_id = HashMap::with_capacity(row_count);
+        let mut max_id = 0u64;
+        let rows = storage.iter()?;
+        let mut text_index = text_index;
+        let mut vector_index = vector_index;
+        for (id, bytes) in rows {
+            let stored: StoredMemory = bincode::deserialize(&bytes).map_err(|e| {
+                duxx_core::Error::Storage(format!("decode memory id={id}: {e}"))
+            })?;
+            if stored.embedding.len() != dim {
+                return Err(duxx_core::Error::Storage(format!(
+                    "memory id={id} has dim {} but store expects {dim}",
+                    stored.embedding.len()
+                )));
+            }
+            if !indices_intact {
+                vector_index.insert(id, stored.embedding.clone())?;
+                text_index.insert(id, stored.text.clone())?;
+            }
+            let mem = Memory {
+                id,
+                key: stored.key,
+                text: stored.text,
+                embedding: stored.embedding,
+                importance: stored.importance,
+                created_at_unix_ns: stored.created_at_unix_ns,
+            };
+            by_id.insert(id, mem);
+            if id > max_id {
+                max_id = id;
+            }
+        }
+        if !indices_intact && row_count > 0 {
+            tracing::info!(
+                rows = row_count,
+                "rebuilt indices from row store (cold path)"
+            );
+        } else if indices_intact {
+            tracing::info!(
+                rows = row_count,
+                "skipped index rebuild (loaded from disk)"
+            );
+        }
+
+        let inner = Arc::new(Inner {
+            dim,
+            by_id: RwLock::new(by_id),
+            vector_index: RwLock::new(vector_index),
+            text_index: RwLock::new(text_index),
+            next_id: RwLock::new(max_id + 1),
+            bus: ChangeBus::default(),
+            storage: Some(storage),
+        });
+        Ok(MemoryStore { inner })
     }
 
     /// Hybrid recall (vector + BM25, RRF-fused).
@@ -447,6 +562,57 @@ mod tests {
         };
         let eff = m.effective_importance(std::time::Duration::from_secs(60 * 60));
         assert!(eff < 1e-10, "expected near-zero decay, got {eff}");
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn open_at_persists_indices_across_restart() {
+        const DIM: usize = 4;
+        let dir = std::env::temp_dir().join(format!(
+            "duxx-open-at-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // First open: write 3 memories.
+        {
+            let store = MemoryStore::open_at(DIM, 1_000, &dir).unwrap();
+            store
+                .remember("alice", "I lost my wallet at the cafe", embed("wallet", DIM))
+                .unwrap();
+            store
+                .remember("alice", "Favorite color is blue", embed("blue", DIM))
+                .unwrap();
+            store
+                .remember("bob", "Tracking number DX-002341", embed("tracking", DIM))
+                .unwrap();
+            assert_eq!(store.len(), 3);
+        } // graceful drop -> dumps HNSW + commits tantivy
+
+        // Second open: indices should be ready immediately, no rebuild.
+        {
+            let store = MemoryStore::open_at(DIM, 1_000, &dir).unwrap();
+            assert_eq!(store.len(), 3, "row count should match");
+            // Both indices loaded from disk, no rebuild path.
+            assert_eq!(
+                store.inner.vector_index.read().len(),
+                3,
+                "hnsw should be loaded"
+            );
+            assert_eq!(
+                store.inner.text_index.read().len(),
+                3,
+                "tantivy should be loaded"
+            );
+            // Recall still works.
+            let hits = store
+                .recall("alice", "wallet", &embed("wallet", DIM), 5)
+                .unwrap();
+            assert!(!hits.is_empty());
+            assert!(hits[0].memory.text.contains("wallet"));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(feature = "redb-store")]

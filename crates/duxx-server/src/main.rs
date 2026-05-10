@@ -80,17 +80,43 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let server = match storage_spec.as_deref() {
+        // dir:./path -- full persistence: redb rows + tantivy index +
+        // HNSW dump under one directory. Reopens skip the rebuild.
+        Some(spec) if spec.starts_with("dir:") => {
+            let path = &spec[4..];
+            std::fs::create_dir_all(path)?;
+            duxx_server::Server::open_at(embedder, path)?
+        }
+        // memory:_, redb:./file -- byte-keyed Storage; rows persist,
+        // indices are rebuilt from rows on open.
         Some(spec) => {
             let storage = open_storage(spec)?;
             duxx_server::Server::with_provider_and_storage(embedder, storage)?
         }
         None => duxx_server::Server::with_provider(embedder),
     };
-    server.serve(&addr).await?;
+
+    // Race serve() against a Ctrl+C / SIGTERM. When the signal fires,
+    // the select! arm returns and the server's Drop runs — which
+    // commits the disk-backed tantivy index and dumps the HNSW. Hard
+    // kills (SIGKILL / TerminateProcess) skip Drop; in that case the
+    // next reopen falls back to row-rebuild (correct, just slower).
+    tokio::select! {
+        res = server.serve(&addr) => {
+            res?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl+C received -- gracefully shutting down");
+        }
+    }
+    drop(server); // explicit so the indices flush before exit
+    tracing::info!("duxx-server stopped");
     Ok(())
 }
 
-/// Parse a `--storage` spec and open the named backend.
+/// Parse a `--storage` spec and open the named byte-keyed backend.
+/// `dir:` is handled separately upstream because it constructs a
+/// full `MemoryStore` rather than a `Storage`.
 fn open_storage(spec: &str) -> anyhow::Result<Arc<dyn duxx_storage::Storage>> {
     let (kind, rest) = spec.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("storage spec must be 'kind:path' (e.g. 'redb:./data/duxx.redb')")
@@ -98,7 +124,6 @@ fn open_storage(spec: &str) -> anyhow::Result<Arc<dyn duxx_storage::Storage>> {
     match kind {
         "memory" => Ok(Arc::new(duxx_storage::MemoryStorage::new())),
         "redb" => {
-            // Make sure the parent dir exists.
             let path = std::path::Path::new(rest);
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
@@ -107,7 +132,9 @@ fn open_storage(spec: &str) -> anyhow::Result<Arc<dyn duxx_storage::Storage>> {
             }
             Ok(Arc::new(duxx_storage::RedbStorage::open(path)?))
         }
-        other => anyhow::bail!("unknown storage kind: {other} (built-in: memory, redb)"),
+        other => anyhow::bail!(
+            "unknown storage kind: {other} (built-in: memory, redb, dir)"
+        ),
     }
 }
 
@@ -129,7 +156,9 @@ fn print_help() {
     println!();
     println!("STORAGE SPECS:");
     println!("  memory:<ignored>                    in-memory only (lost on exit)");
-    println!("  redb:./path/to/file.redb            durable, ACID, single-process");
+    println!("  redb:./path/to/file.redb            durable rows; indices rebuilt on open");
+    println!("  dir:./path/to/dir                   FULLY persistent: rows + tantivy + HNSW");
+    println!("                                      (skips rebuild on graceful reopen)");
     println!();
     println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, OPENAI_API_KEY, COHERE_API_KEY");
 }
