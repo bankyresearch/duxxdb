@@ -13,8 +13,21 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone)]
 pub struct ChangeEvent {
     pub table: String,
+    /// Optional partition / user / agent key. Used for per-key channel
+    /// routing (`PSUBSCRIBE memory.alice*`).
+    pub key: Option<String>,
     pub row_id: u64,
     pub kind: ChangeKind,
+}
+
+impl ChangeEvent {
+    /// Routing channel: `<table>.<key>` if `key` is set, else `<table>`.
+    pub fn channel(&self) -> String {
+        match &self.key {
+            Some(k) => format!("{}.{}", self.table, k),
+            None => self.table.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,11 +74,24 @@ mod tests {
         let mut rx = bus.subscribe();
         bus.publish(ChangeEvent {
             table: "t".into(),
+            key: None,
             row_id: 1,
             kind: ChangeKind::Insert,
         });
         let got = rx.recv().await.unwrap();
         assert_eq!(got.row_id, 1);
         assert_eq!(got.kind, ChangeKind::Insert);
+        assert_eq!(got.channel(), "t");
+    }
+
+    #[tokio::test]
+    async fn keyed_event_channel() {
+        let e = ChangeEvent {
+            table: "memory".into(),
+            key: Some("alice".into()),
+            row_id: 7,
+            kind: ChangeKind::Insert,
+        };
+        assert_eq!(e.channel(), "memory.alice");
     }
 }

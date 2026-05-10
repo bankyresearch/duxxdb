@@ -144,8 +144,11 @@ impl MemoryStore {
         self.inner.by_id.write().insert(id, mem);
         // Publish a change event. Lossy by design — slow subscribers
         // may miss events; durability is the storage layer's job.
+        // Channel = "memory.<key>", so `PSUBSCRIBE memory.*` filters
+        // by user/agent key.
         self.inner.bus.publish(ChangeEvent {
             table: "memory".to_string(),
+            key: Some(key.clone()),
             row_id: id,
             kind: ChangeKind::Insert,
         });
