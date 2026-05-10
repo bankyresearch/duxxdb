@@ -16,6 +16,7 @@
 //! so the server is self-contained for demos. A production deployment
 //! plugs in a real provider via [`McpServer::with_embedder`].
 
+use duxx_embed::{Embedder, HashEmbedder};
 use duxx_memory::MemoryStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,10 +28,6 @@ pub const SERVER_NAME: &str = "duxxdb";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const DEFAULT_DIM: usize = 32;
-
-/// A function that turns a string into a vector. Caller provides;
-/// the server doesn't pretend to ship a real embedding model.
-pub type Embedder = Arc<dyn Fn(&str) -> Vec<f32> + Send + Sync>;
 
 /// JSON-RPC 2.0 request envelope.
 #[derive(Debug, Deserialize)]
@@ -67,7 +64,7 @@ pub struct JsonRpcError {
 #[derive(Clone)]
 pub struct McpServer {
     store: MemoryStore,
-    embedder: Embedder,
+    embedder: Arc<dyn Embedder>,
     dim: usize,
 }
 
@@ -81,25 +78,41 @@ impl std::fmt::Debug for McpServer {
 }
 
 impl McpServer {
-    /// Build a server with the default toy embedder.
+    /// Build a server with the default `HashEmbedder` (32-d).
     pub fn new() -> Self {
-        let dim = DEFAULT_DIM;
+        Self::with_provider(Arc::new(HashEmbedder::new(DEFAULT_DIM)))
+    }
+
+    /// Build with an explicit embedder. The store's `dim` is taken from
+    /// `embedder.dim()`.
+    pub fn with_provider(embedder: Arc<dyn Embedder>) -> Self {
+        let dim = embedder.dim();
         Self {
             store: MemoryStore::with_capacity(dim, 100_000),
-            embedder: Arc::new(toy_embed),
+            embedder,
             dim,
         }
     }
 
-    /// Plug in a real embedder. The vector length must match the store's `dim`.
-    pub fn with_embedder<F>(mut self, dim: usize, embedder: F) -> Self
+    /// Convenience: wrap a closure as an embedder. Useful for tests.
+    pub fn with_embedder<F>(self, dim: usize, embedder: F) -> Self
     where
         F: Fn(&str) -> Vec<f32> + Send + Sync + 'static,
     {
-        self.dim = dim;
-        self.store = MemoryStore::with_capacity(dim, 100_000);
-        self.embedder = Arc::new(embedder);
-        self
+        struct ClosureEmbedder<F> {
+            dim: usize,
+            f: F,
+        }
+        impl<F: Fn(&str) -> Vec<f32> + Send + Sync> Embedder for ClosureEmbedder<F> {
+            fn embed(&self, text: &str) -> duxx_core::Result<Vec<f32>> {
+                Ok((self.f)(text))
+            }
+            fn dim(&self) -> usize {
+                self.dim
+            }
+        }
+        let _ = self;
+        Self::with_provider(Arc::new(ClosureEmbedder { dim, f: embedder }))
     }
 
     pub fn store(&self) -> &MemoryStore {
@@ -251,7 +264,10 @@ impl McpServer {
     fn tool_remember(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
         let key = args.get("key").and_then(Value::as_str).ok_or_else(|| invalid_params("missing 'key'"))?;
         let text = args.get("text").and_then(Value::as_str).ok_or_else(|| invalid_params("missing 'text'"))?;
-        let emb = (self.embedder)(text);
+        let emb = self
+            .embedder
+            .embed(text)
+            .map_err(|e| internal(format!("embed: {e}")))?;
         if emb.len() != self.dim {
             return Err(internal(format!(
                 "embedder produced dim {} but store expects {}",
@@ -270,7 +286,10 @@ impl McpServer {
         let key = args.get("key").and_then(Value::as_str).ok_or_else(|| invalid_params("missing 'key'"))?;
         let query = args.get("query").and_then(Value::as_str).ok_or_else(|| invalid_params("missing 'query'"))?;
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
-        let qvec = (self.embedder)(query);
+        let qvec = self
+            .embedder
+            .embed(query)
+            .map_err(|e| internal(format!("embed: {e}")))?;
         if qvec.len() != self.dim {
             return Err(internal(format!(
                 "embedder produced dim {} but store expects {}",
@@ -326,30 +345,6 @@ fn internal(msg: impl Into<String>) -> JsonRpcError {
         message: msg.into(),
         data: None,
     }
-}
-
-/// Toy embedder: hash tokens into 32-d vector. Self-contained for demos.
-fn toy_embed(text: &str) -> Vec<f32> {
-    duxx_toy_embed(text, DEFAULT_DIM)
-}
-
-/// Public reusable hash-bucket embedder. Keeps the example crate from
-/// having to redefine this helper.
-pub fn duxx_toy_embed(text: &str, dim: usize) -> Vec<f32> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut v = vec![0.0f32; dim];
-    for token in text.to_lowercase().split_whitespace() {
-        let mut h = DefaultHasher::new();
-        token.hash(&mut h);
-        let bucket = (h.finish() as usize) % dim;
-        v[bucket] += 1.0;
-    }
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-    for x in &mut v {
-        *x /= norm;
-    }
-    v
 }
 
 #[cfg(test)]

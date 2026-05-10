@@ -53,9 +53,19 @@ hits = db.recall(user="user_42", query="refund issue", k=10)
 
 ---
 
+## ⚠ Pre-alpha — closed UAT only
+
+DuxxDB is in **closed UAT** (v0.1). The current storage layer is
+**in-memory only** — process restart loses every memory, session, and
+tool-cache entry. Don't put production data in DuxxDB until Phase 2.3
+(Lance disk persistence) lands. See
+[docs/UAT_GUIDE.md](./docs/UAT_GUIDE.md) for the full read-before-you-test
+checklist.
+
 ## Documentation
 
-- **[docs/PROJECT_OVERVIEW.md](./docs/PROJECT_OVERVIEW.md)** — capabilities, competitive landscape, install + quickstart, performance numbers. **Start here.**
+- **[docs/UAT_GUIDE.md](./docs/UAT_GUIDE.md)** — install + integration recipes, what works, what's missing. **Read before testing.**
+- **[docs/PROJECT_OVERVIEW.md](./docs/PROJECT_OVERVIEW.md)** — capabilities, competitive landscape, performance numbers.
 - **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)** — full system design.
 - **[docs/SETUP.md](./docs/SETUP.md)** — install log + cross-platform notes.
 - **[docs/ROADMAP.md](./docs/ROADMAP.md)** — phased plan + status.

@@ -11,6 +11,7 @@ members = [
     "crates/duxx-mcp",
     "crates/duxx-cli",
     "crates/duxx-bench",
+    "crates/duxx-embed",
     "bindings/python",
 ]
 
@@ -63,6 +64,11 @@ duxx-index = { path = "crates/duxx-index", version = "0.1.0" }
 duxx-query = { path = "crates/duxx-query", version = "0.1.0" }
 duxx-memory = { path = "crates/duxx-memory", version = "0.1.0" }
 duxx-reactive = { path = "crates/duxx-reactive", version = "0.1.0" }
+duxx-embed = { path = "crates/duxx-embed", version = "0.1.0" }
+
+# HTTP client for OpenAI / Cohere embedders. rustls-tls = no OpenSSL native build,
+# blocking = sync API matches our embedder trait.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 
 [profile.release]
 lto = "thin"

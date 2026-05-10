@@ -1,0 +1,15 @@
+target/
+.git/
+.github/
+.cargo/
+.claude/
+.venv/
+docs/
+examples/
+scripts/
+**/target/
+**/*.log
+**/*.tmp
+**/.DS_Store
+*.md
+!Cargo.toml

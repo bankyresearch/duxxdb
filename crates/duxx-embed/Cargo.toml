@@ -1,0 +1,24 @@
+[package]
+name = "duxx-embed"
+description = "Embedding providers for DuxxDB — hash (toy), OpenAI, Cohere."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["hash"]
+hash = []
+openai = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+cohere = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+# Convenience: enable both HTTP providers.
+http = ["openai", "cohere"]
+
+[dependencies]
+duxx-core.workspace = true
+tracing.workspace = true
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }

@@ -26,6 +26,7 @@
 
 pub mod resp;
 
+use duxx_embed::{Embedder, HashEmbedder};
 use duxx_memory::{MemoryStore, SessionStore};
 use duxx_reactive::{ChangeEvent, ChangeKind};
 use resp::RespValue;
@@ -39,15 +40,12 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const DEFAULT_DIM: usize = 32;
 
-/// Embedder closure type.
-pub type Embedder = Arc<dyn Fn(&str) -> Vec<f32> + Send + Sync>;
-
 /// The server state — cheaply cloned (Arc internals).
 #[derive(Clone)]
 pub struct Server {
     memory: MemoryStore,
     sessions: SessionStore,
-    embedder: Embedder,
+    embedder: Arc<dyn Embedder>,
     dim: usize,
 }
 
@@ -62,24 +60,42 @@ impl std::fmt::Debug for Server {
 }
 
 impl Server {
+    /// Build with the default `HashEmbedder` (toy, 32-d).
     pub fn new() -> Self {
-        let dim = DEFAULT_DIM;
+        Self::with_provider(Arc::new(HashEmbedder::new(DEFAULT_DIM)))
+    }
+
+    /// Build with an explicit embedder. The store's vector dim is taken
+    /// from `embedder.dim()`.
+    pub fn with_provider(embedder: Arc<dyn Embedder>) -> Self {
+        let dim = embedder.dim();
         Self {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
-            embedder: Arc::new(toy_embed),
+            embedder,
             dim,
         }
     }
 
-    pub fn with_embedder<F>(mut self, dim: usize, embedder: F) -> Self
+    /// Convenience: wrap a closure as an embedder. Useful for tests.
+    pub fn with_embedder<F>(self, dim: usize, embedder: F) -> Self
     where
         F: Fn(&str) -> Vec<f32> + Send + Sync + 'static,
     {
-        self.dim = dim;
-        self.memory = MemoryStore::with_capacity(dim, 100_000);
-        self.embedder = Arc::new(embedder);
-        self
+        struct ClosureEmbedder<F> {
+            dim: usize,
+            f: F,
+        }
+        impl<F: Fn(&str) -> Vec<f32> + Send + Sync> Embedder for ClosureEmbedder<F> {
+            fn embed(&self, text: &str) -> duxx_core::Result<Vec<f32>> {
+                Ok((self.f)(text))
+            }
+            fn dim(&self) -> usize {
+                self.dim
+            }
+        }
+        let _ = self;
+        Self::with_provider(Arc::new(ClosureEmbedder { dim, f: embedder }))
     }
 
     pub fn memory(&self) -> &MemoryStore {
@@ -352,7 +368,10 @@ impl Server {
             return Response::Reply(err("ERR REMEMBER text required"));
         }
         let text = parts.join(" ");
-        let emb = (self.embedder)(&text);
+        let emb = match self.embedder.embed(&text) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
+        };
         if emb.len() != self.dim {
             return Response::Reply(err(format!(
                 "ERR embedder dim {} != server dim {}",
@@ -421,7 +440,10 @@ impl Server {
         } else {
             10
         };
-        let qvec = (self.embedder)(query);
+        let qvec = match self.embedder.embed(query) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
+        };
         if qvec.len() != self.dim {
             return Response::Reply(err(format!(
                 "ERR embedder dim {} != server dim {}",
@@ -498,24 +520,6 @@ fn arg_string(v: &RespValue) -> Option<&str> {
         RespValue::SimpleString(s) => Some(s),
         _ => None,
     }
-}
-
-/// Toy 32-d hash-bucket embedder. DO NOT use in production.
-fn toy_embed(text: &str) -> Vec<f32> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut v = vec![0.0f32; DEFAULT_DIM];
-    for token in text.to_lowercase().split_whitespace() {
-        let mut h = DefaultHasher::new();
-        token.hash(&mut h);
-        let bucket = (h.finish() as usize) % DEFAULT_DIM;
-        v[bucket] += 1.0;
-    }
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-    for x in &mut v {
-        *x /= norm;
-    }
-    v
 }
 
 #[cfg(test)]
