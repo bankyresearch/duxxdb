@@ -1,8 +1,10 @@
 # DuxxDB — Project Overview
 
 > The database built for AI agents. Embedded + server, hybrid (vector +
-> BM25 + structured), durable, with reactive subscriptions and Apache
-> Parquet cold-tier. **Closed UAT — feature-complete through Phase 5.**
+> BM25 + structured), durable, with reactive subscriptions, Apache
+> Parquet cold-tier, and prod-grade hardening (auth, health, Prometheus
+> metrics, graceful shutdown). **Closed UAT — feature-complete through
+> Phase 6.1.**
 
 [![CI](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml/badge.svg)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](../LICENSE)
@@ -159,6 +161,7 @@ RESP / gRPC / MCP servers wrap.
 | Pure Rust core — no GC pauses, no FFI bottlenecks | ✅ | Qdrant ✅, LanceDB ✅; Pinecone/Weaviate/Milvus all have GC |
 | Apache 2.0, no proprietary "open core" tax | ✅ | Pinecone is proprietary; Milvus has Zilliz cloud lock-in pressure |
 | **Apache Parquet cold-tier export** | ✅ | Nobody bundles it for agent memory |
+| **Auth + Prometheus /metrics + gRPC health + graceful shutdown** out of the box | ✅ | Most OSS vector DBs leave at least one of these to the operator |
 
 **The single biggest differentiator:** every other tool forces you to
 *choose* between vector / KV / SQL, or to *compose* multiple stores
@@ -169,7 +172,7 @@ surfaces from one binary.
 
 ## 5. Capabilities today
 
-All of Phase 0 → 5 ships. **99 tests passing** workspace-wide; CI
+All of Phase 0 → 6.1 ships. **106 tests passing** workspace-wide; CI
 matrix on Linux + macOS + Windows.
 
 ### Storage layer
@@ -209,6 +212,25 @@ matrix on Linux + macOS + Windows.
 - **Python wheel** — PyO3 + maturin abi3-py38; one wheel works on
   Python 3.8 → 3.13.
 - **Node bindings** — napi-rs v2; `.node` native module per platform.
+
+### Production hardening (Phase 6.1)
+
+- **Auth.** `--token TOKEN` / `DUXX_TOKEN` on `duxx-server` (RESP) and
+  `duxx-grpc`; constant-time compare; RESP `NOAUTH` / `WRONGPASS` flow,
+  gRPC `x-duxx-token` metadata via tonic Interceptor.
+- **Health.** gRPC standard `grpc.health.v1.Health` via [tonic-health];
+  RESP exposes `/health` on the metrics listener.
+- **Prometheus metrics.** `--metrics-addr HOST:PORT` /
+  `DUXX_METRICS_ADDR` binds a separate hyper listener serving
+  `/metrics` (counters / gauges / histograms) + `/health`.
+- **Graceful shutdown.** Ctrl+C / SIGTERM stops accepting and drains
+  in-flight connections up to `--drain-secs N` (default 30) before
+  triggering tantivy commit + HNSW dump (so `dir:` reopens fast).
+- **Backup.** Cron-driven Parquet snapshots; restore stub +
+  disaster-recovery posture documented in
+  [USER_GUIDE.md § 6](USER_GUIDE.md#6-backup--restore).
+
+[tonic-health]: https://crates.io/crates/tonic-health
 
 ### Storage modes
 
@@ -507,7 +529,9 @@ Full version: [ROADMAP.md](ROADMAP.md). Snapshot:
 | 4.6 | Comparative bench (embedded vs LanceDB) | ✅ |
 | 4.7 | Network comparative bench (vs Redis / Qdrant / pgvector) | ✅ wired; need Docker for full numbers |
 | 5 | Cold-tier export (Apache Parquet) | ✅ |
-| **6** | **Distributed mode, RBAC, observability** | **Future** |
+| **6.1** | **Prod hardening (auth, health, Prometheus, drain)** | ✅ |
+| 6.2 | TLS-native, memory limits + eviction | Planned |
+| 6.3+ | Distributed mode, RBAC, OpenTelemetry, SIMD tuning | Future |
 | Lance | As alternate `Storage` impl | Designed; not blocking — redb covers durability |
 
 ---
@@ -516,27 +540,33 @@ Full version: [ROADMAP.md](ROADMAP.md). Snapshot:
 
 We're **Closed UAT** (v0.1). Honest list of what's still missing:
 
-1. **No auth on the wire.** `duxx-server` and `duxx-grpc` accept any
-   connection. Bind to `127.0.0.1` only; reverse-proxy with auth
-   (nginx + basic auth, mTLS, or a service mesh) for now. RBAC + mTLS
-   land in Phase 6.
-2. **No multi-tenant isolation** in a single process. Run one
+1. **No native TLS yet.** Auth is shipped (`--token` on RESP and
+   gRPC), but TLS termination happens at your load balancer / sidecar
+   for now. Native rustls on both wire protocols lands in Phase 6.2.
+2. **No RBAC.** Single shared token per daemon today. Per-key /
+   per-agent permissions land in Phase 6.2+.
+3. **No multi-tenant isolation** in a single process. Run one
    `--storage dir:./tenant-X` daemon per tenant for now.
-3. **No SIMD-tuned distance kernels yet.** `hnsw_rs` has decent SIMD
+4. **No memory cap / eviction yet.** Phase 6.2: importance-aware
+   eviction once a soft byte cap is exceeded.
+5. **No SIMD-tuned distance kernels yet.** `hnsw_rs` has decent SIMD
    internally; future work may swap to AVX-512 hand-tuned routines.
-4. **Single node only.** No sharding / replication. Phase 6.
-5. **No schema migrations.** Tables are immutable in shape; the row
+6. **Single node only.** No sharding / replication. Phase 6.3+.
+7. **No schema migrations.** Tables are immutable in shape; the row
    store is just bytes-keyed today.
-6. **Public API may shift** before v1.0. Pin a git SHA, not `master`,
+8. **Public API may shift** before v1.0. Pin a git SHA, not `master`,
    if stability matters. The `duxx-memory` surface has been stable
    since Phase 2.6.
-7. **Comparative bench has 3 wired-but-unrun targets** (Redis Stack,
+9. **Comparative bench has 3 wired-but-unrun targets** (Redis Stack,
    Qdrant, pgvector). Numbers fill in once Docker daemon is up on a
    bench host.
 
 For Closed UAT use cases (single-tenant agent prototypes, internal
-demos, PoCs), this is enough. Open UAT to public traffic waits on
-Phase 6.
+demos, PoCs), this is enough. With Phase 6.1 shipped (auth, health,
+metrics, graceful shutdown) DuxxDB is also suitable for internal
+production behind a TLS-terminating load balancer. Open UAT to public
+internet traffic waits on Phase 6.2 (native TLS) and Phase 6.3+
+(distributed / RBAC).
 
 ---
 
@@ -580,4 +610,5 @@ useful to you, please support its upstream dependencies first.
 
 ---
 
-*Last updated: Phase 5 shipped, CI green. See `git log` for changes.*
+*Last updated: Phase 6.1 shipped (auth, health, Prometheus, graceful
+shutdown). See `git log` for changes.*

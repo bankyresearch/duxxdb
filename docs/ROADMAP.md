@@ -157,12 +157,52 @@ verified via pyarrow.
 
 ---
 
-## Phase 6 — Production hardening (later)
+## Phase 6.1 — Production hardening ✅ Shipped
 
+UAT-ready prod-level capabilities for the core daemons.
+
+- [x] **Authentication.** `--token TOKEN` / `DUXX_TOKEN` env on both
+      `duxx-server` (RESP) and `duxx-grpc`. Constant-time compare.
+      RESP returns Redis-compatible `NOAUTH` / `WRONGPASS`; gRPC uses
+      a tonic `Interceptor` checking `x-duxx-token` metadata on every
+      RPC. Pre-AUTH RESP allows only `PING` / `AUTH` / `QUIT` / `HELLO`.
+- [x] **Health.** gRPC server registers
+      `grpc.health.v1.Health` via [tonic-health]; standard
+      `grpc_health_probe` / Kubernetes probes work unchanged. RESP
+      `/health` exposed via the metrics endpoint (returns 200 OK).
+- [x] **Prometheus metrics.** `--metrics-addr HOST:PORT` /
+      `DUXX_METRICS_ADDR` binds a separate hyper listener serving
+      `/metrics` (Prometheus text format) + `/health`. Counters for
+      connections / commands / errors / remembers / recalls; gauges
+      for active connections / memory count / session count;
+      histogram for per-command latency.
+- [x] **Graceful shutdown.** `serve_with_shutdown(addr, signal, drain)`
+      stops accepting on Ctrl+C / SIGTERM, drains in-flight
+      connections up to the budget (`--drain-secs N`, default 30),
+      then triggers `MemoryStore::Drop` (tantivy commit + HNSW dump)
+      so a `dir:` backend reopen takes the fast path.
+- [x] **Backup & restore documented.** `USER_GUIDE.md` § 6 covers
+      Parquet snapshot via cron + a Rust restore stub + a
+      disaster-recovery posture table.
+
+[tonic-health]: https://crates.io/crates/tonic-health
+
+**Exit criterion (met):** a single binary can be deployed behind a
+TLS-terminating load balancer with auth, scraped by Prometheus,
+probed for health, and gracefully drained on rolling restarts.
+
+---
+
+## Phase 6.2+ — Future hardening
+
+Tracked, not yet scheduled.
+
+- TLS-native (rustls) on RESP + gRPC (currently terminate at LB).
+- Memory limits + importance-based eviction (agent-specific).
 - Distributed / sharded mode.
 - Row-level security.
 - Query cache.
-- Observability: OpenTelemetry, Prometheus metrics.
+- OpenTelemetry tracing export.
 - SIMD tuning per architecture (AVX-512, ARM NEON).
 
 ---
