@@ -36,22 +36,20 @@ Welcome. You're an early DuxxDB user. This guide tells you:
 
 ## 2. Known limitations ⚠
 
-### 🛑 Data is not durable
+### ✅ Memories ARE durable when `--storage` is set
 
-The current storage layer is **in-memory only**. When `duxx-server`
-exits, every memory, session, and tool-cache entry is lost. Use it for
-the kind of work where that's OK:
+`duxx-server --storage redb:./data/duxx.redb` makes every `REMEMBER`
+write through to a [redb] file on disk. Restarting the process
+reloads everything from that file before accepting new connections.
 
-- **Stateless chat sessions** — restart wipes history; users start fresh.
-- **Test bots, demo agents** — losing state between runs is fine.
-- **Short-lived agent tasks** — a worker that runs for an hour and then
-  exits never needed durability.
+Without `--storage` (the default), state is in-memory only and lost on
+exit — fine for ephemeral demos or stateless agents.
 
-Use a separate durable store (Postgres, SQLite, Valkey AOF, S3) for
-anything you need to survive a process restart.
+**Still in-memory regardless of `--storage`:** `SessionStore` and
+`ToolCache`. Their TTLs are usually shorter than process uptime so
+this is fine; durability lands in a follow-up.
 
-Phase 2.3 (Lance disk persistence) lands in a future release. See
-[PHASE_2_3_PLAN.md](PHASE_2_3_PLAN.md).
+[redb]: https://github.com/cberner/redb
 
 ### Other current gaps
 
@@ -79,14 +77,19 @@ redis-cli -p 6379
 (integer) 1
 ```
 
-With OpenAI embeddings:
+With OpenAI embeddings + persistent storage:
 
 ```bash
+mkdir -p ./duxx-data
 docker run --rm -p 6379:6379 \
+  -v "$PWD/duxx-data:/data" \
   -e DUXX_EMBEDDER=openai:text-embedding-3-small \
+  -e DUXX_STORAGE=redb:/data/duxx.redb \
   -e OPENAI_API_KEY="$OPENAI_API_KEY" \
   duxxdb:0.1.0
 ```
+
+Now memories survive container restart.
 
 ### Option B — Python wheel
 

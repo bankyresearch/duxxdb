@@ -225,6 +225,28 @@ redis-cli -p 6379
    3) "I lost my wallet"
 ```
 
+### ✅ Phase 2.3 — Durable storage via redb
+
+Pluggable `Storage` trait + a [redb] backend. `--storage redb:./path`
+on `duxx-server` makes memories survive process restart:
+
+```bash
+duxx-server --storage redb:./data/duxx.redb &
+redis-cli -p 6379 -X REMEMBER alice "hello world"
+# kill server
+duxx-server --storage redb:./data/duxx.redb &
+redis-cli -p 6379 RECALL alice "hello"
+# 1) (integer) 1
+#    "0.032787"
+#    "hello world"
+```
+
+Why redb instead of Lance? Pure Rust, zero FFI risk, ACID, MVCC —
+unblocks Open UAT today. Lance can still slot in later as another
+`Storage` impl.
+
+[redb]: https://github.com/cberner/redb
+
 ### ✅ Phase 4 (in-process) — Reactive subscriptions
 
 `MemoryStore::remember()` publishes a `ChangeEvent` to a
@@ -310,11 +332,13 @@ Glob patterns: `*` matches any sequence, `?` matches one char,
 
 | Phase | Component | Status |
 |---|---|---|
-| 2.3 | Lance-backed `Table` (durable storage) | Plan written ([PHASE_2_3_PLAN.md](PHASE_2_3_PLAN.md)); next session |
+| 2.3.5 | Index persistence (skip cold-start rebuild) | Designed |
+| 2.4 | Cross-restart importance decay (Unix-epoch timestamps) | Designed |
 | 3.5 | gRPC daemon for typed cross-language streaming | Designed |
 | 4.6 | Comparative bench vs Redis / Qdrant / pgvector / LanceDB | Designed |
 | 5 | Lakehouse cold-tier export (Iceberg / Delta) | Designed |
 | 6 | Distributed mode, RBAC, observability | Future |
+| Lance | As an alternate `Storage` impl alongside redb | Designed; not blocking, redb covers durability |
 
 [tantivy]: https://github.com/quickwit-oss/tantivy
 [hnsw_rs]: https://crates.io/crates/hnsw_rs

@@ -46,10 +46,16 @@ Goal: working in-process database with hybrid search on 1M rows.
 - [x] **2.2** — Replace placeholder `VectorIndex` with [hnsw_rs] HNSW
 - [x] **2.5** — Batched tantivy commits + auto-flush on read
       (≈30× bulk-insert speedup)
-- [ ] **2.3** — Lance-backed `Table` for durable storage. See
-      [PHASE_2_3_PLAN.md](./PHASE_2_3_PLAN.md). Deferred to its own
-      session because of the dependency footprint and FFI risk on
-      Windows + mingw.
+- [x] **2.3** — Durable storage via [redb] behind a pluggable
+      `Storage` trait. `MemoryStore::with_storage()` replays every
+      persisted memory back into the in-memory caches + indices on
+      open. Server flag `--storage redb:./path` enables durability.
+      Lance was the original target; we shipped redb instead because
+      it's pure Rust (zero FFI risk), ACID, and unblocks Open UAT
+      today. Lance can still slot in as another `Storage` impl later
+      ([PHASE_2_3_PLAN.md](./PHASE_2_3_PLAN.md)).
+
+[redb]: https://github.com/cberner/redb
 
 [tantivy]: https://github.com/quickwit-oss/tantivy
 [hnsw_rs]: https://crates.io/crates/hnsw_rs

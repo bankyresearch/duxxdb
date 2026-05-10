@@ -55,12 +55,12 @@ hits = db.recall(user="user_42", query="refund issue", k=10)
 
 ## ⚠ Pre-alpha — closed UAT only
 
-DuxxDB is in **closed UAT** (v0.1). The current storage layer is
-**in-memory only** — process restart loses every memory, session, and
-tool-cache entry. Don't put production data in DuxxDB until Phase 2.3
-(Lance disk persistence) lands. See
-[docs/UAT_GUIDE.md](./docs/UAT_GUIDE.md) for the full read-before-you-test
-checklist.
+DuxxDB is in **closed UAT** (v0.1). Memories now persist to disk
+when you pass `--storage redb:./path/to/file.redb` to `duxx-server`
+(or set `DUXX_STORAGE=redb:...`). Without that flag, state is
+in-memory only. Other data (sessions, tool-cache) is still in-memory
+regardless. See [docs/UAT_GUIDE.md](./docs/UAT_GUIDE.md) for the full
+read-before-you-test checklist.
 
 ## Documentation
 
