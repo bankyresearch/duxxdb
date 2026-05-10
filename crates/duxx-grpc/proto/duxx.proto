@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package duxx.v1;
+
+// DuxxDB - the database built for AI agents.
+//
+// Mirrors the embedded Rust API and the RESP TCP server. Use this
+// service when you need typed cross-language streaming (e.g. Python
+// agents subscribing to a fleet of memory writes).
+service Duxx {
+    // Store a memory. Returns the assigned id.
+    rpc Remember(RememberRequest) returns (RememberResponse);
+
+    // Top-k hybrid recall (vector + BM25, RRF-fused).
+    rpc Recall(RecallRequest) returns (RecallResponse);
+
+    // Subscribe to memory change events. Server streams a ChangeEvent
+    // for every `remember` call whose channel matches the (optional)
+    // glob pattern. An empty pattern matches all events.
+    rpc Subscribe(SubscribeRequest) returns (stream ChangeEvent);
+
+    // Server stats / health probe.
+    rpc Stats(StatsRequest) returns (StatsResponse);
+
+    // Liveness check.
+    rpc Ping(PingRequest) returns (PingResponse);
+}
+
+// ----- messages ------------------------------------------------------------
+
+message RememberRequest {
+    string key = 1;
+    string text = 2;
+    // Optional. If empty, the server's configured embedder is used.
+    repeated float embedding = 3;
+}
+
+message RememberResponse {
+    uint64 id = 1;
+}
+
+message RecallRequest {
+    string key = 1;
+    string query = 2;
+    // Optional. If empty, the server's configured embedder is used.
+    repeated float embedding = 3;
+    uint32 k = 4;  // 0 -> default 10
+}
+
+message RecallResponse {
+    repeated MemoryHit hits = 1;
+}
+
+message MemoryHit {
+    uint64 id = 1;
+    string key = 2;
+    string text = 3;
+    float score = 4;
+}
+
+message SubscribeRequest {
+    // Glob pattern matched against `<table>.<key>` channels (e.g.
+    // "memory.alice", "memory.*"). Empty = match all.
+    string pattern = 1;
+}
+
+message ChangeEvent {
+    string table = 1;
+    string key = 2;
+    uint64 row_id = 3;
+    Kind kind = 4;
+    // The full channel string this event was published to.
+    string channel = 5;
+
+    enum Kind {
+        UNSPECIFIED = 0;
+        INSERT = 1;
+        UPDATE = 2;
+        DELETE = 3;
+    }
+}
+
+message StatsRequest {}
+
+message StatsResponse {
+    uint64 memories = 1;
+    uint64 sessions = 2;
+    uint32 dim = 3;
+    string version = 4;
+}
+
+message PingRequest {
+    string nonce = 1;
+}
+
+message PingResponse {
+    string nonce = 1;
+}

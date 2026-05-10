@@ -12,6 +12,7 @@ members = [
     "crates/duxx-cli",
     "crates/duxx-bench",
     "crates/duxx-embed",
+    "crates/duxx-grpc",
     "bindings/python",
 ]
 # bindings/node is intentionally NOT a workspace member: napi-build
@@ -66,6 +67,13 @@ pyo3 = { version = "0.22", features = ["abi3-py38"] }
 napi = { version = "2.16", default-features = false, features = ["napi9"] }
 napi-derive = "2.16"
 napi-build = "2"
+
+# gRPC daemon (Phase 3.5)
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Internal crates (consumed by siblings)
 duxx-core = { path = "crates/duxx-core", version = "0.1.0" }
