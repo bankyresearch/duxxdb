@@ -123,21 +123,32 @@ jobs:
           cp LICENSE NOTICE README.md "dist/${STAGE}/"
           cp docs/INSTALLATION.md docs/USER_GUIDE.md "dist/${STAGE}/" || true
 
+          # Pack into the archive name set by the matrix. Don't try
+          # to rewrite extensions -- ARCHIVE_NAME already has the
+          # right .tar.gz / .zip suffix from the matrix, and any
+          # ${VAR%.tar.gz}.zip substitution caused a .zip.zip bug.
           cd dist
           if [ "${{ matrix.kind }}" = "zip" ]; then
-            7z a "${ARCHIVE_NAME%.tar.gz}.zip" "${STAGE}"
+            7z a "${ARCHIVE_NAME}" "${STAGE}"
           else
             tar -czf "${ARCHIVE_NAME}" "${STAGE}"
           fi
+          # Drop the staging dir; only the archive should be uploaded.
+          rm -rf "${STAGE}"
           ls -la
 
-          echo "archive=dist/${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "archive_path=dist/${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "archive_name=${ARCHIVE_NAME}"      >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
+          # Upload ONLY the packed archive, not the staging directory.
+          # An earlier glob `dist/duxxdb-*` matched both the tar/zip
+          # AND the staging dir, which sha256sum then choked on in the
+          # publish job.
           name: archive-${{ matrix.target }}
-          path: dist/duxxdb-*
+          path: ${{ steps.pack.outputs.archive_path }}
 
   # --------------------------------------------------------------------------
   build-deb:

@@ -29,7 +29,10 @@
 # and Prometheus scrape config, see packaging/docker/docker-compose.yml.
 
 # ---------------------------------------------------------------- builder ----
-FROM rust:1.83-bookworm AS builder
+# `rust:1-bookworm` rolls forward to the latest stable Rust release.
+# Rust 1.85+ is required for `edition2024` (some transitive deps,
+# e.g. time-macros, opted in to it).
+FROM rust:1-bookworm AS builder
 
 WORKDIR /usr/src/duxxdb
 
