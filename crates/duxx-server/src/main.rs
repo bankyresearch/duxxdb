@@ -20,7 +20,6 @@
 //!    3) "I lost my wallet"
 //! ```
 
-use duxx_server::Server;
 use std::sync::Arc;
 
 #[tokio::main]

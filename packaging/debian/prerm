@@ -1,0 +1,12 @@
+#!/bin/sh
+# DuxxDB .deb pre-removal script.
+# Stops the service before files disappear.
+
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl stop duxxdb.service >/dev/null 2>&1 || true
+fi
+
+#DEBHELPER#
+exit 0

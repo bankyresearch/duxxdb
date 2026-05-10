@@ -1,0 +1,36 @@
+#!/bin/sh
+# DuxxDB .deb post-removal script.
+#
+# On `purge`:
+#   - removes the duxxdb system user
+#   - removes /var/lib/duxxdb (the operator's data!)
+#   - removes /etc/duxxdb
+#
+# On plain `remove`:
+#   - leaves user + data + config in place so a reinstall is seamless.
+
+set -e
+
+case "$1" in
+    purge)
+        # Remove data directory. THIS IS DESTRUCTIVE.
+        rm -rf /var/lib/duxxdb || true
+        rm -rf /etc/duxxdb || true
+        # Remove the system user/group.
+        if getent passwd duxxdb >/dev/null 2>&1; then
+            deluser --system duxxdb >/dev/null 2>&1 || true
+        fi
+        if getent group duxxdb >/dev/null 2>&1; then
+            delgroup --system duxxdb >/dev/null 2>&1 || true
+        fi
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

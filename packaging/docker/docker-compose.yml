@@ -1,0 +1,101 @@
+# Production-grade docker-compose for DuxxDB.
+#
+#   docker compose -f packaging/docker/docker-compose.yml up -d
+#
+# What this gives you:
+#   * Persistent rows + tantivy + HNSW under the named volume `duxxdb-data`.
+#     Container restarts skip the index rebuild (Phase 2.3.5 fast path).
+#   * Auth required on every connection. Set DUXX_TOKEN in .env first.
+#   * Prometheus /metrics + /health on :9100.
+#   * Graceful shutdown drain (default 30s) before the container is killed.
+#   * Healthcheck via redis-cli PING; orchestrator restarts on failure.
+#   * Optional Prometheus sidecar that scrapes :9100 every 15s.
+#
+# .env file is REQUIRED. Copy the template once, then edit:
+#   cp packaging/docker/.env.example packaging/docker/.env
+#   $EDITOR packaging/docker/.env
+#
+# To stop and KEEP your data:        docker compose down
+# To stop and DELETE your data:      docker compose down -v   # destroys named volume
+# To roll forward to a new image:    docker compose pull && docker compose up -d
+# To inspect logs:                   docker compose logs -f duxxdb
+# To run a shell inside the box:     docker compose exec duxxdb redis-cli -a "$DUXX_TOKEN"
+
+services:
+  duxxdb:
+    image: ghcr.io/bankyresearch/duxxdb:latest
+    # Or build locally from the repo root: `docker compose build`.
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: duxxdb
+    restart: unless-stopped
+
+    # Stop signal + grace window: SIGTERM hits the Phase 6.1 graceful-shutdown
+    # path, which drains in-flight conns up to --drain-secs before exit.
+    stop_signal: SIGTERM
+    stop_grace_period: 35s
+
+    ports:
+      - "${DUXX_PORT:-6379}:6379"      # RESP TCP
+      - "${DUXX_METRICS_PORT:-9100}:9100"  # Prometheus + /health
+
+    environment:
+      DUXX_STORAGE: "dir:/var/lib/duxxdb"
+      DUXX_EMBEDDER: "${DUXX_EMBEDDER:-hash:32}"
+      DUXX_TOKEN: "${DUXX_TOKEN:?DUXX_TOKEN is required for production. See .env.example.}"
+      DUXX_METRICS_ADDR: "0.0.0.0:9100"
+      RUST_LOG: "${RUST_LOG:-info}"
+      # Pass through API keys ONLY if you actually use the OpenAI/Cohere
+      # embedders. Leave blank otherwise.
+      OPENAI_API_KEY: "${OPENAI_API_KEY-}"
+      COHERE_API_KEY: "${COHERE_API_KEY-}"
+
+    # Override the default flags to enable auth + metrics + tuned drain.
+    command: >
+      --addr 0.0.0.0:6379
+      --drain-secs 30
+
+    volumes:
+      - duxxdb-data:/var/lib/duxxdb
+
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$DUXX_TOKEN\" PING | grep -q PONG"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+    # Conservative resource defaults; bump for real workloads.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # --------------------------------------------------------------------------
+  # Optional Prometheus scraper. Comment out the whole service (and remove
+  # the volume below) if you already run Prometheus elsewhere.
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: duxxdb-prometheus
+    restart: unless-stopped
+    profiles: ["metrics"]              # only starts with `--profile metrics`
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      duxxdb:
+        condition: service_healthy
+
+volumes:
+  duxxdb-data:
+    driver: local
+  prometheus-data:
+    driver: local

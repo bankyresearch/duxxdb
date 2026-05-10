@@ -1,0 +1,53 @@
+[Unit]
+Description=DuxxDB - the database for AI agents (RESP server)
+Documentation=https://github.com/bankyresearch/duxxdb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=duxxdb
+Group=duxxdb
+
+# /etc/duxxdb/duxx.env carries DUXX_TOKEN, DUXX_STORAGE, etc.
+# It is created by the .deb / .rpm post-install scripts.
+EnvironmentFile=/etc/duxxdb/duxx.env
+
+# Hardcoded address + drain budget; everything else is env-driven so
+# operators can tune without re-editing this unit.
+ExecStart=/usr/bin/duxx-server --addr 0.0.0.0:6379 --drain-secs 30
+
+# SIGTERM hits Phase 6.1's graceful-shutdown path, which drains
+# in-flight TCP connections then commits tantivy + dumps HNSW.
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+
+# Restart policy: come back if duxx-server crashes, but don't
+# crash-loop forever. systemd default is 10 attempts in 100s.
+Restart=on-failure
+RestartSec=2s
+
+# ---- Sandbox -----------------------------------------------------------------
+# Deny everything that isn't strictly needed. /var/lib/duxxdb is
+# writable; everything else is read-only or hidden. These flags require
+# systemd >= 232 (Debian 9 / Ubuntu 16.04+ / RHEL 8+).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/duxxdb
+
+# Resource caps. Bump for production-scale memory stores.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

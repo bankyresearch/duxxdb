@@ -1,0 +1,68 @@
+#!/bin/sh
+# DuxxDB .deb post-install script.
+#
+# - Creates a `duxxdb` system user + group (no shell, no home).
+# - Creates /var/lib/duxxdb (owned by duxxdb:duxxdb, mode 0750).
+# - Locks down /etc/duxxdb/duxx.env (mode 0640, group duxxdb).
+# - Reloads systemd; the cargo-deb `[package.metadata.deb.systemd-units]`
+#   block handles enable + start.
+
+set -e
+
+# Idempotent user creation.
+if ! getent group duxxdb >/dev/null 2>&1; then
+    addgroup --system duxxdb
+fi
+if ! getent passwd duxxdb >/dev/null 2>&1; then
+    adduser --system --ingroup duxxdb \
+        --home /var/lib/duxxdb \
+        --no-create-home \
+        --shell /usr/sbin/nologin \
+        duxxdb
+fi
+
+# Data directory.
+mkdir -p /var/lib/duxxdb
+chown duxxdb:duxxdb /var/lib/duxxdb
+chmod 0750 /var/lib/duxxdb
+
+# Lock down the env file (it carries the auth token in production).
+if [ -f /etc/duxxdb/duxx.env ]; then
+    chown root:duxxdb /etc/duxxdb/duxx.env
+    chmod 0640 /etc/duxxdb/duxx.env
+fi
+
+# Auto-generate a token if the operator hasn't set one yet AND the env
+# file looks like the unedited template (DUXX_TOKEN= line empty).
+if [ -f /etc/duxxdb/duxx.env ] && grep -qE '^DUXX_TOKEN=$' /etc/duxxdb/duxx.env 2>/dev/null; then
+    if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+        TOK=$(od -vAn -N32 -tx1 < /dev/urandom | tr -d ' \n')
+        sed -i "s|^DUXX_TOKEN=$|DUXX_TOKEN=${TOK}|" /etc/duxxdb/duxx.env
+        echo "DuxxDB: generated random DUXX_TOKEN. View it with:"
+        echo "  sudo grep ^DUXX_TOKEN /etc/duxxdb/duxx.env"
+    fi
+fi
+
+# systemd reload happens automatically via the dh-installed scripts when
+# enable=true, but call it explicitly to be safe on minimal images.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+cat <<EOF
+
+DuxxDB installed.
+
+  sudo systemctl start  duxxdb        # start now
+  sudo systemctl status duxxdb        # check status
+  journalctl -u duxxdb -f             # tail logs
+
+  redis-cli -p 6379 -a "\$(sudo grep ^DUXX_TOKEN /etc/duxxdb/duxx.env | cut -d= -f2)" PING
+
+Edit configuration:    /etc/duxxdb/duxx.env
+Documentation:         /usr/share/doc/duxxdb/
+
+EOF
+
+#DEBHELPER#
+exit 0

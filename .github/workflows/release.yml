@@ -1,0 +1,260 @@
+name: Release
+
+# Triggers on annotated semver tags. Cut a release with:
+#   git tag -a v0.1.0 -m 'DuxxDB v0.1.0'
+#   git push origin v0.1.0
+#
+# Produces, on the GitHub Release for the tag:
+#   * duxxdb-vX.Y.Z-x86_64-linux.tar.gz
+#   * duxxdb-vX.Y.Z-aarch64-linux.tar.gz
+#   * duxxdb-vX.Y.Z-x86_64-macos.tar.gz
+#   * duxxdb-vX.Y.Z-aarch64-macos.tar.gz
+#   * duxxdb-vX.Y.Z-x86_64-windows.zip
+#   * duxxdb_X.Y.Z-1_amd64.deb       (cargo-deb)
+#   * duxxdb-vX.Y.Z-SHA256SUMS
+# And pushes:
+#   * ghcr.io/<owner>/duxxdb:vX.Y.Z
+#   * ghcr.io/<owner>/duxxdb:latest
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write   # create release + upload assets
+  packages: write   # push to GHCR
+
+jobs:
+  # --------------------------------------------------------------------------
+  build-binaries:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: duxxdb-${TAG}-x86_64-linux.tar.gz
+            kind: tar
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: duxxdb-${TAG}-aarch64-linux.tar.gz
+            kind: tar
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: duxxdb-${TAG}-x86_64-macos.tar.gz
+            kind: tar
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: duxxdb-${TAG}-aarch64-macos.tar.gz
+            kind: tar
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: duxxdb-${TAG}-x86_64-windows.zip
+            kind: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cross (linux aarch64)
+        if: ${{ matrix.cross == true }}
+        run: cargo install cross --locked
+
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} \
+              -p duxx-server -p duxx-grpc -p duxx-mcp -p duxx-coldtier \
+              --features duxx-embed/http
+          else
+            cargo build --release --target ${{ matrix.target }} \
+              -p duxx-server -p duxx-grpc -p duxx-mcp -p duxx-coldtier \
+              --features duxx-embed/http
+          fi
+
+      - name: Pack archive
+        id: pack
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euxo pipefail
+          ARCHIVE_NAME=$(echo "${{ matrix.archive }}" | envsubst)
+          STAGE="duxxdb-${TAG}-$(echo "${{ matrix.target }}" | sed -E 's/-(unknown|apple|pc)-//' | sed -E 's/-(gnu|msvc)$//')"
+          mkdir -p "dist/$STAGE"
+
+          EXT=""
+          if [[ "${{ matrix.target }}" == *windows* ]]; then EXT=".exe"; fi
+
+          for bin in duxx-server duxx-grpc duxx-mcp duxx-export; do
+            cp "target/${{ matrix.target }}/release/${bin}${EXT}" "dist/${STAGE}/"
+          done
+          cp LICENSE NOTICE README.md "dist/${STAGE}/"
+          cp docs/INSTALLATION.md docs/USER_GUIDE.md "dist/${STAGE}/" || true
+
+          cd dist
+          if [ "${{ matrix.kind }}" = "zip" ]; then
+            7z a "${ARCHIVE_NAME%.tar.gz}.zip" "${STAGE}"
+          else
+            tar -czf "${ARCHIVE_NAME}" "${STAGE}"
+          fi
+          ls -la
+
+          echo "archive=dist/${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/duxxdb-*
+
+  # --------------------------------------------------------------------------
+  build-deb:
+    name: build .deb (amd64)
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-deb
+      - name: Install cargo-deb + protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          cargo install cargo-deb --locked
+      - name: Build release binaries (amd64)
+        run: |
+          cargo build --release \
+            -p duxx-server -p duxx-grpc -p duxx-mcp -p duxx-coldtier \
+            --features duxx-embed/http
+      - name: Make .deb
+        run: cargo deb -p duxx-server --no-build
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-deb-amd64
+          path: target/debian/*.deb
+
+  # --------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, build-deb]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: archive-*
+          merge-multiple: true
+
+      - name: Compute checksums
+        shell: bash
+        run: |
+          cd dist
+          ls -la
+          sha256sum duxxdb-* duxxdb_* > duxxdb-${{ steps.tag.outputs.tag }}-SHA256SUMS
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            dist/duxxdb-*
+            dist/duxxdb_*
+            dist/*-SHA256SUMS
+
+  # --------------------------------------------------------------------------
+  docker:
+    name: Push GHCR image
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/duxxdb:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/duxxdb:latest
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

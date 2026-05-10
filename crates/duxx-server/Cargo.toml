@@ -15,6 +15,48 @@ path = "src/lib.rs"
 name = "duxx-server"
 path = "src/main.rs"
 
+# ---------------------------------------------------------------------------
+# `cargo deb -p duxx-server` produces a .deb that:
+#   - drops the binary in /usr/bin/duxx-server
+#   - installs the systemd unit + env file from packaging/systemd/
+#   - creates the duxxdb system user (via debian/postinst)
+#   - enables & starts the duxxdb.service unit on first install
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+maintainer = "Bankatesh Choudhary <phdmb10007.21@bitmesra.ac.in>"
+copyright = "2026, DuxxDB Contributors. Apache-2.0."
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+DuxxDB is the database built for AI agents: hybrid (vector + BM25 +
+structured) retrieval in a single query plan, agent-native primitives
+(MEMORY / TOOL_CACHE / SESSION), and embedded-or-server deployment from
+one Rust codebase. Speaks RESP2/3 (Valkey/Redis-compatible), gRPC, and
+MCP stdio. Phase 6.1 ships auth, Prometheus metrics, gRPC health, and
+graceful shutdown out of the box.
+"""
+section = "database"
+priority = "optional"
+depends = "$auto, adduser, redis-tools"
+assets = [
+    ["../../target/release/duxx-server", "usr/bin/duxx-server", "755"],
+    ["../../target/release/duxx-grpc",   "usr/bin/duxx-grpc",   "755"],
+    ["../../target/release/duxx-mcp",    "usr/bin/duxx-mcp",    "755"],
+    ["../../target/release/duxx-export", "usr/bin/duxx-export", "755"],
+    ["../../packaging/systemd/duxxdb.service", "lib/systemd/system/duxxdb.service", "644"],
+    ["../../packaging/systemd/duxx.env",       "etc/duxxdb/duxx.env",                "640"],
+    ["../../README.md",                        "usr/share/doc/duxxdb/README.md",     "644"],
+    ["../../docs/INSTALLATION.md",             "usr/share/doc/duxxdb/INSTALLATION.md", "644"],
+    ["../../docs/USER_GUIDE.md",               "usr/share/doc/duxxdb/USER_GUIDE.md", "644"],
+]
+conf-files = ["/etc/duxxdb/duxx.env"]
+maintainer-scripts = "../../packaging/debian/"
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "../../packaging/systemd/"
+enable = true
+start = false
+restart-after-upgrade = true
+
 [dependencies]
 duxx-core.workspace = true
 duxx-memory.workspace = true
