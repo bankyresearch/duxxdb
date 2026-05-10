@@ -19,7 +19,7 @@ use duxx_storage::Storage;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 // Re-export so users get the full Storage surface from one place.
@@ -43,17 +43,33 @@ pub struct Memory {
     /// returned at recall time is computed via [`Memory::effective_importance`]
     /// and decays exponentially with age.
     pub importance: f32,
-    pub created_at: Instant,
+    /// Wall-clock insert time as nanoseconds since the Unix epoch.
+    /// Wall-clock so it survives process restart (a monotonic `Instant`
+    /// would not). Tiny NTP-induced wobble is acceptable for decay use.
+    pub created_at_unix_ns: u128,
+}
+
+/// Current wall-clock time as Unix-epoch nanoseconds.
+fn now_unix_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 impl Memory {
     /// Importance decayed by elapsed time, half-life style.
     ///
     /// `effective = importance * 2^(-age / half_life)`
-    pub fn effective_importance(&self, half_life: std::time::Duration) -> f32 {
-        let age = self.created_at.elapsed().as_secs_f32();
+    ///
+    /// Age is measured against `now_unix_ns()` so the value continues
+    /// to decay correctly after a process restart.
+    pub fn effective_importance(&self, half_life: Duration) -> f32 {
+        let now = now_unix_ns();
+        let age_ns = now.saturating_sub(self.created_at_unix_ns);
+        let age_secs = age_ns as f32 / 1.0e9;
         let half = half_life.as_secs_f32().max(1e-3);
-        self.importance * 2.0_f32.powf(-age / half)
+        self.importance * 2.0_f32.powf(-age_secs / half)
     }
 }
 
@@ -84,11 +100,8 @@ struct Inner {
     storage: Option<Arc<dyn Storage>>,
 }
 
-/// Wire format for persisted memories. `created_at` is intentionally
-/// not stored — it's reset to `Instant::now()` at reload time, so
-/// importance decay restarts from process start. (Production users
-/// who care about cross-restart decay should clock from
-/// SystemTime / Unix epoch instead — Phase 2.4.)
+/// Wire format for persisted memories. `created_at_unix_ns` is stored
+/// so importance decay continues across process restart (Phase 2.4).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredMemory {
     id: u64,
@@ -96,6 +109,11 @@ struct StoredMemory {
     text: String,
     embedding: Vec<f32>,
     importance: f32,
+    /// Unix epoch nanoseconds. `0` for legacy rows persisted before
+    /// Phase 2.4 — restored as "ancient" so they still appear but
+    /// with near-zero decayed importance.
+    #[serde(default)]
+    created_at_unix_ns: u128,
 }
 
 impl From<&Memory> for StoredMemory {
@@ -106,6 +124,7 @@ impl From<&Memory> for StoredMemory {
             text: m.text.clone(),
             embedding: m.embedding.clone(),
             importance: m.importance,
+            created_at_unix_ns: m.created_at_unix_ns,
         }
     }
 }
@@ -172,7 +191,7 @@ impl MemoryStore {
                 text: stored.text,
                 embedding: stored.embedding,
                 importance: stored.importance,
-                created_at: Instant::now(),
+                created_at_unix_ns: stored.created_at_unix_ns,
             };
             store.inner.by_id.write().insert(id, mem);
             if id > max_id {
@@ -247,7 +266,7 @@ impl MemoryStore {
             text: text.clone(),
             embedding,
             importance: 1.0,
-            created_at: Instant::now(),
+            created_at_unix_ns: now_unix_ns(),
         };
         // Write through to durable storage BEFORE inserting into the
         // in-memory cache. If the persistence write fails, we don't
@@ -413,5 +432,68 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let eff = m.effective_importance(std::time::Duration::from_millis(1));
         assert!(eff < 0.01, "effective importance after many half-lives: {eff}");
+    }
+
+    #[test]
+    fn ancient_memory_decays_to_near_zero() {
+        // Manually construct a Memory with a created_at far in the past.
+        let m = Memory {
+            id: 1,
+            key: "u".into(),
+            text: "ancient".into(),
+            embedding: vec![0.0; 4],
+            importance: 1.0,
+            created_at_unix_ns: 0, // 1970 — extremely old
+        };
+        let eff = m.effective_importance(std::time::Duration::from_secs(60 * 60));
+        assert!(eff < 1e-10, "expected near-zero decay, got {eff}");
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn decay_continues_across_restart() {
+        // Insert a memory, persist it. Reopen. Verify the loaded
+        // memory's created_at_unix_ns matches the original (i.e. the
+        // age grew across the reopen, didn't reset).
+        const DIM: usize = 4;
+        let dir = std::env::temp_dir().join(format!(
+            "duxx-decay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("decay.redb");
+
+        let original_ts: u128;
+        let id: u64;
+        {
+            let storage: Arc<dyn Storage> =
+                Arc::new(duxx_storage::RedbStorage::open(&path).unwrap());
+            let store = MemoryStore::with_storage(DIM, 1_000, storage).unwrap();
+            id = store
+                .remember("u", "remembered_long_ago", embed("ancient", DIM))
+                .unwrap();
+            let m = store.inner.by_id.read().get(&id).cloned().unwrap();
+            original_ts = m.created_at_unix_ns;
+            assert!(original_ts > 0);
+        }
+
+        // Wait at least 1 ms so age > 0 across restart.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        {
+            let storage: Arc<dyn Storage> =
+                Arc::new(duxx_storage::RedbStorage::open(&path).unwrap());
+            let store = MemoryStore::with_storage(DIM, 1_000, storage).unwrap();
+            let m = store.inner.by_id.read().get(&id).cloned().unwrap();
+            assert_eq!(
+                m.created_at_unix_ns, original_ts,
+                "timestamp must be preserved across restart"
+            );
+            // Now decay a millisecond-half-life: should be very small.
+            let eff = m.effective_importance(std::time::Duration::from_millis(1));
+            assert!(eff < 1.0, "should have aged, got eff={eff}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
