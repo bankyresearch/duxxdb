@@ -135,15 +135,25 @@ durability (resume after crash) waits on Lance.
 
 ---
 
-## Phase 5 — Cold-tier bridge (Week 7–8)
+## Phase 5 — Cold-tier export ✅ Shipped (Parquet)
 
-- [ ] Arrow Flight exporter
-- [ ] Iceberg writer (via `iceberg-rust` or bundled catalog)
-- [ ] Delta writer (via `delta-rs`)
-- [ ] Unity Catalog ACL stub (read-only)
-- [ ] Scheduled compaction / re-embedding from cold → hot
+- [x] **Apache Parquet** export via [`duxx-coldtier`](../crates/duxx-coldtier/).
+  - `ParquetExporter::write(&store, path)` library API.
+  - `duxx-export --storage dir:./path --out file.parquet` binary.
+  - Schema: `id` / `key` / `text` / `embedding` (FixedSizeList<Float32, dim>) /
+    `importance` / `created_at_ns`.
+  - SNAPPY-compressed by default; Spark / DuckDB / Polars / pandas /
+    pyarrow read it natively.
+- [ ] Delta Lake wrapping (`deltalake` crate) — defer until a
+      production user actually needs the transaction log + time travel.
+      Parquet covers the common "export to lakehouse" use case.
+- [ ] Iceberg / Unity Catalog — same posture as Delta; defer.
+- [ ] Scheduled / streaming export — currently one-shot; periodic
+      re-export via cron / systemd timer is the standard pattern.
 
-**Exit criterion:** a DuxxDB table can sync to an Iceberg table on S3 / local file store.
+**Exit criterion (met):** a DuxxDB store can be exported to a
+Parquet file readable by every major analytics tool. End-to-end
+verified via pyarrow.
 
 ---
 
