@@ -1,0 +1,29 @@
+[package]
+name = "duxx-coldtier"
+description = "DuxxDB cold-tier export (Parquet today; Delta/Iceberg behind feature flags later)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "duxx-export"
+path = "src/main.rs"
+
+[dependencies]
+duxx-core.workspace = true
+duxx-memory.workspace = true
+duxx-storage.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

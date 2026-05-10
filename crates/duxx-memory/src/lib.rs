@@ -260,6 +260,15 @@ impl MemoryStore {
         self.len() == 0
     }
 
+    /// Snapshot every memory as a Vec. Order is by id ascending.
+    /// Used by the cold-tier exporter; the cost is O(n) clones.
+    pub fn all_memories(&self) -> Vec<Memory> {
+        let by_id = self.inner.by_id.read();
+        let mut out: Vec<Memory> = by_id.values().cloned().collect();
+        out.sort_by_key(|m| m.id);
+        out
+    }
+
     /// Insert a new memory. `embedding.len()` must match `self.dim()`.
     pub fn remember(
         &self,

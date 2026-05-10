@@ -13,6 +13,7 @@ members = [
     "crates/duxx-bench",
     "crates/duxx-embed",
     "crates/duxx-grpc",
+    "crates/duxx-coldtier",
     "bindings/python",
 ]
 # bindings/node is intentionally NOT a workspace member: napi-build
@@ -74,6 +75,15 @@ tonic-build = "0.12"
 prost = "0.13"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Cold-tier export (Phase 5). Plain Parquet first -- pure Rust, ships
+# anywhere, and Spark/DuckDB/Polars all read it natively. Delta Lake
+# wrapping is a follow-up via the `deltalake` crate when we need
+# transaction-log / time-travel semantics.
+arrow = "53"
+arrow-array = "53"
+arrow-schema = "53"
+parquet = { version = "53", default-features = false, features = ["arrow", "snap"] }
 
 # Internal crates (consumed by siblings)
 duxx-core = { path = "crates/duxx-core", version = "0.1.0" }
