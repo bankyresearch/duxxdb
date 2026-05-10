@@ -277,15 +277,42 @@ print(hits[0])
 Also available: `duxxdb.ToolCache` (semantic-near-hit) and
 `duxxdb.SessionStore` (sliding-TTL KV).
 
+### ✅ Phase 3.4 — Node.js / TypeScript bindings
+
+[`bindings/node`](../bindings/node) ships napi-rs v2 wrappers exposing
+the same public surface as the Python binding (`MemoryStore`,
+`ToolCache`, `SessionStore`). Builds on Linux / macOS / Windows-MSVC
+via `npm run build`; Bun loads the resulting `.node` module too.
+
+```ts
+import { MemoryStore } from "duxxdb";
+const store = new MemoryStore(4);
+store.remember("alice", "hello", [1, 0, 0, 0]);
+```
+
+### ✅ Phase 4.5 — Pattern subscribe + per-key channels
+
+Subscribers can now express "watch only Alice's memories" server-side:
+
+```bash
+redis-cli -p 6379
+> PSUBSCRIBE memory.alice*
+1) "psubscribe"
+2) "memory.alice*"
+3) (integer) 1
+# any other connection's REMEMBER alice "..." now pushes here
+```
+
+Glob patterns: `*` matches any sequence, `?` matches one char,
+`\\X` is a literal escape.
+
 ### 🚧 Still to do
 
 | Phase | Component | Status |
 |---|---|---|
 | 2.3 | Lance-backed `Table` (durable storage) | Plan written ([PHASE_2_3_PLAN.md](PHASE_2_3_PLAN.md)); next session |
-| 3.4 | TypeScript bindings (napi-rs) | Designed |
 | 3.5 | gRPC daemon for typed cross-language streaming | Designed |
-| 4.5 | Pattern-subscribe (`PSUBSCRIBE`), per-key filters | Designed |
-| 4.5 | Comparative bench vs Redis / Qdrant / pgvector / LanceDB | Designed |
+| 4.6 | Comparative bench vs Redis / Qdrant / pgvector / LanceDB | Designed |
 | 5 | Lakehouse cold-tier export (Iceberg / Delta) | Designed |
 | 6 | Distributed mode, RBAC, observability | Future |
 

@@ -84,8 +84,9 @@ Goal: working in-process database with hybrid search on 1M rows.
       work unchanged.
 - [x] **3.3** — Python bindings (`bindings/python`, PyO3 + maturin
       abi3-py38). Single wheel works on Python 3.8 through 3.13.
-      `pip install duxxdb && import duxxdb`.
-- [ ] **3.4** — TypeScript bindings (`bindings/node`, napi-rs)
+- [x] **3.4** — Node.js / TypeScript bindings (`bindings/node`,
+      napi-rs v2). `npm run build` produces a `.node` native module +
+      `index.js` + `index.d.ts`. Builds on Linux / macOS / Windows-MSVC.
 - [ ] **3.5** — gRPC daemon for typed cross-language streaming
 
 ---
@@ -114,7 +115,9 @@ Goal: working in-process database with hybrid search on 1M rows.
 - [ ] WAL tailer (durable resume tokens) — depends on Phase 2.3 (Lance)
 - [ ] Comparative benchmarks vs Redis/Qdrant/pgvector/LanceDB on
       identical workloads
-- [ ] Pattern subscribe (`PSUBSCRIBE`) + per-key filtering — Phase 4.5
+- [x] **Phase 4.5** — `PSUBSCRIBE` patterns + per-key channels.
+      `MemoryStore.remember` publishes to `memory.<key>`; supervisors
+      `PSUBSCRIBE memory.*` to filter by user/agent.
 - [ ] **v0.1.0 release tag** — after Phase 2.3 lands
 
 **Status:** the in-process reactive path works end to end. Network
