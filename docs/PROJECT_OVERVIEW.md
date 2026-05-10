@@ -341,7 +341,7 @@ Glob patterns: `*` matches any sequence, `?` matches one char,
 |---|---|---|
 | 2.3.5 | Index persistence (skip cold-start rebuild) | ✅ Shipped |
 | 2.4 | Cross-restart importance decay (Unix-epoch timestamps) | ✅ Shipped |
-| 3.5 | gRPC daemon for typed cross-language streaming | Designed |
+| 3.5 | gRPC daemon for typed cross-language streaming | ✅ Shipped |
 | 4.6 | Comparative bench vs Redis / Qdrant / pgvector / LanceDB | Designed |
 | 5 | Lakehouse cold-tier export (Iceberg / Delta) | Designed |
 | 6 | Distributed mode, RBAC, observability | Future |

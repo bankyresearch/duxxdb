@@ -94,7 +94,10 @@ Goal: working in-process database with hybrid search on 1M rows.
 - [x] **3.4** — Node.js / TypeScript bindings (`bindings/node`,
       napi-rs v2). `npm run build` produces a `.node` native module +
       `index.js` + `index.d.ts`. Builds on Linux / macOS / Windows-MSVC.
-- [ ] **3.5** — gRPC daemon for typed cross-language streaming
+- [x] **3.5** — gRPC daemon (tonic + prost) with streaming Subscribe.
+      `duxx-grpc` binary at `127.0.0.1:50051` by default; proto schema
+      at `crates/duxx-grpc/proto/duxx.proto`. Verified Python grpcio
+      end-to-end including streaming Subscribe.
 
 ---
 
