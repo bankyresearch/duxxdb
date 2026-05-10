@@ -15,7 +15,7 @@ from one Rust codebase. Speaks RESP2/3, gRPC, and MCP out of the box.
 [![Status](https://img.shields.io/badge/status-Public%20Ready-brightgreen)](docs/PROJECT_OVERVIEW.md)
 [![Docs](https://img.shields.io/badge/docs-7%20guides-blue)](docs/)
 
-[**Install**](#install) · [**Quickstart**](#quickstart) · [**Why**](#why-duxxdb) · [**Features**](#features) · [**Architecture**](#architecture) · [**Benchmarks**](#benchmarks) · [**Roadmap**](docs/ROADMAP.md) · [**Contribute**](CONTRIBUTING.md)
+[**Install**](#install) · [**Quickstart**](#quickstart) · [**Why**](#why-duxxdb) · [**Features**](#features) · [**Integrate**](docs/INTEGRATION_GUIDE.md) · [**FAQ**](docs/FAQ.md) · [**Architecture**](#architecture) · [**Benchmarks**](#benchmarks) · [**Roadmap**](docs/ROADMAP.md) · [**Contribute**](CONTRIBUTING.md)
 
 </div>
 
@@ -212,6 +212,7 @@ grpcurl -plaintext -d '{"key":"alice","query":"wallet","k":5}' \
 ```
 
 → Full per-surface walkthrough: **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)**.
+→ Wiring into a real agent (chatbot / voice bot / migration): **[docs/INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md)**.
 
 ---
 
@@ -292,12 +293,12 @@ patterns: [docs/PROJECT_OVERVIEW.md § 8](docs/PROJECT_OVERVIEW.md#8-competitive
 |---|---|
 | [INSTALLATION.md](docs/INSTALLATION.md) | Picking install method per OS |
 | [USER_GUIDE.md](docs/USER_GUIDE.md) | Writing client code in any of 6 languages |
+| [INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md) | Wiring DuxxDB into a chatbot, voice bot, or autonomous agent (with diagrams) |
+| [FAQ.md](docs/FAQ.md) | "Is DuxxDB right for me?" — when to use, when not to, framework support, migration |
 | [PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md) | Pitching DuxxDB to a teammate / making a build-vs-buy call |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Understanding the internals before contributing |
 | [ROADMAP.md](docs/ROADMAP.md) | Knowing what's shipped vs. planned |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Opening your first PR |
-| [SECURITY.md](SECURITY.md) | Reporting a vulnerability |
-| [CHANGELOG.md](CHANGELOG.md) | What changed between releases |
 
 ---
 
