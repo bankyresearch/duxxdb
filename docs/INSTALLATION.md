@@ -536,11 +536,42 @@ The most-used knobs:
 | `DUXX_STORAGE` | `--storage` | `memory:_` | Use `dir:./path` for full persistence. |
 | `DUXX_EMBEDDER` | `--embedder` | `hash:32` | OpenAI / Cohere need an API key env. |
 | `DUXX_METRICS_ADDR` | `--metrics-addr` | (off) | `127.0.0.1:9100` is the convention. |
+| `DUXX_TLS_CERT` | `--tls-cert` | (off) | PEM cert chain. Both --tls-cert AND --tls-key required. |
+| `DUXX_TLS_KEY` | `--tls-key` | (off) | PEM private key. Phase 6.2. |
+| `DUXX_MAX_MEMORIES` | `--max-memories` | unlimited | Soft row cap. Lowest decayed-importance rows evicted on overflow. |
 | — | `--addr` | `127.0.0.1:6379` | RESP listen address. |
 | — | `--drain-secs` | `30` | SIGTERM drain budget. |
 | `RUST_LOG` | — | `info` | Use `debug` for troubleshooting. |
 | `OPENAI_API_KEY` | — | — | Required iff `DUXX_EMBEDDER=openai:*`. |
 | `COHERE_API_KEY` | — | — | Required iff `DUXX_EMBEDDER=cohere:*`. |
+
+### Enabling TLS (Phase 6.2)
+
+```bash
+# 1. Get a cert + key. With Let's Encrypt + certbot:
+sudo certbot certonly --standalone -d duxxdb.example.com
+# /etc/letsencrypt/live/duxxdb.example.com/fullchain.pem
+# /etc/letsencrypt/live/duxxdb.example.com/privkey.pem
+
+# 2. Point duxx-server at them:
+duxx-server --addr 0.0.0.0:6379 \
+  --token "$DUXX_TOKEN" \
+  --tls-cert /etc/letsencrypt/live/duxxdb.example.com/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/duxxdb.example.com/privkey.pem \
+  --storage  dir:/var/lib/duxxdb
+
+# 3. Connect with redis-cli:
+redis-cli --tls -h duxxdb.example.com -p 6379 -a "$DUXX_TOKEN" PING
+# +PONG
+```
+
+The same `--tls-cert` / `--tls-key` flags work on `duxx-grpc`. For
+`grpcurl`:
+
+```bash
+grpcurl -H "x-duxx-token: $DUXX_TOKEN" \
+  duxxdb.example.com:50051 duxx.v1.Duxx/Ping
+```
 
 Restart after edits:
 

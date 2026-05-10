@@ -506,9 +506,11 @@ Env vars override defaults but lose to explicit CLI flags:
 | **Health probes** | ✅ Phase 6.1 | gRPC: `grpc.health.v1.Health/Check`. HTTP: `GET /health` on the metrics port. |
 | **Prometheus metrics** | ✅ Phase 6.1 | `--metrics-addr 0.0.0.0:9091` exposes `/metrics` (text format) + `/health` |
 | **Graceful shutdown** | ✅ Phase 6.1 | SIGINT/SIGTERM stops accepting new connections, drains for `--drain-secs` (default 30) before exiting. Rolling-deploy safe. |
-| TLS | ⚠ not yet — terminate at LB | Put nginx / Envoy / a service mesh in front; bind DuxxDB to `127.0.0.1`. |
+| **Native TLS** | ✅ Phase 6.2 | `--tls-cert PATH --tls-key PATH` on RESP and gRPC. rustls-backed. `redis-cli --tls` / `grpcurl` work. |
+| **Memory cap + eviction** | ✅ Phase 6.2 | `--max-memories N`. Lowest *effective* (decayed) importance row evicted on overflow. |
 | Multi-tenancy | ⚠ no isolation in process | One `--storage dir:./tenant-X` daemon per tenant for now |
-| RBAC | ✗ | Deferred to Phase 6.2 |
+| RBAC | ✗ | Deferred to Phase 6.3+ |
+| mTLS (client cert auth) | ✗ | Deferred to Phase 6.3+ |
 | Sharding / replication | ✗ | Single node; replicate at the orchestration layer (Kubernetes) for now |
 | Backups | ✅ Parquet export | See [§ 3.5](#35-cold-tier-export-to-parquet) and [§ 6](#6-backup--restore) below |
 
@@ -520,7 +522,10 @@ duxx-server \
   --storage dir:/var/lib/duxx \
   --embedder openai:text-embedding-3-small \
   --token "$(cat /etc/duxx/token)" \
+  --tls-cert /etc/letsencrypt/live/duxxdb.example.com/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/duxxdb.example.com/privkey.pem \
   --metrics-addr 127.0.0.1:9091 \
+  --max-memories 1000000 \
   --drain-secs 60
 ```
 
@@ -529,7 +534,9 @@ duxx-grpc \
   --addr 0.0.0.0:50051 \
   --storage dir:/var/lib/duxx \
   --embedder openai:text-embedding-3-small \
-  --token "$(cat /etc/duxx/token)"
+  --token "$(cat /etc/duxx/token)" \
+  --tls-cert /etc/letsencrypt/live/duxxdb.example.com/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/duxxdb.example.com/privkey.pem
 ```
 
 K8s liveness probe:
@@ -601,11 +608,22 @@ Python via `pyarrow` — copy that loop and point it at your file.
 | Disk lost entirely | Restore from latest Parquet dump in object storage. |
 | Single bad memory | Manually `DEL` via the row store, or `--remove` flag (Phase 6.2). |
 
-For Closed UAT: bind to localhost, use `dir:` storage, set a token,
-configure your embedder. For Open UAT: add the `--metrics-addr`
-endpoint, put nginx/mTLS in front, and you're set. Production
-deployments need Phase 6.2 (RBAC, multi-tenant isolation,
-distributed mode) — see [ROADMAP.md](ROADMAP.md).
+### Public-internet checklist (Phase 6.2 ready)
+
+For an internet-exposed deployment:
+
+1. `--tls-cert` + `--tls-key` (Let's Encrypt / cert-manager / your CA).
+2. `--token` (≥ 16 chars; rotate via env reload + restart).
+3. `--storage dir:/var/lib/duxxdb` for full persistence.
+4. `--max-memories N` so a runaway client can't OOM the box.
+5. `--metrics-addr 127.0.0.1:9100` (scraped by Prometheus on the
+   same host or a sibling pod, **not** exposed publicly).
+6. `--drain-secs 30` (or higher for long-tail in-flight requests).
+7. Run as a non-root user (the `.deb` does this automatically).
+8. Bind metrics + health to localhost only; expose RESP/gRPC publicly.
+
+Multi-tenant SaaS deployments still need Phase 6.3+ (mTLS, per-key
+RBAC, sharding) — see [ROADMAP.md](ROADMAP.md).
 
 ---
 

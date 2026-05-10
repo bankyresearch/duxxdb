@@ -73,3 +73,10 @@ prometheus.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true

@@ -38,6 +38,9 @@ async fn main() -> anyhow::Result<()> {
     let mut token: Option<String> = None;
     let mut drain_secs: u64 = 30;
     let mut metrics_addr: Option<String> = None;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
+    let mut max_memories: Option<usize> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -71,6 +74,24 @@ async fn main() -> anyhow::Result<()> {
                         anyhow::anyhow!("--metrics-addr needs HOST:PORT")
                     })?,
                 );
+            }
+            "--tls-cert" => {
+                tls_cert = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--tls-cert needs a path"))?,
+                );
+            }
+            "--tls-key" => {
+                tls_key = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--tls-key needs a path"))?,
+                );
+            }
+            "--max-memories" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-memories needs a value"))?;
+                max_memories = Some(v.parse()?);
             }
             "--help" | "-h" => {
                 print_help();
@@ -131,6 +152,35 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::warn!(
             "running without authentication. Bind to 127.0.0.1 only, OR set --token / DUXX_TOKEN."
+        );
+    }
+
+    // Optional native TLS termination (Phase 6.2). Both --tls-cert and
+    // --tls-key must be provided together, or neither.
+    let tls_cert = tls_cert.or_else(|| std::env::var("DUXX_TLS_CERT").ok());
+    let tls_key = tls_key.or_else(|| std::env::var("DUXX_TLS_KEY").ok());
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            server = server.with_tls_files(&cert, &key)?;
+            tracing::info!(cert = %cert, "TLS termination ENABLED");
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("TLS requires BOTH --tls-cert and --tls-key");
+        }
+        (None, None) => {}
+    }
+
+    // Optional memory cap with importance-based eviction (Phase 6.2).
+    let max_memories = max_memories.or_else(|| {
+        std::env::var("DUXX_MAX_MEMORIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    });
+    if let Some(cap) = max_memories {
+        server.memory().set_max_rows(Some(cap));
+        tracing::info!(
+            max_memories = cap,
+            "memory cap ENABLED (oldest decayed-importance evicted on overflow)"
         );
     }
 
@@ -203,6 +253,10 @@ fn print_help() {
     println!("  --drain-secs N         Shutdown drain budget (default 30)");
     println!("  --metrics-addr HOST:PORT  Bind a Prometheus + /health endpoint");
     println!("                         (default: disabled)");
+    println!("  --tls-cert PATH        PEM cert chain (Phase 6.2)");
+    println!("  --tls-key  PATH        PEM private key (must accompany --tls-cert)");
+    println!("  --max-memories N       Cap memory rows; oldest decayed-importance");
+    println!("                         is evicted on overflow (default: unlimited)");
     println!();
     println!("EMBEDDER SPECS:");
     println!("  hash:<dim>                          deterministic toy embedder");
@@ -217,5 +271,6 @@ fn print_help() {
     println!("                                      (skips rebuild on graceful reopen)");
     println!();
     println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_TOKEN, DUXX_METRICS_ADDR,");
+    println!("     DUXX_TLS_CERT, DUXX_TLS_KEY, DUXX_MAX_MEMORIES,");
     println!("     OPENAI_API_KEY, COHERE_API_KEY");
 }

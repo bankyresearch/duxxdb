@@ -98,6 +98,15 @@ struct Inner {
     /// writes through to it; on `with_storage` open we replay everything
     /// back into the in-memory caches and indices.
     storage: Option<Arc<dyn Storage>>,
+    /// Optional row cap (Phase 6.2). When set and exceeded, the lowest
+    /// effective-importance row gets evicted on every subsequent
+    /// `remember`. `None` means unlimited.
+    max_rows: RwLock<Option<usize>>,
+    /// Half-life used by the eviction policy when reranking by
+    /// effective importance. Default 24 h.
+    evict_half_life: RwLock<Duration>,
+    /// Number of rows evicted by the cap so far. Useful for metrics.
+    evictions_total: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for Inner {
@@ -163,6 +172,9 @@ impl MemoryStore {
                 next_id: RwLock::new(1),
                 bus: ChangeBus::default(),
                 storage: None,
+                max_rows: RwLock::new(None),
+                evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
+                evictions_total: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -233,6 +245,9 @@ impl MemoryStore {
             next_id: RwLock::new(*store.inner.next_id.read()),
             bus: ChangeBus::default(),
             storage: Some(storage),
+            max_rows: RwLock::new(None),
+            evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
+            evictions_total: std::sync::atomic::AtomicU64::new(0),
         });
         tracing::info!(memories = n, "loaded memories from storage");
         Ok(MemoryStore { inner })
@@ -250,6 +265,96 @@ impl MemoryStore {
 
     pub fn dim(&self) -> usize {
         self.inner.dim
+    }
+
+    /// Configure a maximum number of rows. Once exceeded, every
+    /// subsequent `remember` evicts the row with the lowest *effective*
+    /// (decayed) importance until the row count is back at the cap.
+    /// `None` (the default) means unlimited.
+    ///
+    /// **Phase 6.2.** This is the agent-friendly knob: a long-running
+    /// chatbot can keep `--max-memories 1_000_000` and trust the store
+    /// to forget the boring stuff before the interesting stuff.
+    pub fn set_max_rows(&self, cap: Option<usize>) {
+        *self.inner.max_rows.write() = cap;
+    }
+
+    /// Read the current row cap (`None` = unlimited).
+    pub fn max_rows(&self) -> Option<usize> {
+        *self.inner.max_rows.read()
+    }
+
+    /// Set the half-life used to weight effective importance during
+    /// eviction. Default is 24 h. Shorter = forget recent stuff faster.
+    pub fn set_eviction_half_life(&self, hl: Duration) {
+        *self.inner.evict_half_life.write() = hl;
+    }
+
+    /// Total number of rows evicted by the cap since process start.
+    pub fn evictions_total(&self) -> u64 {
+        self.inner
+            .evictions_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drop one row by id from the row map and durable storage.
+    /// Returns true if the id existed.
+    ///
+    /// **Note:** The underlying HNSW + tantivy indices retain the
+    /// vector / token postings until the next process restart. That's
+    /// fine for correctness — `recall` filters every hit through
+    /// `by_id` (see below), so an evicted row never appears in
+    /// results. Reclaiming the index memory itself requires HNSW
+    /// tombstones + tantivy deletes, which is Phase 6.3 work.
+    fn forget(&self, id: u64) -> bool {
+        let removed = self.inner.by_id.write().remove(&id).is_some();
+        if removed {
+            if let Some(s) = &self.inner.storage {
+                let _ = s.delete(id);
+            }
+            self.inner
+                .evictions_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.bus.publish(ChangeEvent {
+                table: "memory".to_string(),
+                key: None,
+                row_id: id,
+                kind: ChangeKind::Delete,
+            });
+        }
+        removed
+    }
+
+    /// If the store is over its `max_rows` cap, evict the lowest
+    /// effective-importance rows until back at the cap. No-op when
+    /// no cap is set or the store is already under it.
+    fn enforce_cap(&self) {
+        let cap = match *self.inner.max_rows.read() {
+            Some(c) => c,
+            None => return,
+        };
+        let len_now = self.inner.by_id.read().len();
+        if len_now <= cap {
+            return;
+        }
+        let half_life = *self.inner.evict_half_life.read();
+
+        // Snapshot (id, effective_importance) under the read lock,
+        // then sort ascending. We drop the read lock before forget()
+        // takes the write lock.
+        let mut scored: Vec<(u64, f32)> = {
+            let by_id = self.inner.by_id.read();
+            by_id
+                .values()
+                .map(|m| (m.id, m.effective_importance(half_life)))
+                .collect()
+        };
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let to_evict = len_now - cap;
+        for (id, _score) in scored.into_iter().take(to_evict) {
+            self.forget(id);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -315,6 +420,9 @@ impl MemoryStore {
             kind: ChangeKind::Insert,
         });
         tracing::debug!(id, key = %key, "remembered");
+        // Phase 6.2: enforce the optional row cap. Cheap when no cap
+        // is configured (single read of an Option<usize>).
+        self.enforce_cap();
         Ok(id)
     }
 
@@ -417,6 +525,9 @@ impl MemoryStore {
             next_id: RwLock::new(max_id + 1),
             bus: ChangeBus::default(),
             storage: Some(storage),
+            max_rows: RwLock::new(None),
+            evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
+            evictions_total: std::sync::atomic::AtomicU64::new(0),
         });
         Ok(MemoryStore { inner })
     }
@@ -502,6 +613,78 @@ mod tests {
         let hits = s.recall("u1", q, &embed(q, DIM), 5).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].memory.text.contains("refund"));
+    }
+
+    // -------- Phase 6.2: row cap + importance-based eviction --------
+
+    #[test]
+    fn cap_evicts_lowest_effective_importance() {
+        const DIM: usize = 8;
+        let s = MemoryStore::new(DIM);
+        s.set_max_rows(Some(3));
+        // Use a very short half-life so created_at differences dominate
+        // and the *oldest* rows look least important.
+        s.set_eviction_half_life(std::time::Duration::from_micros(1));
+
+        // Insert 5 rows in chronological order.
+        let id_a = s.remember("u1", "alpha", embed("alpha", DIM)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id_b = s.remember("u1", "beta", embed("beta", DIM)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _id_c = s.remember("u1", "gamma", embed("gamma", DIM)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _id_d = s.remember("u1", "delta", embed("delta", DIM)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _id_e = s.remember("u1", "epsilon", embed("epsilon", DIM)).unwrap();
+
+        // Cap should hold the row count at 3.
+        assert_eq!(s.len(), 3, "len should equal the cap");
+        assert_eq!(s.evictions_total(), 2, "two oldest rows should have been evicted");
+
+        // The first two (oldest -> lowest decayed importance) are gone.
+        let by_id = s.inner.by_id.read();
+        assert!(!by_id.contains_key(&id_a), "alpha should be evicted");
+        assert!(!by_id.contains_key(&id_b), "beta should be evicted");
+    }
+
+    #[test]
+    fn no_cap_means_unlimited() {
+        const DIM: usize = 8;
+        let s = MemoryStore::new(DIM);
+        // Default: no cap.
+        assert_eq!(s.max_rows(), None);
+        for i in 0..50 {
+            s.remember("u", &format!("msg-{i}"), embed(&format!("m{i}"), DIM))
+                .unwrap();
+        }
+        assert_eq!(s.len(), 50);
+        assert_eq!(s.evictions_total(), 0);
+    }
+
+    #[test]
+    fn evicted_rows_disappear_from_recall() {
+        const DIM: usize = 8;
+        let s = MemoryStore::new(DIM);
+        s.set_max_rows(Some(2));
+        s.set_eviction_half_life(std::time::Duration::from_micros(1));
+
+        s.remember("u", "old wallet message", embed("wallet old", DIM))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.remember("u", "newer wallet message", embed("wallet new", DIM))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.remember("u", "third unrelated message", embed("third", DIM))
+            .unwrap();
+
+        // The oldest (id=1) should be evicted from `by_id`. recall()
+        // filters its results through `by_id`, so even though the
+        // HNSW + tantivy indices still reference id=1 internally, it
+        // must NOT show up in the response.
+        let hits = s.recall("u", "wallet", &embed("wallet", DIM), 10).unwrap();
+        for h in &hits {
+            assert_ne!(h.memory.id, 1, "evicted row leaked into recall");
+        }
     }
 
     #[cfg(feature = "redb-store")]

@@ -2,9 +2,9 @@
 
 > The database built for AI agents. Embedded + server, hybrid (vector +
 > BM25 + structured), durable, with reactive subscriptions, Apache
-> Parquet cold-tier, and prod-grade hardening (auth, health, Prometheus
-> metrics, graceful shutdown). **Closed UAT — feature-complete through
-> Phase 6.1.**
+> Parquet cold-tier, and prod-grade hardening (auth, native TLS, health,
+> Prometheus metrics, graceful shutdown, importance-based eviction).
+> **Public-ready — feature-complete through Phase 6.2.**
 
 [![CI](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml/badge.svg)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](../LICENSE)
@@ -172,7 +172,7 @@ surfaces from one binary.
 
 ## 5. Capabilities today
 
-All of Phase 0 → 6.1 ships. **106 tests passing** workspace-wide; CI
+All of Phase 0 → 6.2 ships. **112 tests passing** workspace-wide; CI
 matrix on Linux + macOS + Windows.
 
 ### Storage layer
@@ -213,11 +213,16 @@ matrix on Linux + macOS + Windows.
   Python 3.8 → 3.13.
 - **Node bindings** — napi-rs v2; `.node` native module per platform.
 
-### Production hardening (Phase 6.1)
+### Production hardening (Phase 6.1 + 6.2)
 
 - **Auth.** `--token TOKEN` / `DUXX_TOKEN` on `duxx-server` (RESP) and
   `duxx-grpc`; constant-time compare; RESP `NOAUTH` / `WRONGPASS` flow,
   gRPC `x-duxx-token` metadata via tonic Interceptor.
+- **Native TLS** (Phase 6.2). `--tls-cert PATH --tls-key PATH` /
+  `DUXX_TLS_CERT` / `DUXX_TLS_KEY` on both daemons. Pure-Rust rustls;
+  no OpenSSL dependency. RESP via tokio-rustls in the accept loop;
+  gRPC via tonic's `tls` feature. `redis-cli --tls`, `grpcurl --tls`,
+  any rustls / OpenSSL client connect directly.
 - **Health.** gRPC standard `grpc.health.v1.Health` via [tonic-health];
   RESP exposes `/health` on the metrics listener.
 - **Prometheus metrics.** `--metrics-addr HOST:PORT` /
@@ -226,6 +231,10 @@ matrix on Linux + macOS + Windows.
 - **Graceful shutdown.** Ctrl+C / SIGTERM stops accepting and drains
   in-flight connections up to `--drain-secs N` (default 30) before
   triggering tantivy commit + HNSW dump (so `dir:` reopens fast).
+- **Memory cap + eviction** (Phase 6.2). `--max-memories N` /
+  `DUXX_MAX_MEMORIES` enforces a soft row cap. On overflow, the
+  lowest *effective* (decayed) importance row is evicted first —
+  agent-friendly forgetting, not naive LRU.
 - **Backup.** Cron-driven Parquet snapshots; restore stub +
   disaster-recovery posture documented in
   [USER_GUIDE.md § 6](USER_GUIDE.md#6-backup--restore).
@@ -530,43 +539,43 @@ Full version: [ROADMAP.md](ROADMAP.md). Snapshot:
 | 4.7 | Network comparative bench (vs Redis / Qdrant / pgvector) | ✅ wired; need Docker for full numbers |
 | 5 | Cold-tier export (Apache Parquet) | ✅ |
 | **6.1** | **Prod hardening (auth, health, Prometheus, drain)** | ✅ |
-| 6.2 | TLS-native, memory limits + eviction | Planned |
-| 6.3+ | Distributed mode, RBAC, OpenTelemetry, SIMD tuning | Future |
+| **6.2** | **Native TLS + memory cap + importance-based eviction** | ✅ |
+| 6.3+ | mTLS, distributed mode, RBAC, OpenTelemetry, SIMD tuning | Future |
 | Lance | As alternate `Storage` impl | Designed; not blocking — redb covers durability |
 
 ---
 
 ## 12. Limitations & caveats
 
-We're **Closed UAT** (v0.1). Honest list of what's still missing:
+We're **public-ready** (v0.1). Honest list of what's still missing:
 
-1. **No native TLS yet.** Auth is shipped (`--token` on RESP and
-   gRPC), but TLS termination happens at your load balancer / sidecar
-   for now. Native rustls on both wire protocols lands in Phase 6.2.
-2. **No RBAC.** Single shared token per daemon today. Per-key /
-   per-agent permissions land in Phase 6.2+.
+1. **No mTLS** (client-cert auth). Single shared bearer/AUTH token
+   per daemon today. Per-client cert verification lands in Phase 6.3+.
+2. **No per-key / per-agent RBAC.** One token grants full access to
+   all keys. Phase 6.3+.
 3. **No multi-tenant isolation** in a single process. Run one
    `--storage dir:./tenant-X` daemon per tenant for now.
-4. **No memory cap / eviction yet.** Phase 6.2: importance-aware
-   eviction once a soft byte cap is exceeded.
+4. **Eviction reclaims rows but not index memory.** When the
+   `--max-memories` cap evicts a row, the row store + duxx-memory
+   row map drop it (so `recall` never returns it again), but the
+   HNSW + tantivy entries stay until the next process restart.
+   Index-side tombstones are Phase 6.3.
 5. **No SIMD-tuned distance kernels yet.** `hnsw_rs` has decent SIMD
    internally; future work may swap to AVX-512 hand-tuned routines.
 6. **Single node only.** No sharding / replication. Phase 6.3+.
 7. **No schema migrations.** Tables are immutable in shape; the row
    store is just bytes-keyed today.
-8. **Public API may shift** before v1.0. Pin a git SHA, not `master`,
-   if stability matters. The `duxx-memory` surface has been stable
-   since Phase 2.6.
+8. **Public API may shift** before v1.0. Pin a git SHA / tag, not
+   `master`, if stability matters. The `duxx-memory` surface has been
+   stable since Phase 2.6.
 9. **Comparative bench has 3 wired-but-unrun targets** (Redis Stack,
    Qdrant, pgvector). Numbers fill in once Docker daemon is up on a
    bench host.
 
-For Closed UAT use cases (single-tenant agent prototypes, internal
-demos, PoCs), this is enough. With Phase 6.1 shipped (auth, health,
-metrics, graceful shutdown) DuxxDB is also suitable for internal
-production behind a TLS-terminating load balancer. Open UAT to public
-internet traffic waits on Phase 6.2 (native TLS) and Phase 6.3+
-(distributed / RBAC).
+With Phase 6.2 shipped (native TLS, eviction) DuxxDB is suitable for
+**public-internet exposure** behind a TLS cert (Let's Encrypt /
+cert-manager / your CA) — no sidecar required. Multi-tenant SaaS
+deployment still wants Phase 6.3+ (mTLS, RBAC, sharding).
 
 ---
 
@@ -610,5 +619,5 @@ useful to you, please support its upstream dependencies first.
 
 ---
 
-*Last updated: Phase 6.1 shipped (auth, health, Prometheus, graceful
-shutdown). See `git log` for changes.*
+*Last updated: Phase 6.2 shipped (native TLS on RESP + gRPC, memory
+cap + importance-based eviction). See `git log` for changes.*

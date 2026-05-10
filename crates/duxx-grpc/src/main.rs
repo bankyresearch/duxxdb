@@ -25,6 +25,8 @@ async fn main() -> anyhow::Result<()> {
     let mut embedder_spec: Option<String> = None;
     let mut storage_spec: Option<String> = None;
     let mut token: Option<String> = None;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -44,6 +46,18 @@ async fn main() -> anyhow::Result<()> {
             "--token" | "-t" => {
                 token = Some(
                     args.next().ok_or_else(|| anyhow::anyhow!("--token needs a value"))?,
+                );
+            }
+            "--tls-cert" => {
+                tls_cert = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--tls-cert needs a path"))?,
+                );
+            }
+            "--tls-key" => {
+                tls_key = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--tls-key needs a path"))?,
                 );
             }
             "--help" | "-h" => {
@@ -105,6 +119,21 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Optional native TLS (Phase 6.2). Both --tls-cert and --tls-key
+    // must be provided together, or neither.
+    let tls_cert = tls_cert.or_else(|| std::env::var("DUXX_TLS_CERT").ok());
+    let tls_key = tls_key.or_else(|| std::env::var("DUXX_TLS_KEY").ok());
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            svc = svc.with_tls_files(&cert, &key)?;
+            tracing::info!(cert = %cert, "gRPC TLS termination ENABLED");
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("TLS requires BOTH --tls-cert and --tls-key");
+        }
+        (None, None) => {}
+    }
+
     tokio::select! {
         res = svc.clone().serve(&addr) => res?,
         _ = tokio::signal::ctrl_c() => {
@@ -127,10 +156,12 @@ fn print_help() {
     println!("  --storage dir:./path   Persistent on-disk store (rows + indices)");
     println!("  --token TOKEN          Require Bearer TOKEN on every RPC");
     println!("                         (default: no auth -- localhost-only safe)");
+    println!("  --tls-cert PATH        PEM cert chain   (Phase 6.2)");
+    println!("  --tls-key  PATH        PEM private key  (must accompany --tls-cert)");
     println!();
     println!("Health: grpc.health.v1.Health/Check is always available");
     println!("(no auth required) for k8s livenessProbe / readinessProbe.");
     println!();
-    println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_TOKEN,");
+    println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_TOKEN, DUXX_TLS_CERT, DUXX_TLS_KEY,");
     println!("     OPENAI_API_KEY, COHERE_API_KEY");
 }

@@ -50,6 +50,10 @@ pub struct DuxxService {
     /// `authorization: Bearer <token>` in metadata. When `None`, the
     /// service is unauthenticated.
     auth_token: Option<Arc<str>>,
+    /// Optional TLS identity (Phase 6.2). When `Some`, the listener
+    /// uses tonic's tls support (rustls under the hood) so clients
+    /// connect over h2 + TLS.
+    tls_identity: Option<tonic::transport::Identity>,
 }
 
 impl DuxxService {
@@ -66,6 +70,7 @@ impl DuxxService {
             embedder,
             dim,
             auth_token: None,
+            tls_identity: None,
         }
     }
 
@@ -81,11 +86,31 @@ impl DuxxService {
             embedder,
             dim,
             auth_token: None,
+            tls_identity: None,
         })
     }
 
     /// Require clients to send `authorization: Bearer <token>` on
     /// every RPC. Pass `None` (or omit) to disable auth.
+    /// Enable native TLS termination (Phase 6.2). Pass paths to a
+    /// PEM cert chain and PEM private key. The listener uses tonic's
+    /// rustls-backed tls support; clients must connect over `https://`
+    /// (or with the equivalent `with_root_certificates` / `--tls`
+    /// flag for grpcurl etc.).
+    pub fn with_tls_files(
+        mut self,
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let cert = std::fs::read(cert_path.as_ref()).map_err(|e| {
+            anyhow::anyhow!("read TLS cert {}: {e}", cert_path.as_ref().display())
+        })?;
+        let key = std::fs::read(key_path.as_ref())
+            .map_err(|e| anyhow::anyhow!("read TLS key {}: {e}", key_path.as_ref().display()))?;
+        self.tls_identity = Some(tonic::transport::Identity::from_pem(cert, key));
+        Ok(self)
+    }
+
     pub fn with_auth(mut self, token: impl Into<Arc<str>>) -> Self {
         self.auth_token = Some(token.into());
         self
@@ -129,7 +154,12 @@ impl DuxxService {
         let parsed: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid addr {addr}: {e}"))?;
-        tracing::info!(%addr, auth = self.auth_token.is_some(), "duxx-grpc listening");
+        tracing::info!(
+            %addr,
+            auth = self.auth_token.is_some(),
+            tls = self.tls_identity.is_some(),
+            "duxx-grpc listening"
+        );
 
         // Standard health protocol -- k8s livenessProbe / readinessProbe
         // can hit `grpc.health.v1.Health/Check` directly.
@@ -138,10 +168,19 @@ impl DuxxService {
             .set_serving::<DuxxServer<DuxxService>>()
             .await;
 
+        let tls_identity = self.tls_identity.clone();
         let interceptor = self.auth_interceptor();
         let duxx_with_auth = DuxxServer::with_interceptor(self, interceptor);
 
-        tonic::transport::Server::builder()
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(identity) = tls_identity {
+            let tls_cfg = tonic::transport::ServerTlsConfig::new().identity(identity);
+            builder = builder
+                .tls_config(tls_cfg)
+                .map_err(|e| anyhow::anyhow!("gRPC TLS config: {e}"))?;
+        }
+
+        builder
             .add_service(health_svc)
             .add_service(duxx_with_auth)
             .serve(parsed)

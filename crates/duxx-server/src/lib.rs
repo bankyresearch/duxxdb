@@ -27,14 +27,15 @@
 pub mod glob;
 pub mod metrics;
 pub mod resp;
+pub mod tls;
 
 use duxx_embed::{Embedder, HashEmbedder};
 use duxx_memory::{MemoryStore, SessionStore};
 use duxx_reactive::{ChangeEvent, ChangeKind};
 use resp::RespValue;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 pub const SERVER_NAME: &str = "duxxdb";
@@ -60,6 +61,9 @@ pub struct Server {
     /// Optional Prometheus metrics. When Some, accept-loop + handler
     /// hooks update counters. Use [`Server::with_metrics`] to attach.
     metrics: Option<metrics::Metrics>,
+    /// When Some, the accept loop wraps each TcpStream in a rustls
+    /// TlsStream before handing it to `handle_connection`. Phase 6.2.
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -90,6 +94,7 @@ impl Server {
             auth_token: None,
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
+            tls_config: None,
         }
     }
 
@@ -106,6 +111,28 @@ impl Server {
     pub fn with_metrics(mut self, m: metrics::Metrics) -> Self {
         self.metrics = Some(m);
         self
+    }
+
+    /// Enable TLS termination on the listener. Pass paths to a
+    /// PEM-encoded certificate chain and private key. Once set,
+    /// every accepted TCP stream is upgraded to rustls before any
+    /// RESP traffic flows.
+    ///
+    /// Errors if the cert / key files don't exist, can't be parsed,
+    /// or don't form a valid pair.
+    pub fn with_tls_files(
+        mut self,
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let cfg = tls::load_server_config(cert_path, key_path)?;
+        self.tls_config = Some(cfg);
+        Ok(self)
+    }
+
+    /// Whether this server will terminate TLS on accept.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_config.is_some()
     }
 
     /// Number of currently-open client connections.
@@ -131,6 +158,7 @@ impl Server {
             auth_token: None,
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
+            tls_config: None,
         })
     }
 
@@ -151,6 +179,7 @@ impl Server {
             auth_token: None,
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
+            tls_config: None,
         })
     }
 
@@ -190,8 +219,13 @@ impl Server {
         tracing::info!(
             addr = %addr,
             auth = self.auth_token.is_some(),
+            tls = self.tls_config.is_some(),
             "duxx-server listening"
         );
+        let acceptor = self
+            .tls_config
+            .clone()
+            .map(tokio_rustls::TlsAcceptor::from);
         loop {
             let (socket, peer) = listener.accept().await?;
             tracing::debug!(?peer, "accepted");
@@ -199,8 +233,16 @@ impl Server {
             self.active_conns
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let counter = self.active_conns.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                if let Err(e) = server.handle_connection(socket).await {
+                let result = match acceptor {
+                    Some(acc) => match acc.accept(socket).await {
+                        Ok(tls) => server.handle_connection(tls).await,
+                        Err(e) => Err(anyhow::anyhow!("TLS handshake: {e}")),
+                    },
+                    None => server.handle_connection(socket).await,
+                };
+                if let Err(e) = result {
                     tracing::warn!(?peer, error = %e, "connection ended with error");
                 }
                 counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -222,10 +264,15 @@ impl Server {
         tracing::info!(
             addr = %addr,
             auth = self.auth_token.is_some(),
+            tls = self.tls_config.is_some(),
             "duxx-server listening"
         );
         let server = self.clone();
         let counter = self.active_conns.clone();
+        let acceptor = self
+            .tls_config
+            .clone()
+            .map(tokio_rustls::TlsAcceptor::from);
         tokio::pin!(shutdown);
 
         loop {
@@ -243,8 +290,16 @@ impl Server {
                     }
                     let c = counter.clone();
                     let m = s.metrics.clone();
+                    let acc = acceptor.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = s.handle_connection(socket).await {
+                        let result = match acc {
+                            Some(a) => match a.accept(socket).await {
+                                Ok(tls) => s.handle_connection(tls).await,
+                                Err(e) => Err(anyhow::anyhow!("TLS handshake: {e}")),
+                            },
+                            None => s.handle_connection(socket).await,
+                        };
+                        if let Err(e) = result {
                             tracing::warn!(?peer, error = %e, "connection ended with error");
                             if let Some(ref m) = m {
                                 m.errors_total.with_label_values(&["conn"]).inc();
@@ -282,7 +337,10 @@ impl Server {
         }
     }
 
-    async fn handle_connection(&self, mut socket: TcpStream) -> anyhow::Result<()> {
+    async fn handle_connection<S>(&self, mut socket: S) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut buf = bytes::BytesMut::with_capacity(4096);
         let mut out = Vec::with_capacity(1024);
         let mut state = SubState::default();
@@ -1231,5 +1289,95 @@ mod tests {
         assert!(!m("memory.*", "session.alice"));
         assert!(m("memory.a*", "memory.alice"));
         assert!(!m("memory.a*", "memory.bob"));
+    }
+
+    // ---------- Phase 6.2: native TLS handshake end-to-end ----------
+
+    /// Generate a self-signed cert + key pair for "localhost" in a
+    /// fresh tempdir. Returns (tempdir, cert_pem_path, key_pem_path).
+    /// Tempdir must outlive the file paths.
+    fn self_signed_pair_for_test() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use std::io::Write;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(cert.cert.pem().as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(cert.key_pair.serialize_pem().as_bytes())
+            .unwrap();
+        (dir, cert_path, key_path)
+    }
+
+    /// Drive a full RESP-over-TLS round-trip against a `Server` built
+    /// with [`Server::with_tls_files`]. Confirms:
+    ///   1. The accept loop upgrades each TCP stream to rustls.
+    ///   2. The decrypted stream still talks RESP correctly.
+    ///   3. PING works end-to-end over TLS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_handshake_round_trips_resp() {
+        // Make rustls happy. Idempotent — fine to call from multiple tests.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // 1. Self-signed cert for "localhost".
+        let (_dir, cert_path, key_path) = self_signed_pair_for_test();
+        let server_cert_pem = std::fs::read(&cert_path).unwrap();
+
+        // 2. Bind the server on an ephemeral port with TLS enabled.
+        let server = Server::new().with_tls_files(&cert_path, &key_path).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let addr = format!("{local_addr}");
+
+        let server_handle = {
+            let s = server.clone();
+            let a = addr.clone();
+            tokio::spawn(async move {
+                let _ = s
+                    .serve_with_shutdown(
+                        &a,
+                        async {
+                            // Hold the server up for the whole test.
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        },
+                        std::time::Duration::from_secs(1),
+                    )
+                    .await;
+            })
+        };
+
+        // Give the listener a beat to come up.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 3. Build a rustls client that trusts our self-signed cert.
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut server_cert_pem.as_slice()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+        let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let mut tls = connector.connect(domain, tcp).await.expect("TLS handshake");
+
+        // 4. Send PING and read PONG.
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        tls.write_all(ping).await.unwrap();
+        tls.flush().await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = tls.read(&mut buf).await.unwrap();
+        let response = std::str::from_utf8(&buf[..n]).unwrap();
+        assert_eq!(response, "+PONG\r\n", "PING response over TLS");
+
+        server_handle.abort();
     }
 }

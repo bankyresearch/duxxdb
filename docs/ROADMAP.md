@@ -193,14 +193,51 @@ probed for health, and gracefully drained on rolling restarts.
 
 ---
 
-## Phase 6.2+ — Future hardening
+## Phase 6.2 — Production hardening II ✅ Shipped
+
+Public-internet readiness — DuxxDB no longer needs a TLS-terminating
+sidecar to be exposed safely.
+
+- [x] **TLS-native on RESP** via [rustls] + [tokio-rustls].
+      `--tls-cert PATH --tls-key PATH` (or `DUXX_TLS_CERT` /
+      `DUXX_TLS_KEY` env). `redis-cli --tls` and any rustls / OpenSSL
+      RESP client connect directly. Connection upgrade happens in the
+      accept loop; auth + drain + metrics paths all run unchanged.
+- [x] **TLS-native on gRPC** via tonic's `tls` feature (rustls under
+      the hood). Same flags / env on `duxx-grpc`. `grpcurl --insecure`
+      / Python `grpc.secure_channel(creds)` work. Health protocol
+      stays unencrypted-on-the-internal-port-friendly via separate
+      builder.
+- [x] **Row cap + importance-based eviction.**
+      `--max-memories N` / `DUXX_MAX_MEMORIES` on `duxx-server`. Once
+      exceeded, every `REMEMBER` evicts the row with the lowest
+      *effective* (decayed) importance until the count is back at the
+      cap. Agent-friendly: a chatbot can keep one big cap and trust
+      the store to forget the boring stuff first. `set_eviction_half_life`
+      tunes how aggressively old rows look "forgotten".
+- [x] **Tests:** TLS handshake end-to-end (rustls client → server →
+      RESP PING) + cap eviction policy + cap-with-recall integration.
+      Workspace: 112 tests pass.
+
+[rustls]: https://github.com/rustls/rustls
+[tokio-rustls]: https://github.com/rustls/tokio-rustls
+
+**Exit criterion (met):** a single binary can be exposed on a public
+IP with TLS, an auth token, Prometheus metrics, a memory cap, and a
+graceful drain on rolling restarts — no sidecars required.
+
+---
+
+## Phase 6.3+ — Future hardening
 
 Tracked, not yet scheduled.
 
-- TLS-native (rustls) on RESP + gRPC (currently terminate at LB).
-- Memory limits + importance-based eviction (agent-specific).
+- mTLS (client cert auth).
+- Index-side eviction (HNSW tombstones, tantivy deletes) so cap
+  reclaims index memory too — Phase 6.2 only reclaims row + storage
+  bytes; the indices retain entries until restart.
 - Distributed / sharded mode.
-- Row-level security.
+- Row-level security / RBAC.
 - Query cache.
 - OpenTelemetry tracing export.
 - SIMD tuning per architecture (AVX-512, ARM NEON).

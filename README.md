@@ -11,8 +11,8 @@ from one Rust codebase. Speaks RESP2/3, gRPC, and MCP out of the box.
 [![CI](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml/badge.svg)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Made with Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-106%20passing-success)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
-[![Status](https://img.shields.io/badge/status-Closed%20UAT-orange)](docs/PROJECT_OVERVIEW.md)
+[![Tests](https://img.shields.io/badge/tests-112%20passing-success)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
+[![Status](https://img.shields.io/badge/status-Public%20Ready-brightgreen)](docs/PROJECT_OVERVIEW.md)
 [![Docs](https://img.shields.io/badge/docs-7%20guides-blue)](docs/)
 
 [**Install**](#install) · [**Quickstart**](#quickstart) · [**Why**](#why-duxxdb) · [**Features**](#features) · [**Architecture**](#architecture) · [**Benchmarks**](#benchmarks) · [**Roadmap**](docs/ROADMAP.md) · [**Contribute**](CONTRIBUTING.md)
@@ -37,10 +37,10 @@ DuxxDB just spoke RESP — `redis-cli`, `valkey-cli`, `redis-rs`,
 `node-redis`, `go-redis`, all work unchanged. Now switch to the
 [Quickstart](#quickstart) for Python, gRPC, or MCP.
 
-> **Status:** Closed UAT — feature-complete through Phase 6.1
-> (auth · health · Prometheus · graceful shutdown). Public-internet
-> hardening (TLS-native, eviction) lands in Phase 6.2 — see the
-> [Roadmap](docs/ROADMAP.md).
+> **Status:** Public-ready — feature-complete through Phase 6.2
+> (auth · native TLS · health · Prometheus · graceful shutdown ·
+> importance-based eviction). 112 tests green on Linux + macOS +
+> Windows. See the [Roadmap](docs/ROADMAP.md).
 
 ---
 
@@ -102,11 +102,13 @@ out of one codebase. Pure Rust, no GC pauses.
 - **gRPC** with streaming `Subscribe` (tonic)
 - **MCP stdio** for Claude / GPT / Cline agents
 
-#### Production hardening (Phase 6.1)
+#### Production hardening (Phase 6.1 + 6.2)
 - Token auth (`--token` / `DUXX_TOKEN`)
+- **Native TLS** on RESP + gRPC (rustls)
 - Prometheus `/metrics` + `/health`
 - gRPC `grpc.health.v1.Health` protocol
 - Graceful shutdown drain
+- **Memory cap + importance-based eviction**
 - Apache Parquet cold-tier export
 
 </td></tr>
@@ -384,6 +386,5 @@ If DuxxDB is useful to you, please support its upstream dependencies first.
 
 **[⬆ Back to top](#duxxdb)**
 
-Built by [Bankatesh Choudhary](https://github.com/bankyresearch) · IIT (BHU)
-Banaras / BIT Mesra
+Built by [Bankatesh Choudhary](https://github.com/bankyresearch)
 </div>
