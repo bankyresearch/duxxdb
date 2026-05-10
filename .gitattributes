@@ -1,0 +1,86 @@
+# DuxxDB line-ending policy.
+#
+# Without this file, Windows contributors get noisy CRLF/LF warnings
+# on every git add / commit / checkout because core.autocrlf=true is
+# the Windows default. Pinning text files to LF and Windows scripts
+# to CRLF gives consistent behavior across Linux / macOS / Windows
+# and silences the warnings.
+#
+# After committing this file once, every contributor should run:
+#   git add --renormalize .
+# to re-stage existing files with the correct endings. We do that in
+# the same commit that adds this file.
+
+# Default: detect text vs binary, normalize text to LF on commit.
+* text=auto eol=lf
+
+# ---------------------------------------------------------------- source code
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.jsonc     text eol=lf
+*.py        text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.js        text eol=lf
+*.jsx       text eol=lf
+*.mjs       text eol=lf
+*.cjs       text eol=lf
+*.proto     text eol=lf
+*.html      text eol=lf
+*.css       text eol=lf
+*.scss      text eol=lf
+
+# ---------------------------------------------------------------- scripts
+# Shell scripts MUST end with LF (CRLF breaks the shebang on Linux).
+*.sh        text eol=lf
+*.bash      text eol=lf
+Makefile    text eol=lf
+
+# Windows scripts MUST end with CRLF (otherwise cmd.exe misparses).
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Cargo / Node lock files: text but force LF so cross-platform diffs
+# don't churn.
+Cargo.lock              text eol=lf
+package-lock.json       text eol=lf
+yarn.lock               text eol=lf
+poetry.lock             text eol=lf
+
+# Documentation generators and CI configs.
+.gitignore              text eol=lf
+.dockerignore           text eol=lf
+.editorconfig           text eol=lf
+.gitattributes          text eol=lf
+
+# ---------------------------------------------------------------- binaries
+# Never normalize, never diff inline.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.svg       text eol=lf
+*.pdf       binary
+*.zip       binary
+*.tar       binary
+*.tar.gz    binary
+*.tgz       binary
+*.deb       binary
+*.rpm       binary
+*.msi       binary
+*.exe       binary
+*.dll       binary
+*.so        binary
+*.dylib     binary
+*.node      binary
+*.wasm      binary
+*.parquet   binary
+*.pem       text eol=lf
+*.key       text eol=lf
+*.crt       text eol=lf
