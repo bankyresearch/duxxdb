@@ -38,6 +38,10 @@ bindings/node/index.js
 bindings/node/index.d.ts
 bindings/node/target/
 
+# Generated protobuf stubs for the comparative bench
+bench/comparative/_proto/
+bench/comparative/_lancedb_bench_tmp/
+
 # Claude Code session metadata
 .claude/
 

@@ -112,7 +112,233 @@ class LanceDBBackend:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
-BACKENDS = {b.name: b for b in [DuxxDBBackend, LanceDBBackend]}
+class RedisStackBackend:
+    """Redis Stack with RediSearch HNSW vector index."""
+    name = "redis"
+
+    def open(self, dim: int) -> None:
+        import redis
+        from redis.commands.search.field import TextField, VectorField
+        from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+
+        self.r = redis.Redis(host="localhost", port=6379)
+        self.r.ping()
+        try:
+            self.r.ft("idx:memories").dropindex(delete_documents=True)
+        except Exception:
+            pass
+        try:
+            for k in self.r.keys("mem:*"):
+                self.r.delete(k)
+        except Exception:
+            pass
+        schema = (
+            TextField("$.key", as_name="key"),
+            TextField("$.text", as_name="text"),
+            VectorField(
+                "$.vector",
+                "HNSW",
+                {"TYPE": "FLOAT32", "DIM": dim, "DISTANCE_METRIC": "COSINE"},
+                as_name="vector",
+            ),
+        )
+        self.r.ft("idx:memories").create_index(
+            schema,
+            definition=IndexDefinition(prefix=["mem:"], index_type=IndexType.JSON),
+        )
+        self.dim = dim
+        self.next_id = 1
+
+    def insert(self, key, text, embedding):
+        self.r.json().set(
+            f"mem:{self.next_id}",
+            "$",
+            {"key": key, "text": text, "vector": [float(x) for x in embedding]},
+        )
+        self.next_id += 1
+
+    def recall(self, key, query, embedding, k):
+        import numpy as np
+        from redis.commands.search.query import Query
+
+        vec = np.asarray(embedding, dtype=np.float32).tobytes()
+        q = (
+            Query(f"*=>[KNN {k} @vector $vec AS dist]")
+            .sort_by("dist")
+            .return_fields("dist")
+            .dialect(2)
+        )
+        res = self.r.ft("idx:memories").search(q, query_params={"vec": vec})
+        return len(res.docs)
+
+    def close(self):
+        try:
+            self.r.ft("idx:memories").dropindex(delete_documents=True)
+        except Exception:
+            pass
+        try:
+            self.r.close()
+        except Exception:
+            pass
+
+
+class QdrantBackend:
+    name = "qdrant"
+
+    def open(self, dim: int) -> None:
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Distance, VectorParams
+
+        self.client = QdrantClient(host="localhost", port=6333)
+        try:
+            self.client.delete_collection("memories")
+        except Exception:
+            pass
+        self.client.create_collection(
+            collection_name="memories",
+            vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+        )
+        self.next_id = 1
+
+    def insert(self, key, text, embedding):
+        from qdrant_client.models import PointStruct
+
+        self.client.upsert(
+            collection_name="memories",
+            points=[
+                PointStruct(
+                    id=self.next_id,
+                    vector=list(embedding),
+                    payload={"key": key, "text": text},
+                )
+            ],
+        )
+        self.next_id += 1
+
+    def recall(self, key, query, embedding, k):
+        hits = self.client.search(
+            collection_name="memories",
+            query_vector=list(embedding),
+            limit=k,
+        )
+        return len(hits)
+
+    def close(self):
+        try:
+            self.client.delete_collection("memories")
+        except Exception:
+            pass
+
+
+class PgVectorBackend:
+    name = "pgvector"
+
+    def open(self, dim: int) -> None:
+        import psycopg2
+
+        self.conn = psycopg2.connect(
+            host="localhost",
+            port=5432,
+            user="postgres",
+            password="bench",
+            dbname="duxx_bench",
+        )
+        self.conn.autocommit = True
+        with self.conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("DROP TABLE IF EXISTS memories")
+            cur.execute(
+                "CREATE TABLE memories ("
+                "id BIGSERIAL PRIMARY KEY, "
+                "key TEXT, "
+                "text TEXT, "
+                f"vector vector({dim})"
+                ")"
+            )
+            cur.execute(
+                "CREATE INDEX ON memories USING hnsw (vector vector_cosine_ops)"
+            )
+
+    def insert(self, key, text, embedding):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO memories (key, text, vector) VALUES (%s, %s, %s)",
+                (key, text, str(list(embedding))),
+            )
+
+    def recall(self, key, query, embedding, k):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM memories ORDER BY vector <=> %s::vector LIMIT %s",
+                (str(list(embedding)), k),
+            )
+            return len(cur.fetchall())
+
+    def close(self):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS memories")
+        except Exception:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+
+class DuxxGrpcBackend:
+    """DuxxDB through the gRPC daemon — apples-to-apples network parity
+    with the other network backends."""
+    name = "duxx-grpc"
+
+    def open(self, dim: int) -> None:
+        import os
+        import sys
+
+        # Add the generated proto stubs to path.
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_proto"))
+        import duxx_pb2 as pb
+        import duxx_pb2_grpc as svc
+        import grpc
+
+        self.pb = pb
+        self.svc = svc
+        self.channel = grpc.insecure_channel("localhost:50051")
+        self.client = svc.DuxxStub(self.channel)
+        # Liveness check
+        self.client.Ping(pb.PingRequest(nonce="hi"))
+
+    def insert(self, key, text, embedding):
+        self.client.Remember(
+            self.pb.RememberRequest(key=key, text=text, embedding=list(embedding))
+        )
+
+    def recall(self, key, query, embedding, k):
+        r = self.client.Recall(
+            self.pb.RecallRequest(
+                key=key, query=query, embedding=list(embedding), k=k
+            )
+        )
+        return len(r.hits)
+
+    def close(self):
+        try:
+            self.channel.close()
+        except Exception:
+            pass
+
+
+BACKENDS = {
+    b.name: b
+    for b in [
+        DuxxDBBackend,
+        LanceDBBackend,
+        RedisStackBackend,
+        QdrantBackend,
+        PgVectorBackend,
+        DuxxGrpcBackend,
+    ]
+}
 
 
 # ----------------------------------------------------------------------------
