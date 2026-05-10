@@ -1,0 +1,27 @@
+# Configuration for the `cross` cross-compiler.
+# Used by .github/workflows/release.yml when building the aarch64
+# Linux release binaries.
+#
+# Why this file exists:
+#   `cross` runs the build inside its own Docker image
+#   (ghcr.io/cross-rs/aarch64-unknown-linux-gnu). The release workflow
+#   installs `protoc` on the GitHub runner, but that doesn't help —
+#   the cross container is a separate filesystem. duxx-grpc's
+#   build.rs invokes `protoc` to regenerate the gRPC stubs, so the
+#   container needs it too.
+#
+# Fix: a pre-build step that apt-installs protobuf-compiler inside
+# the cross image before each build.
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes --no-install-recommends protobuf-compiler",
+]
+
+# We don't currently cross-compile to x86_64 Linux (the host already
+# is x86_64 Linux on ubuntu-latest), but if we ever start, the same
+# pre-build step applies. Adding it preemptively documents intent.
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes --no-install-recommends protobuf-compiler",
+]
