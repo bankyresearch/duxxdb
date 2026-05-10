@@ -1,0 +1,166 @@
+name: Publish PyPI
+
+# Builds platform-specific wheels for the duxxdb Python binding and
+# publishes them to PyPI on every annotated semver tag.
+#
+# Triggers:
+#   - tag push matching v*.*.* (production release)
+#   - manual workflow_dispatch with a tag input (re-run a release)
+#
+# Authentication: PyPI Trusted Publisher (OIDC). No API token in the
+# repo. One-time setup on PyPI:
+#   1. Sign in at https://pypi.org/manage/account/publishing/
+#   2. "Add a new pending publisher" with these values:
+#        PyPI project name:   duxxdb
+#        Owner:               bankyresearch
+#        Repository name:     duxxdb
+#        Workflow name:       pypi.yml
+#        Environment name:    pypi
+#   3. Save. The next tag push uploads automatically.
+#
+# Outputs (per release):
+#   - duxxdb-X.Y.Z.tar.gz                              (sdist)
+#   - duxxdb-X.Y.Z-cp38-abi3-manylinux2014_x86_64.whl
+#   - duxxdb-X.Y.Z-cp38-abi3-manylinux2014_aarch64.whl
+#   - duxxdb-X.Y.Z-cp38-abi3-macosx_10_12_x86_64.whl
+#   - duxxdb-X.Y.Z-cp38-abi3-macosx_11_0_arm64.whl
+#   - duxxdb-X.Y.Z-cp38-abi3-win_amd64.whl
+#
+# `cp38-abi3` means: built against the stable ABI for Python 3.8+, so
+# the same wheel works on Python 3.8 / 3.9 / 3.10 / 3.11 / 3.12 / 3.13.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag / version to publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+  # Required for PyPI Trusted Publisher OIDC.
+  id-token: write
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Build wheels (matrix). Each job builds its own platform wheel using
+  # the maturin GitHub Action, which handles cross-compilation for
+  # aarch64-linux via cross/QEMU.
+  # --------------------------------------------------------------------------
+  wheels:
+    name: build wheel ${{ matrix.target }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: manylinux2014
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: manylinux2014
+          - os: macos-13          # Intel
+            target: x86_64
+            manylinux: ""
+          - os: macos-latest      # Apple silicon
+            target: aarch64
+            manylinux: ""
+          - os: windows-latest
+            target: x64
+            manylinux: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel via maturin
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --strip
+          # On linux-aarch64 we need cross + QEMU; the action handles it.
+          docker-options: ""
+
+      - name: Show wheel contents
+        shell: bash
+        run: |
+          ls -la bindings/python/dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
+
+  # --------------------------------------------------------------------------
+  # Source distribution (one job, runs on linux). PyPI requires sdists
+  # for `pip install --no-binary` users and for static analysis.
+  # --------------------------------------------------------------------------
+  sdist:
+    name: build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: bindings/python/dist/*.tar.gz
+
+  # --------------------------------------------------------------------------
+  # Publish step. Only runs after every wheel + sdist succeeded.
+  # Uses PyPI Trusted Publisher (OIDC) — no API token in the repo.
+  # --------------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [wheels, sdist]
+    environment:
+      name: pypi
+      url: https://pypi.org/p/duxxdb
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "wheels-*"
+          merge-multiple: true
+
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: List uploads
+        run: ls -la dist/
+
+      - name: Publish to PyPI (Trusted Publisher OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # No `password:` -- Trusted Publisher uses OIDC.
+          # `repository-url:` defaults to https://upload.pypi.org/legacy/.
+          skip-existing: true
+          verbose: true

@@ -4,24 +4,53 @@ build-backend = "maturin"
 
 [project]
 name = "duxxdb"
-description = "DuxxDB \u2014 the database built for AI agents."
+description = "DuxxDB — the database built for AI agents. Hybrid (vector + BM25 + structured) retrieval, agent-native primitives (MEMORY / TOOL_CACHE / SESSION), embedded-or-server, RESP / gRPC / MCP."
 version = "0.1.0"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
-authors = [{ name = "DuxxDB Contributors" }]
+readme = "README.md"
+authors = [
+    { name = "Bankatesh Choudhary", email = "phdmb10007.21@bitmesra.ac.in" },
+]
+maintainers = [
+    { name = "Bankatesh Choudhary", email = "phdmb10007.21@bitmesra.ac.in" },
+]
+keywords = [
+    "database", "vector-database", "vector-search", "hybrid-search",
+    "ai", "ai-agents", "agent-memory", "rag", "retrieval-augmented-generation",
+    "memory", "embeddings", "bm25", "hnsw", "rrf", "reciprocal-rank-fusion",
+    "mcp", "model-context-protocol", "rust", "tantivy",
+]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
     "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
-keywords = ["database", "vector", "search", "ai", "agent", "rag", "memory"]
 
 [project.urls]
-Homepage = "https://github.com/duxxdb/duxxdb"
-Repository = "https://github.com/duxxdb/duxxdb"
+Homepage = "https://github.com/bankyresearch/duxxdb"
+Documentation = "https://github.com/bankyresearch/duxxdb/tree/master/docs"
+Repository = "https://github.com/bankyresearch/duxxdb"
+Issues = "https://github.com/bankyresearch/duxxdb/issues"
+Changelog = "https://github.com/bankyresearch/duxxdb/blob/master/docs/ROADMAP.md"
 
 [tool.maturin]
 # Build the extension-module variant of pyo3 (no libpython linkage).
