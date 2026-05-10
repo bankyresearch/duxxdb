@@ -225,25 +225,32 @@ redis-cli -p 6379
    3) "I lost my wallet"
 ```
 
-### ✅ Phase 2.3 — Durable storage via redb
+### ✅ Phase 2.3 + 2.3.5 — Durable storage with persistent indices
 
-Pluggable `Storage` trait + a [redb] backend. `--storage redb:./path`
-on `duxx-server` makes memories survive process restart:
+Two storage tiers; pick by spec:
 
 ```bash
-duxx-server --storage redb:./data/duxx.redb &
-redis-cli -p 6379 -X REMEMBER alice "hello world"
-# kill server
-duxx-server --storage redb:./data/duxx.redb &
-redis-cli -p 6379 RECALL alice "hello"
-# 1) (integer) 1
-#    "0.032787"
-#    "hello world"
+# Rows persist (redb). Indices rebuild from rows on each open
+# (~250 us/row). Simpler, fewer files on disk.
+duxx-server --storage redb:./data/duxx.redb
+
+# Rows + tantivy + HNSW all persisted under one directory.
+# Graceful reopen (after Ctrl+C / SIGTERM) skips the index rebuild.
+# Hard kill / panic falls back to the rebuild path automatically.
+duxx-server --storage dir:./data/duxx
 ```
 
-Why redb instead of Lance? Pure Rust, zero FFI risk, ACID, MVCC —
-unblocks Open UAT today. Lance can still slot in later as another
-`Storage` impl.
+Layout under `dir:`:
+
+```
+data/duxx/
+├── store.redb       row store (redb, ACID)
+├── tantivy/         BM25 disk index (tantivy MmapDirectory)
+└── hnsw/            HNSW dump + id-map sidecar (hnsw_rs file_dump)
+```
+
+Why not Lance? Pure Rust, zero FFI risk; unblocks Open UAT today.
+Lance can still slot in later as another `Storage` impl.
 
 [redb]: https://github.com/cberner/redb
 
@@ -332,7 +339,7 @@ Glob patterns: `*` matches any sequence, `?` matches one char,
 
 | Phase | Component | Status |
 |---|---|---|
-| 2.3.5 | Index persistence (skip cold-start rebuild) | Designed |
+| 2.3.5 | Index persistence (skip cold-start rebuild) | ✅ Shipped |
 | 2.4 | Cross-restart importance decay (Unix-epoch timestamps) | ✅ Shipped |
 | 3.5 | gRPC daemon for typed cross-language streaming | Designed |
 | 4.6 | Comparative bench vs Redis / Qdrant / pgvector / LanceDB | Designed |

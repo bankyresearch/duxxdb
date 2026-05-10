@@ -47,13 +47,14 @@ Goal: working in-process database with hybrid search on 1M rows.
 - [x] **2.5** — Batched tantivy commits + auto-flush on read
       (≈30× bulk-insert speedup)
 - [x] **2.3** — Durable storage via [redb] behind a pluggable
-      `Storage` trait. `MemoryStore::with_storage()` replays every
-      persisted memory back into the in-memory caches + indices on
-      open. Server flag `--storage redb:./path` enables durability.
-      Lance was the original target; we shipped redb instead because
-      it's pure Rust (zero FFI risk), ACID, and unblocks Open UAT
-      today. Lance can still slot in as another `Storage` impl later
-      ([PHASE_2_3_PLAN.md](./PHASE_2_3_PLAN.md)).
+      `Storage` trait. Server flag `--storage redb:./path` enables
+      row durability; indices rebuild from rows on open.
+- [x] **2.3.5** — Index persistence: disk-backed tantivy
+      (`MmapDirectory`) + HNSW dump/load (`hnsw_rs::file_dump`).
+      Server flag `--storage dir:./path` enables full persistence
+      (rows + indices). Graceful reopens skip the rebuild (fast path);
+      hard kills fall back to row-rebuild (cold path). Ctrl+C handler
+      added so `docker stop` / SIGTERM reach the fast path.
 
 [redb]: https://github.com/cberner/redb
 
