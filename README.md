@@ -67,12 +67,13 @@ read-before-you-test checklist.
 
 ## Documentation
 
-- **[docs/UAT_GUIDE.md](./docs/UAT_GUIDE.md)** — install + integration recipes, what works, what's missing. **Read before testing.**
-- **[docs/PROJECT_OVERVIEW.md](./docs/PROJECT_OVERVIEW.md)** — capabilities, competitive landscape, performance numbers.
+- **[docs/INSTALLATION.md](./docs/INSTALLATION.md)** — install per platform (Docker, source, Python wheel, Node bindings, Cargo dep). **Start here to set up.**
+- **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)** — quickstart per integration surface, workflows, configuration. **Start here to use.**
+- **[docs/PROJECT_OVERVIEW.md](./docs/PROJECT_OVERVIEW.md)** — capabilities, competitive landscape, performance numbers, architecture.
 - **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)** — full system design.
-- **[docs/SETUP.md](./docs/SETUP.md)** — install log + cross-platform notes.
-- **[docs/ROADMAP.md](./docs/ROADMAP.md)** — phased plan + status.
-- **[docs/PHASE_2_3_PLAN.md](./docs/PHASE_2_3_PLAN.md)** — Lance integration plan for the next session.
+- **[docs/ROADMAP.md](./docs/ROADMAP.md)** — phased plan + status (Phase 0 → 5 ✅).
+- **[docs/SETUP.md](./docs/SETUP.md)** — toolchain history + Windows-specific gotchas.
+- **[docs/UAT_GUIDE.md](./docs/UAT_GUIDE.md)** — Closed-UAT-specific testing notes.
 
 ## Architecture (short version)
 
