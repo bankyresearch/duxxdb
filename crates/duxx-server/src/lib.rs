@@ -25,6 +25,7 @@
 //! provider via [`Server::with_embedder`].
 
 pub mod glob;
+pub mod metrics;
 pub mod resp;
 
 use duxx_embed::{Embedder, HashEmbedder};
@@ -48,6 +49,17 @@ pub struct Server {
     sessions: SessionStore,
     embedder: Arc<dyn Embedder>,
     dim: usize,
+    /// When `Some`, every connection must `AUTH <token>` before any
+    /// other command (PING is always allowed). When `None`, the
+    /// server runs unauthenticated — fine for localhost dev, NOT
+    /// safe for any network-exposed deployment.
+    auth_token: Option<Arc<str>>,
+    /// Active connection count for graceful-shutdown drain. Dropped
+    /// to 0 by `serve_with_shutdown` on each conn close.
+    active_conns: Arc<std::sync::atomic::AtomicUsize>,
+    /// Optional Prometheus metrics. When Some, accept-loop + handler
+    /// hooks update counters. Use [`Server::with_metrics`] to attach.
+    metrics: Option<metrics::Metrics>,
 }
 
 impl std::fmt::Debug for Server {
@@ -61,8 +73,8 @@ impl std::fmt::Debug for Server {
 }
 
 impl Server {
-    /// Build with the default `HashEmbedder` (toy, 32-d) and no
-    /// durable storage.
+    /// Build with the default `HashEmbedder` (toy, 32-d), no
+    /// durable storage, and no auth.
     pub fn new() -> Self {
         Self::with_provider(Arc::new(HashEmbedder::new(DEFAULT_DIM)))
     }
@@ -75,7 +87,31 @@ impl Server {
             sessions: SessionStore::new(),
             embedder,
             dim,
+            auth_token: None,
+            active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            metrics: None,
         }
+    }
+
+    /// Require clients to issue `AUTH <token>` before any non-PING
+    /// command. Pass `None` to disable auth (the default).
+    pub fn with_auth(mut self, token: impl Into<Arc<str>>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Attach Prometheus metrics. The accept loop will increment
+    /// connection counters; the dispatch path increments command
+    /// counters and records latency histograms.
+    pub fn with_metrics(mut self, m: metrics::Metrics) -> Self {
+        self.metrics = Some(m);
+        self
+    }
+
+    /// Number of currently-open client connections.
+    pub fn active_connections(&self) -> usize {
+        self.active_conns
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Build with an embedder AND a durable storage backend (redb,
@@ -92,6 +128,9 @@ impl Server {
             sessions: SessionStore::new(),
             embedder,
             dim,
+            auth_token: None,
+            active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            metrics: None,
         })
     }
 
@@ -109,6 +148,9 @@ impl Server {
             sessions: SessionStore::new(),
             embedder,
             dim,
+            auth_token: None,
+            active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            metrics: None,
         })
     }
 
@@ -145,16 +187,98 @@ impl Server {
     /// process shutdown).
     pub async fn serve(&self, addr: &str) -> anyhow::Result<()> {
         let listener = TcpListener::bind(addr).await?;
-        tracing::info!(addr = %addr, "duxx-server listening");
+        tracing::info!(
+            addr = %addr,
+            auth = self.auth_token.is_some(),
+            "duxx-server listening"
+        );
         loop {
             let (socket, peer) = listener.accept().await?;
             tracing::debug!(?peer, "accepted");
             let server = self.clone();
+            self.active_conns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let counter = self.active_conns.clone();
             tokio::spawn(async move {
                 if let Err(e) = server.handle_connection(socket).await {
                     tracing::warn!(?peer, error = %e, "connection ended with error");
                 }
+                counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             });
+        }
+    }
+
+    /// Bind and serve until `shutdown` resolves. After the signal:
+    /// stop accepting new connections, then wait up to `drain` for
+    /// active connections to close. Returns the count still open at
+    /// the deadline (0 = clean drain).
+    pub async fn serve_with_shutdown(
+        &self,
+        addr: &str,
+        shutdown: impl std::future::Future<Output = ()>,
+        drain: std::time::Duration,
+    ) -> anyhow::Result<usize> {
+        let listener = TcpListener::bind(addr).await?;
+        tracing::info!(
+            addr = %addr,
+            auth = self.auth_token.is_some(),
+            "duxx-server listening"
+        );
+        let server = self.clone();
+        let counter = self.active_conns.clone();
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                accept = listener.accept() => {
+                    let (socket, peer) = accept?;
+                    tracing::debug!(?peer, "accepted");
+                    let s = server.clone();
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(m) = &s.metrics {
+                        m.connections_total.inc();
+                        m.active_connections.inc();
+                        m.memory_count.set(s.memory.len() as i64);
+                        m.session_count.set(s.sessions.len() as i64);
+                    }
+                    let c = counter.clone();
+                    let m = s.metrics.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = s.handle_connection(socket).await {
+                            tracing::warn!(?peer, error = %e, "connection ended with error");
+                            if let Some(ref m) = m {
+                                m.errors_total.with_label_values(&["conn"]).inc();
+                            }
+                        }
+                        c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(m) = m {
+                            m.active_connections.dec();
+                        }
+                    });
+                }
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown signal received; draining");
+                    break;
+                }
+            }
+        }
+
+        // Drain.
+        let deadline = tokio::time::Instant::now() + drain;
+        loop {
+            let n = counter.load(std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                tracing::info!("drain complete: all connections closed");
+                return Ok(0);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    open = n,
+                    "drain deadline hit; {n} connections still open"
+                );
+                return Ok(n);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
@@ -162,6 +286,9 @@ impl Server {
         let mut buf = bytes::BytesMut::with_capacity(4096);
         let mut out = Vec::with_capacity(1024);
         let mut state = SubState::default();
+        // Pre-authed when no token is configured. Otherwise stays
+        // false until the client issues AUTH <token>.
+        let mut authed = self.auth_token.is_none();
 
         loop {
             // Drain any complete commands already in `buf`.
@@ -169,7 +296,8 @@ impl Server {
                 match resp::parse(&mut buf) {
                     Ok(Some(v)) => {
                         out.clear();
-                        let action = self.dispatch_with_sub(v, state.is_subscribed());
+                        let action =
+                            self.dispatch_with_auth(v, state.is_subscribed(), &mut authed);
                         match action {
                             Response::Reply(value) => {
                                 value.write_to(&mut out);
@@ -282,14 +410,55 @@ impl Server {
         }
     }
 
-    /// Pure dispatch — no subscription side-effects. Used by tests.
+    /// Pure dispatch — no subscription / auth side-effects. Used by tests.
     pub fn dispatch(&self, value: RespValue) -> Response {
-        self.dispatch_with_sub(value, false)
+        let mut authed = true;
+        self.dispatch_with_auth(value, false, &mut authed)
+    }
+
+    /// Dispatch with auth + subscribe-mode awareness. `authed` is
+    /// flipped to true on a successful AUTH command.
+    fn dispatch_with_auth(
+        &self,
+        value: RespValue,
+        subscribed: bool,
+        authed: &mut bool,
+    ) -> Response {
+        // Authentication gate: when a token is configured, only
+        // PING / AUTH / QUIT / HELLO work pre-auth. Everything else
+        // returns NOAUTH to match Redis convention.
+        if !*authed {
+            // Peek at the command name without consuming `value`.
+            let cmd_upper = match &value {
+                RespValue::Array(items) if !items.is_empty() => arg_string(&items[0])
+                    .map(|s| s.to_ascii_uppercase())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let allowed_pre_auth =
+                matches!(cmd_upper.as_str(), "AUTH" | "PING" | "QUIT" | "HELLO");
+            if !allowed_pre_auth {
+                return Response::Reply(err(
+                    "NOAUTH Authentication required.",
+                ));
+            }
+        }
+        self.dispatch_with_sub_inner(value, subscribed, authed)
     }
 
     /// Dispatch in connection context. `subscribed` is true if the
     /// connection has any active SUBSCRIBE/PSUBSCRIBE.
     fn dispatch_with_sub(&self, value: RespValue, subscribed: bool) -> Response {
+        let mut authed = true;
+        self.dispatch_with_sub_inner(value, subscribed, &mut authed)
+    }
+
+    fn dispatch_with_sub_inner(
+        &self,
+        value: RespValue,
+        subscribed: bool,
+        authed: &mut bool,
+    ) -> Response {
         let args = match value {
             RespValue::Array(items) => items,
             other => return Response::Reply(err(format!("ERR expected array, got {other:?}"))),
@@ -317,6 +486,7 @@ impl Server {
         match cmd.as_str() {
             "PING" => self.cmd_ping(&args),
             "HELLO" => self.cmd_hello(&args),
+            "AUTH" => self.cmd_auth(&args, authed),
             "COMMAND" => self.cmd_command(),
             "INFO" => self.cmd_info(),
             "QUIT" => Response::CloseAfter(simple("OK")),
@@ -330,6 +500,33 @@ impl Server {
             "PSUBSCRIBE" => self.cmd_psubscribe(&args),
             "PUNSUBSCRIBE" => self.cmd_punsubscribe(&args),
             other => Response::Reply(err(format!("ERR unknown command '{other}'"))),
+        }
+    }
+
+    fn cmd_auth(&self, args: &[RespValue], authed: &mut bool) -> Response {
+        // Redis AUTH is `AUTH <password>` or `AUTH <user> <password>`.
+        // We accept both shapes and ignore the user part (single-tenant).
+        let token = match args.len() {
+            2 => arg_string(&args[1]),
+            3 => arg_string(&args[2]),
+            _ => return Response::Reply(err("ERR wrong number of arguments for AUTH")),
+        };
+        let token = match token {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR AUTH token must be a string")),
+        };
+        match &self.auth_token {
+            None => Response::Reply(err(
+                "ERR Client sent AUTH, but no password is set",
+            )),
+            Some(expected) => {
+                if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+                    *authed = true;
+                    Response::Reply(simple("OK"))
+                } else {
+                    Response::Reply(err("WRONGPASS invalid token"))
+                }
+            }
         }
     }
 
@@ -363,7 +560,8 @@ impl Server {
     fn cmd_command(&self) -> Response {
         // Very minimal: just list our command names.
         let names = [
-            "PING", "HELLO", "COMMAND", "INFO", "QUIT", "SET", "GET", "DEL", "REMEMBER", "RECALL",
+            "PING", "HELLO", "AUTH", "COMMAND", "INFO", "QUIT", "SET", "GET", "DEL",
+            "REMEMBER", "RECALL", "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
         ];
         let arr: Vec<RespValue> = names.iter().map(|n| RespValue::bulk(*n)).collect();
         Response::Reply(RespValue::Array(arr))
@@ -578,6 +776,7 @@ impl Default for Server {
 }
 
 /// What `dispatch` returns. The connection-loop interprets each variant.
+#[derive(Debug)]
 pub enum Response {
     Reply(RespValue),
     CloseAfter(RespValue),
@@ -650,6 +849,20 @@ fn simple(s: &str) -> RespValue {
 
 fn err(s: impl Into<String>) -> RespValue {
     RespValue::Error(s.into())
+}
+
+/// Constant-time byte comparison — keeps token validation immune to
+/// timing side-channel attacks. Pulled in here rather than via the
+/// `subtle` crate to keep the dep tree small.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn arg_string(v: &RespValue) -> Option<&str> {
@@ -864,6 +1077,102 @@ mod tests {
         let r2 = unwrap(s.dispatch(v2));
         assert_eq!(r1, simple("PONG"));
         assert!(matches!(r2, RespValue::BulkString(_)));
+    }
+
+    #[test]
+    fn auth_rejects_unauthed_commands_when_token_set() {
+        let s = Server::new().with_auth("s3cret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            RespValue::Array(vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("u"),
+                RespValue::bulk("hi"),
+            ]),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.starts_with("NOAUTH"), "got: {msg}");
+            }
+            _ => panic!("expected NOAUTH error"),
+        }
+    }
+
+    #[test]
+    fn auth_accepts_correct_token() {
+        let s = Server::new().with_auth("s3cret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk("s3cret")]),
+            false,
+            &mut authed,
+        );
+        assert!(authed, "should be authed after AUTH");
+        match r {
+            Response::Reply(RespValue::SimpleString(s)) if s == "OK" => {}
+            other => panic!("expected +OK, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_rejects_wrong_token() {
+        let s = Server::new().with_auth("s3cret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk("wrong")]),
+            false,
+            &mut authed,
+        );
+        assert!(!authed, "should NOT be authed after wrong token");
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.starts_with("WRONGPASS"), "got: {msg}");
+            }
+            _ => panic!("expected WRONGPASS"),
+        }
+    }
+
+    #[test]
+    fn auth_no_token_set_errors_on_auth_command() {
+        // Redis convention: AUTH on an un-passworded server is a client error.
+        let s = Server::new();
+        let mut authed = true;
+        let r = s.dispatch_with_auth(
+            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk("anything")]),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("no password is set"), "got: {msg}");
+            }
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn ping_allowed_pre_auth() {
+        let s = Server::new().with_auth("s3cret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            RespValue::Array(vec![RespValue::bulk("PING")]),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::SimpleString(s)) if s == "PONG" => {}
+            _ => panic!("PING must work before auth"),
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_basic() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]

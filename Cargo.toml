@@ -72,9 +72,16 @@ napi-build = "2"
 # gRPC daemon (Phase 3.5)
 tonic = "0.12"
 tonic-build = "0.12"
+tonic-health = "0.12"
 prost = "0.13"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Prometheus metrics (Phase 6.1)
+prometheus = "0.13"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 # Cold-tier export (Phase 5). Plain Parquet first -- pure Rust, ships
 # anywhere, and Spark/DuckDB/Polars all read it natively. Delta Lake

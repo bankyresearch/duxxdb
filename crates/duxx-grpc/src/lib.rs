@@ -46,6 +46,10 @@ pub struct DuxxService {
     memory: MemoryStore,
     embedder: Arc<dyn Embedder>,
     dim: usize,
+    /// Optional bearer token. When `Some`, every request must carry
+    /// `authorization: Bearer <token>` in metadata. When `None`, the
+    /// service is unauthenticated.
+    auth_token: Option<Arc<str>>,
 }
 
 impl DuxxService {
@@ -61,6 +65,7 @@ impl DuxxService {
             memory: MemoryStore::with_capacity(dim, 100_000),
             embedder,
             dim,
+            auth_token: None,
         }
     }
 
@@ -75,7 +80,41 @@ impl DuxxService {
             memory,
             embedder,
             dim,
+            auth_token: None,
         })
+    }
+
+    /// Require clients to send `authorization: Bearer <token>` on
+    /// every RPC. Pass `None` (or omit) to disable auth.
+    pub fn with_auth(mut self, token: impl Into<Arc<str>>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Build the bearer-token check used by [`Self::serve`]. Public
+    /// so tests / custom serve loops can reuse it.
+    pub fn auth_interceptor(&self) -> impl tonic::service::Interceptor + Clone {
+        let expected: Option<Arc<str>> = self.auth_token.clone();
+        move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+            let Some(want) = expected.as_ref() else {
+                return Ok(req); // auth disabled
+            };
+            let got = req
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .unwrap_or("");
+            if got.is_empty() {
+                return Err(tonic::Status::unauthenticated(
+                    "missing authorization header (Bearer token required)",
+                ));
+            }
+            if !ct_eq(got.as_bytes(), want.as_bytes()) {
+                return Err(tonic::Status::unauthenticated("invalid bearer token"));
+            }
+            Ok(req)
+        }
     }
 
     /// Wrap as a `tonic` server ready for `serve()`.
@@ -83,19 +122,45 @@ impl DuxxService {
         DuxxServer::new(self)
     }
 
-    /// Convenience: serve on `addr` until cancellation.
+    /// Convenience: serve on `addr` until cancellation. Includes the
+    /// standard `grpc.health.v1.Health` service for k8s / load
+    /// balancers and the bearer-token interceptor when auth is set.
     pub async fn serve(self, addr: &str) -> anyhow::Result<()> {
         let parsed: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid addr {addr}: {e}"))?;
-        let svc = self.into_server();
-        tracing::info!(%addr, "duxx-grpc listening");
+        tracing::info!(%addr, auth = self.auth_token.is_some(), "duxx-grpc listening");
+
+        // Standard health protocol -- k8s livenessProbe / readinessProbe
+        // can hit `grpc.health.v1.Health/Check` directly.
+        let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
+        health_reporter
+            .set_serving::<DuxxServer<DuxxService>>()
+            .await;
+
+        let interceptor = self.auth_interceptor();
+        let duxx_with_auth = DuxxServer::with_interceptor(self, interceptor);
+
         tonic::transport::Server::builder()
-            .add_service(svc)
+            .add_service(health_svc)
+            .add_service(duxx_with_auth)
             .serve(parsed)
             .await?;
         Ok(())
     }
+}
+
+/// Constant-time byte comparison (auth tokens, defense against timing
+/// side-channels).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl Default for DuxxService {

@@ -24,6 +24,7 @@ duxx-embed = { workspace = true, features = ["http"] }
 tokio = { workspace = true }
 tokio-stream.workspace = true
 tonic.workspace = true
+tonic-health.workspace = true
 prost.workspace = true
 async-stream.workspace = true
 futures.workspace = true

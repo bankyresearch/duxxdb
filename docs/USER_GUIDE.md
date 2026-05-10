@@ -25,6 +25,7 @@ surfaces. If you haven't installed yet, start at
    - [Storage modes](#42-storage-modes)
    - [Server flags](#43-server-flags)
 5. [Going to production](#5-going-to-production)
+6. [Backup & restore](#6-backup--restore)
 
 ---
 
@@ -458,24 +459,40 @@ Set via:
 
 ```
 duxx-server [OPTIONS]
-  --addr HOST:PORT       default 127.0.0.1:6379
-  --embedder SPEC        default hash:32
-  --storage SPEC         default in-memory only
+  --addr HOST:PORT          default 127.0.0.1:6379
+  --embedder SPEC           default hash:32
+  --storage SPEC            default in-memory only
+  --token TOKEN             require AUTH <TOKEN> (default: no auth)
+  --drain-secs N            graceful-shutdown drain window (default 30)
+  --metrics-addr HOST:PORT  Prometheus + /health endpoint (default: disabled)
 
 duxx-grpc [OPTIONS]
-  --addr HOST:PORT       default 127.0.0.1:50051
-  --embedder SPEC        default hash:32
-  --storage SPEC         default in-memory only
+  --addr HOST:PORT          default 127.0.0.1:50051
+  --embedder SPEC           default hash:32
+  --storage SPEC            default in-memory only
+  --token TOKEN             require Bearer TOKEN (default: no auth)
+  # grpc.health.v1.Health is always served (no auth required)
 
-duxx-mcp                 # stdio JSON-RPC; uses DUXX_EMBEDDER + DUXX_STORAGE env
+duxx-mcp                    # stdio JSON-RPC; uses DUXX_EMBEDDER + DUXX_STORAGE env
 
 duxx-export
-  --storage SPEC         required
-  --out PATH             required Parquet path
-  --dim N                default 32
+  --storage SPEC            required
+  --out PATH                required Parquet path
+  --dim N                   default 32
 ```
 
-Env vars override the spec defaults but lose to explicit CLI flags.
+**Auth semantics:**
+- RESP: `AUTH <token>` (Redis-compatible). Pre-auth, only `PING` /
+  `AUTH` / `QUIT` / `HELLO` work; everything else returns `NOAUTH`.
+  Wrong tokens return `WRONGPASS`.
+- gRPC: send `authorization: Bearer <token>` metadata on every
+  request. Missing or wrong token returns `UNAUTHENTICATED`.
+  Health protocol bypasses auth so probes work.
+- Tokens are compared in constant time to defeat timing
+  side-channel attacks.
+
+Env vars override defaults but lose to explicit CLI flags:
+`DUXX_EMBEDDER` / `DUXX_STORAGE` / `DUXX_TOKEN` / `DUXX_METRICS_ADDR`.
 
 ---
 
@@ -483,20 +500,112 @@ Env vars override the spec defaults but lose to explicit CLI flags.
 
 | Concern | Status | Recommendation |
 |---|---|---|
-| Durability | ✅ via `dir:` | Pin `--storage dir:...`; hard-kill safe via cold-path rebuild |
+| Durability | ✅ via `--storage dir:` | Pin `--storage dir:...`; hard-kill safe via cold-path rebuild |
 | Cross-restart decay | ✅ Phase 2.4 | Set per-store half-life via `recall_decayed` in code |
-| Network exposure | ⚠ no auth yet | Bind to `127.0.0.1` only; reverse-proxy with auth (nginx + basic auth, or service-mesh mTLS). Don't expose to public Internet. |
-| Multi-tenancy | ⚠ no isolation | One `MemoryStore` (or one `--storage dir:./tenant-X`) per tenant |
-| Observability | ⚠ basic tracing | We log via [`tracing`](https://crates.io/crates/tracing); pipe stderr to your collector. Prometheus / OpenTelemetry exporters land in Phase 6. |
-| RBAC | ✗ | Deferred to Phase 6 |
-| Sharding / replication | ✗ | Single node only; replicate at the orchestration layer (Kubernetes) for now |
-| Backups | use Parquet export | Hourly `duxx-export` to cold storage; restore by importing back via `MemoryStore::with_storage` (custom code today) |
+| **Auth** | ✅ Phase 6.1 — token-based | Set `--token` / `DUXX_TOKEN` (≥ 16 chars). Clients issue `AUTH <token>` (RESP) or `authorization: Bearer <token>` (gRPC). |
+| **Health probes** | ✅ Phase 6.1 | gRPC: `grpc.health.v1.Health/Check`. HTTP: `GET /health` on the metrics port. |
+| **Prometheus metrics** | ✅ Phase 6.1 | `--metrics-addr 0.0.0.0:9091` exposes `/metrics` (text format) + `/health` |
+| **Graceful shutdown** | ✅ Phase 6.1 | SIGINT/SIGTERM stops accepting new connections, drains for `--drain-secs` (default 30) before exiting. Rolling-deploy safe. |
+| TLS | ⚠ not yet — terminate at LB | Put nginx / Envoy / a service mesh in front; bind DuxxDB to `127.0.0.1`. |
+| Multi-tenancy | ⚠ no isolation in process | One `--storage dir:./tenant-X` daemon per tenant for now |
+| RBAC | ✗ | Deferred to Phase 6.2 |
+| Sharding / replication | ✗ | Single node; replicate at the orchestration layer (Kubernetes) for now |
+| Backups | ✅ Parquet export | See [§ 3.5](#35-cold-tier-export-to-parquet) and [§ 6](#6-backup--restore) below |
 
-For Closed UAT: bind to localhost, use `dir:` storage, configure
-your embedder, and you're set. Production deployments wait on
-Phase 6 hardening.
+### Production startup recipe
 
-Open issues that block Open UAT → see [ROADMAP.md](ROADMAP.md).
+```bash
+duxx-server \
+  --addr 0.0.0.0:6379 \
+  --storage dir:/var/lib/duxx \
+  --embedder openai:text-embedding-3-small \
+  --token "$(cat /etc/duxx/token)" \
+  --metrics-addr 127.0.0.1:9091 \
+  --drain-secs 60
+```
+
+```bash
+duxx-grpc \
+  --addr 0.0.0.0:50051 \
+  --storage dir:/var/lib/duxx \
+  --embedder openai:text-embedding-3-small \
+  --token "$(cat /etc/duxx/token)"
+```
+
+K8s liveness probe:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 9091
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# OR for gRPC:
+readinessProbe:
+  grpc:
+    port: 50051
+  periodSeconds: 5
+```
+
+---
+
+## 6. Backup & restore
+
+### Backup — periodic Parquet dump
+
+```cron
+# /etc/cron.hourly/duxx-backup
+0 * * * *  /usr/local/bin/duxx-export \
+  --storage dir:/var/lib/duxx \
+  --out /var/cold/$(date +\%Y\%m\%d-\%H).parquet \
+  --dim 1536
+```
+
+Uploads to S3 / GCS / Azure are a follow-on `aws s3 cp …` — treat
+the parquet file as any other artifact.
+
+### Restore — from Parquet back into DuxxDB
+
+There's no auto-import yet (Phase 6.2). Until then, write a small
+Rust program against `MemoryStore` that reads the Parquet file via
+the `parquet` crate and calls `remember()` for each row:
+
+```rust
+use duxx_memory::{MemoryStore, Memory};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::fs::File;
+
+fn main() -> anyhow::Result<()> {
+    let store = MemoryStore::open_at(1536, 100_000, "/var/lib/duxx")?;
+    let file = File::open("/var/cold/snapshot.parquet")?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    for batch in reader {
+        let batch = batch?;
+        // … decode columns, call store.remember(...) for each row …
+    }
+    Ok(())
+}
+```
+
+The `bench/comparative/bench.py` harness has a similar pattern in
+Python via `pyarrow` — copy that loop and point it at your file.
+
+### Disaster recovery posture
+
+| Failure | Recovery |
+|---|---|
+| Server crashed (panic / SIGKILL) | Restart — auto-rebuilds tantivy + HNSW from `redb` rows. Sub-minute for 100k memories; minutes for 1M. |
+| Disk corruption on `redb` | Restore from latest Parquet dump (hourly). |
+| Disk lost entirely | Restore from latest Parquet dump in object storage. |
+| Single bad memory | Manually `DEL` via the row store, or `--remove` flag (Phase 6.2). |
+
+For Closed UAT: bind to localhost, use `dir:` storage, set a token,
+configure your embedder. For Open UAT: add the `--metrics-addr`
+endpoint, put nginx/mTLS in front, and you're set. Production
+deployments need Phase 6.2 (RBAC, multi-tenant isolation,
+distributed mode) — see [ROADMAP.md](ROADMAP.md).
 
 ---
 

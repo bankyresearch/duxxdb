@@ -36,6 +36,9 @@ async fn main() -> anyhow::Result<()> {
     let mut addr = String::from("127.0.0.1:6379");
     let mut embedder_spec: Option<String> = None;
     let mut storage_spec: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut drain_secs: u64 = 30;
+    let mut metrics_addr: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -52,6 +55,24 @@ async fn main() -> anyhow::Result<()> {
                     args.next().ok_or_else(|| anyhow::anyhow!("--storage needs a value"))?,
                 );
             }
+            "--token" | "-t" => {
+                token = Some(
+                    args.next().ok_or_else(|| anyhow::anyhow!("--token needs a value"))?,
+                );
+            }
+            "--drain-secs" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--drain-secs needs a value"))?;
+                drain_secs = v.parse()?;
+            }
+            "--metrics-addr" => {
+                metrics_addr = Some(
+                    args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--metrics-addr needs HOST:PORT")
+                    })?,
+                );
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -59,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             other => anyhow::bail!("unknown arg: {other}"),
         }
     }
+    let token = token.or_else(|| std::env::var("DUXX_TOKEN").ok());
 
     let embedder_spec = embedder_spec
         .or_else(|| std::env::var("DUXX_EMBEDDER").ok())
@@ -79,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
         None => Arc::new(duxx_embed::HashEmbedder::new(32)),
     };
 
-    let server = match storage_spec.as_deref() {
+    let mut server = match storage_spec.as_deref() {
         // dir:./path -- full persistence: redb rows + tantivy index +
         // HNSW dump under one directory. Reopens skip the rebuild.
         Some(spec) if spec.starts_with("dir:") => {
@@ -96,20 +118,50 @@ async fn main() -> anyhow::Result<()> {
         None => duxx_server::Server::with_provider(embedder),
     };
 
-    // Race serve() against a Ctrl+C / SIGTERM. When the signal fires,
-    // the select! arm returns and the server's Drop runs — which
-    // commits the disk-backed tantivy index and dumps the HNSW. Hard
-    // kills (SIGKILL / TerminateProcess) skip Drop; in that case the
-    // next reopen falls back to row-rebuild (correct, just slower).
-    tokio::select! {
-        res = server.serve(&addr) => {
-            res?;
+    if let Some(t) = token {
+        if t.is_empty() {
+            anyhow::bail!("--token / DUXX_TOKEN must not be empty");
         }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl+C received -- gracefully shutting down");
+        if t.len() < 16 {
+            tracing::warn!(
+                "auth token is shorter than 16 characters; use a stronger value in production"
+            );
         }
+        server = server.with_auth(t);
+        tracing::info!("authentication ENABLED (clients must AUTH)");
+    } else {
+        tracing::warn!(
+            "running without authentication. Bind to 127.0.0.1 only, OR set --token / DUXX_TOKEN."
+        );
     }
-    drop(server); // explicit so the indices flush before exit
+
+    // Optional Prometheus / health endpoint on a separate listener.
+    let metrics_addr = metrics_addr.or_else(|| std::env::var("DUXX_METRICS_ADDR").ok());
+    if let Some(addr) = metrics_addr {
+        let m = duxx_server::metrics::Metrics::new();
+        server = server.with_metrics(m.clone());
+        let parsed: std::net::SocketAddr = addr.parse()?;
+        tokio::spawn(async move {
+            if let Err(e) = duxx_server::metrics::serve(m, parsed).await {
+                tracing::warn!(error = %e, "metrics endpoint stopped");
+            }
+        });
+    }
+
+    // Graceful shutdown: serve until Ctrl+C / SIGTERM, then drain
+    // in-flight connections for `drain_secs` before exiting.
+    let drain = std::time::Duration::from_secs(drain_secs);
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl+C received");
+    };
+    let still_open = server.serve_with_shutdown(&addr, shutdown, drain).await?;
+    drop(server); // explicit: triggers MemoryStore Drop -> tantivy commit + HNSW dump
+    if still_open > 0 {
+        tracing::warn!(
+            "{still_open} connections did not close within {drain_secs}s drain window"
+        );
+    }
     tracing::info!("duxx-server stopped");
     Ok(())
 }
@@ -144,9 +196,14 @@ fn print_help() {
     println!("USAGE: duxx-server [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("  --addr HOST:PORT       Listen address     (default 127.0.0.1:6379)");
-    println!("  --embedder SPEC        Embedder spec      (default hash:32)");
-    println!("  --storage SPEC         Storage backend    (default in-memory only)");
+    println!("  --addr HOST:PORT       Listen address       (default 127.0.0.1:6379)");
+    println!("  --embedder SPEC        Embedder spec        (default hash:32)");
+    println!("  --storage SPEC         Storage backend      (default in-memory only)");
+    println!("  --token TOKEN          Require AUTH <TOKEN> from every client");
+    println!("                         (default: no auth -- localhost-only safe)");
+    println!("  --drain-secs N         Shutdown drain budget (default 30)");
+    println!("  --metrics-addr HOST:PORT  Bind a Prometheus + /health endpoint");
+    println!("                         (default: disabled)");
     println!();
     println!("EMBEDDER SPECS:");
     println!("  hash:<dim>                          deterministic toy embedder");
@@ -160,5 +217,6 @@ fn print_help() {
     println!("  dir:./path/to/dir                   FULLY persistent: rows + tantivy + HNSW");
     println!("                                      (skips rebuild on graceful reopen)");
     println!();
-    println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, OPENAI_API_KEY, COHERE_API_KEY");
+    println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_TOKEN, DUXX_METRICS_ADDR,");
+    println!("     OPENAI_API_KEY, COHERE_API_KEY");
 }

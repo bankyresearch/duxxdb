@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let mut addr = String::from("127.0.0.1:50051");
     let mut embedder_spec: Option<String> = None;
     let mut storage_spec: Option<String> = None;
+    let mut token: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -40,6 +41,11 @@ async fn main() -> anyhow::Result<()> {
                     args.next().ok_or_else(|| anyhow::anyhow!("--storage needs a value"))?,
                 );
             }
+            "--token" | "-t" => {
+                token = Some(
+                    args.next().ok_or_else(|| anyhow::anyhow!("--token needs a value"))?,
+                );
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -47,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
             other => anyhow::bail!("unknown arg: {other}"),
         }
     }
+    let token = token.or_else(|| std::env::var("DUXX_TOKEN").ok());
 
     let embedder_spec = embedder_spec
         .or_else(|| std::env::var("DUXX_EMBEDDER").ok())
@@ -67,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
             None => Arc::new(duxx_embed::HashEmbedder::new(32)),
         };
 
-    let svc = match storage_spec.as_deref() {
+    let mut svc = match storage_spec.as_deref() {
         Some(spec) if spec.starts_with("dir:") => {
             let dir = &spec[4..];
             std::fs::create_dir_all(dir)?;
@@ -80,6 +87,23 @@ async fn main() -> anyhow::Result<()> {
         }
         None => DuxxService::with_provider(embedder),
     };
+
+    if let Some(t) = token {
+        if t.is_empty() {
+            anyhow::bail!("--token / DUXX_TOKEN must not be empty");
+        }
+        if t.len() < 16 {
+            tracing::warn!(
+                "auth token shorter than 16 chars; use a stronger value in production"
+            );
+        }
+        svc = svc.with_auth(t);
+        tracing::info!("authentication ENABLED (Bearer token required)");
+    } else {
+        tracing::warn!(
+            "running without authentication. Bind to 127.0.0.1 only, or set --token / DUXX_TOKEN."
+        );
+    }
 
     tokio::select! {
         res = svc.clone().serve(&addr) => res?,
@@ -98,9 +122,15 @@ fn print_help() {
     println!("USAGE: duxx-grpc [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("  --addr HOST:PORT       Listen address  (default 127.0.0.1:50051)");
-    println!("  --embedder SPEC        Embedder spec   (default hash:32)");
+    println!("  --addr HOST:PORT       Listen address     (default 127.0.0.1:50051)");
+    println!("  --embedder SPEC        Embedder spec      (default hash:32)");
     println!("  --storage dir:./path   Persistent on-disk store (rows + indices)");
+    println!("  --token TOKEN          Require Bearer TOKEN on every RPC");
+    println!("                         (default: no auth -- localhost-only safe)");
     println!();
-    println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, OPENAI_API_KEY, COHERE_API_KEY");
+    println!("Health: grpc.health.v1.Health/Check is always available");
+    println!("(no auth required) for k8s livenessProbe / readinessProbe.");
+    println!();
+    println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_TOKEN,");
+    println!("     OPENAI_API_KEY, COHERE_API_KEY");
 }
