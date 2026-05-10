@@ -60,12 +60,14 @@ jobs:
           - os: ubuntu-latest
             target: x86_64
             manylinux: manylinux2014
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64
             manylinux: manylinux2014
-          - os: macos-13          # Intel
-            target: x86_64
-            manylinux: ""
+          # Apple Silicon only for v0.1.0. macOS Intel (macos-13) is
+          # excluded because the hosted-runner queue routinely stalls
+          # at 15-40+ minutes per job, blocking the publish step.
+          # Intel Mac users can `pip install duxxdb --no-binary :all:`
+          # to build the wheel locally (Rust toolchain + maturin).
           - os: macos-latest      # Apple silicon
             target: aarch64
             manylinux: ""

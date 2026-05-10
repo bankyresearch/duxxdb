@@ -43,15 +43,21 @@ jobs:
             os: ubuntu-latest
             archive: duxxdb-${TAG}-x86_64-linux.tar.gz
             kind: tar
+          # ARM64 Linux: GitHub now offers a native arm64 hosted runner
+          # (ubuntu-24.04-arm) so we build natively instead of cross-
+          # compiling. The cross approach was blocked by a stale protoc
+          # in the cross-rs container (proto2 only, doesn't recognize
+          # proto3 in our duxx.proto schema).
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             archive: duxxdb-${TAG}-aarch64-linux.tar.gz
             kind: tar
-            cross: true
-          - target: x86_64-apple-darwin
-            os: macos-13
-            archive: duxxdb-${TAG}-x86_64-macos.tar.gz
-            kind: tar
+          # macOS Apple Silicon. macOS Intel (x86_64-apple-darwin /
+          # macos-13) is intentionally omitted -- the macos-13 hosted
+          # runner pool is heavily congested and stalls in the queue
+          # for hours. Apple Silicon covers every Mac since late 2020;
+          # Intel Mac users on 0.1.0 build from source via
+          # `cargo build --release --workspace`.
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: duxxdb-${TAG}-aarch64-macos.tar.gz
@@ -79,10 +85,6 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install cross (linux aarch64)
-        if: ${{ matrix.cross == true }}
-        run: cargo install cross --locked
-
       - name: Install rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -97,15 +99,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} \
-              -p duxx-server -p duxx-grpc -p duxx-mcp -p duxx-coldtier \
-              --features duxx-embed/http
-          else
-            cargo build --release --target ${{ matrix.target }} \
-              -p duxx-server -p duxx-grpc -p duxx-mcp -p duxx-coldtier \
-              --features duxx-embed/http
-          fi
+          cargo build --release --target ${{ matrix.target }} \
+            -p duxx-server -p duxx-grpc -p duxx-mcp -p duxx-coldtier \
+            --features duxx-embed/http
 
       - name: Pack archive
         id: pack
