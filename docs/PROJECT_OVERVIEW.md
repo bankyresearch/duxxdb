@@ -333,7 +333,7 @@ Glob patterns: `*` matches any sequence, `?` matches one char,
 | Phase | Component | Status |
 |---|---|---|
 | 2.3.5 | Index persistence (skip cold-start rebuild) | Designed |
-| 2.4 | Cross-restart importance decay (Unix-epoch timestamps) | Designed |
+| 2.4 | Cross-restart importance decay (Unix-epoch timestamps) | ✅ Shipped |
 | 3.5 | gRPC daemon for typed cross-language streaming | Designed |
 | 4.6 | Comparative bench vs Redis / Qdrant / pgvector / LanceDB | Designed |
 | 5 | Lakehouse cold-tier export (Iceberg / Delta) | Designed |
