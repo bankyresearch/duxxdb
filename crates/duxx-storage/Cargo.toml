@@ -1,12 +1,16 @@
 [package]
 name = "duxx-storage"
-description = "DuxxDB storage engine — columnar table with mixed scalar, text, and vector columns."
+description = "DuxxDB storage engine - in-memory + optional redb-backed durable Table impls."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[features]
+default = ["redb-store"]
+redb-store = ["dep:redb"]
 
 [dependencies]
 duxx-core.workspace = true
@@ -16,3 +20,7 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+redb = { workspace = true, optional = true }
+
+[dev-dependencies]
+bincode.workspace = true

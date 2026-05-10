@@ -61,13 +61,13 @@ impl std::fmt::Debug for Server {
 }
 
 impl Server {
-    /// Build with the default `HashEmbedder` (toy, 32-d).
+    /// Build with the default `HashEmbedder` (toy, 32-d) and no
+    /// durable storage.
     pub fn new() -> Self {
         Self::with_provider(Arc::new(HashEmbedder::new(DEFAULT_DIM)))
     }
 
-    /// Build with an explicit embedder. The store's vector dim is taken
-    /// from `embedder.dim()`.
+    /// Build with an explicit embedder; in-memory only.
     pub fn with_provider(embedder: Arc<dyn Embedder>) -> Self {
         let dim = embedder.dim();
         Self {
@@ -76,6 +76,22 @@ impl Server {
             embedder,
             dim,
         }
+    }
+
+    /// Build with an embedder AND a durable storage backend (redb,
+    /// or any other `Storage` impl). Memories survive process restart.
+    pub fn with_provider_and_storage(
+        embedder: Arc<dyn Embedder>,
+        storage: Arc<dyn duxx_storage::Storage>,
+    ) -> anyhow::Result<Self> {
+        let dim = embedder.dim();
+        let memory = MemoryStore::with_storage(dim, 100_000, storage)?;
+        Ok(Self {
+            memory,
+            sessions: SessionStore::new(),
+            embedder,
+            dim,
+        })
     }
 
     /// Convenience: wrap a closure as an embedder. Useful for tests.

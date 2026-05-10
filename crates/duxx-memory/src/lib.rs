@@ -15,11 +15,17 @@ use duxx_core::Result;
 use duxx_index::{TextIndex, VectorIndex};
 use duxx_query::{hybrid_recall, RecallHit};
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
+use duxx_storage::Storage;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
+
+// Re-export so users get the full Storage surface from one place.
+pub use duxx_storage::{MemoryStorage, Storage as StorageTrait};
+#[cfg(feature = "redb-store")]
+pub use duxx_storage::RedbStorage;
 
 pub use session::{SessionStore, DEFAULT_TTL as DEFAULT_SESSION_TTL};
 pub use tool_cache::{HitKind, ToolCache, ToolCacheHit, DEFAULT_NEAR_HIT_THRESHOLD};
@@ -72,6 +78,36 @@ struct Inner {
     text_index: RwLock<TextIndex>,
     next_id: RwLock<u64>,
     bus: ChangeBus,
+    /// Optional durable backing store. When `Some`, every `remember`
+    /// writes through to it; on `with_storage` open we replay everything
+    /// back into the in-memory caches and indices.
+    storage: Option<Arc<dyn Storage>>,
+}
+
+/// Wire format for persisted memories. `created_at` is intentionally
+/// not stored — it's reset to `Instant::now()` at reload time, so
+/// importance decay restarts from process start. (Production users
+/// who care about cross-restart decay should clock from
+/// SystemTime / Unix epoch instead — Phase 2.4.)
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredMemory {
+    id: u64,
+    key: String,
+    text: String,
+    embedding: Vec<f32>,
+    importance: f32,
+}
+
+impl From<&Memory> for StoredMemory {
+    fn from(m: &Memory) -> Self {
+        Self {
+            id: m.id,
+            key: m.key.clone(),
+            text: m.text.clone(),
+            embedding: m.embedding.clone(),
+            importance: m.importance,
+        }
+    }
 }
 
 impl MemoryStore {
@@ -90,8 +126,80 @@ impl MemoryStore {
                 text_index: RwLock::new(TextIndex::new()),
                 next_id: RwLock::new(1),
                 bus: ChangeBus::default(),
+                storage: None,
             }),
         }
+    }
+
+    /// Build a store backed by a durable [`Storage`].
+    ///
+    /// On open, every memory currently in `storage` is replayed back
+    /// into the in-memory cache and rebuilt into the vector / text
+    /// indices. Subsequent `remember` calls write through to `storage`.
+    ///
+    /// Cold start cost is roughly proportional to the corpus size —
+    /// expect ~250 µs per memory on NVMe (HNSW insert + tantivy add).
+    /// At 1 M rows that's ~5 minutes; Phase 2.3.5 will persist the
+    /// indices alongside the rows to skip rebuild.
+    pub fn with_storage(
+        dim: usize,
+        capacity: usize,
+        storage: Arc<dyn Storage>,
+    ) -> Result<Self> {
+        let store = Self::with_capacity(dim, capacity);
+        let rows = storage.iter()?;
+        let mut max_id = 0u64;
+        let n = rows.len();
+        for (id, bytes) in rows {
+            let stored: StoredMemory = bincode::deserialize(&bytes).map_err(|e| {
+                duxx_core::Error::Storage(format!("decode memory id={id}: {e}"))
+            })?;
+            if stored.embedding.len() != dim {
+                return Err(duxx_core::Error::Storage(format!(
+                    "memory id={id} has dim {} but store expects {dim}",
+                    stored.embedding.len()
+                )));
+            }
+            store
+                .inner
+                .vector_index
+                .write()
+                .insert(id, stored.embedding.clone())?;
+            store.inner.text_index.write().insert(id, stored.text.clone())?;
+            let mem = Memory {
+                id,
+                key: stored.key,
+                text: stored.text,
+                embedding: stored.embedding,
+                importance: stored.importance,
+                created_at: Instant::now(),
+            };
+            store.inner.by_id.write().insert(id, mem);
+            if id > max_id {
+                max_id = id;
+            }
+        }
+        *store.inner.next_id.write() = max_id + 1;
+        // Now wire the storage into Inner so future writes flow through.
+        // We have to re-build Inner because Inner owns storage and we
+        // already started constructing without it.
+        let inner = Arc::new(Inner {
+            dim,
+            by_id: RwLock::new(std::mem::take(&mut *store.inner.by_id.write())),
+            vector_index: RwLock::new(std::mem::replace(
+                &mut *store.inner.vector_index.write(),
+                VectorIndex::new(dim),
+            )),
+            text_index: RwLock::new(std::mem::replace(
+                &mut *store.inner.text_index.write(),
+                TextIndex::new(),
+            )),
+            next_id: RwLock::new(*store.inner.next_id.read()),
+            bus: ChangeBus::default(),
+            storage: Some(storage),
+        });
+        tracing::info!(memories = n, "loaded memories from storage");
+        Ok(MemoryStore { inner })
     }
 
     /// Subscribe to change events on this store. Each `remember` call
@@ -141,11 +249,20 @@ impl MemoryStore {
             importance: 1.0,
             created_at: Instant::now(),
         };
+        // Write through to durable storage BEFORE inserting into the
+        // in-memory cache. If the persistence write fails, we don't
+        // want a phantom row in memory.
+        if let Some(s) = &self.inner.storage {
+            let stored = StoredMemory::from(&mem);
+            let bytes = bincode::serialize(&stored).map_err(|e| {
+                duxx_core::Error::Storage(format!("encode memory id={id}: {e}"))
+            })?;
+            s.put(id, &bytes)?;
+        }
         self.inner.by_id.write().insert(id, mem);
         // Publish a change event. Lossy by design — slow subscribers
-        // may miss events; durability is the storage layer's job.
-        // Channel = "memory.<key>", so `PSUBSCRIBE memory.*` filters
-        // by user/agent key.
+        // may miss events. Channel = "memory.<key>", so `PSUBSCRIBE
+        // memory.*` filters by user/agent key.
         self.inner.bus.publish(ChangeEvent {
             table: "memory".to_string(),
             key: Some(key.clone()),
@@ -154,6 +271,11 @@ impl MemoryStore {
         });
         tracing::debug!(id, key = %key, "remembered");
         Ok(id)
+    }
+
+    /// Whether this store has a durable backing.
+    pub fn is_persistent(&self) -> bool {
+        self.inner.storage.is_some()
     }
 
     /// Hybrid recall (vector + BM25, RRF-fused).
@@ -237,6 +359,47 @@ mod tests {
         let hits = s.recall("u1", q, &embed(q, DIM), 5).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].memory.text.contains("refund"));
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn redb_persistence_across_reopen() {
+        const DIM: usize = 8;
+        let dir = std::env::temp_dir().join(format!(
+            "duxx-memory-persist-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memories.redb");
+
+        // First open: write data.
+        {
+            let storage: Arc<dyn Storage> =
+                Arc::new(duxx_storage::RedbStorage::open(&path).unwrap());
+            let store = MemoryStore::with_storage(DIM, 1_000, storage).unwrap();
+            store
+                .remember("alice", "I lost my wallet", embed("wallet", DIM))
+                .unwrap();
+            store
+                .remember("alice", "Favorite color blue", embed("blue", DIM))
+                .unwrap();
+            assert_eq!(store.len(), 2);
+        }
+
+        // Second open: data should still be there + queryable.
+        {
+            let storage: Arc<dyn Storage> =
+                Arc::new(duxx_storage::RedbStorage::open(&path).unwrap());
+            let store = MemoryStore::with_storage(DIM, 1_000, storage).unwrap();
+            assert_eq!(store.len(), 2, "data should survive reopen");
+            let hits = store
+                .recall("alice", "wallet", &embed("wallet", DIM), 5)
+                .unwrap();
+            assert!(!hits.is_empty());
+            assert!(hits[0].memory.text.contains("wallet"));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

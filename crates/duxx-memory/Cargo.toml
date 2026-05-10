@@ -8,6 +8,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["redb-store"]
+redb-store = ["duxx-storage/redb-store"]
+
 [dependencies]
 duxx-core.workspace = true
 duxx-index.workspace = true
@@ -18,4 +22,8 @@ parking_lot.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+bincode.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

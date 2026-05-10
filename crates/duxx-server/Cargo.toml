@@ -19,6 +19,7 @@ path = "src/main.rs"
 duxx-core.workspace = true
 duxx-memory.workspace = true
 duxx-reactive.workspace = true
+duxx-storage.workspace = true
 duxx-embed = { workspace = true, features = ["http"] }
 tokio.workspace = true
 bytes.workspace = true
