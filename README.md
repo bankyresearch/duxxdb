@@ -1,5 +1,8 @@
 # DuxxDB
 
+[![CI](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml/badge.svg)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 **The database built for AI agents.**
 
 Hybrid structured + vector + full-text search in one embedded engine, with realtime reactive subscriptions and native support for the Model Context Protocol.
