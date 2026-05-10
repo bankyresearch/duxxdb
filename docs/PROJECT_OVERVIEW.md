@@ -153,7 +153,7 @@ RESP / gRPC / MCP servers wrap.
 | Agent primitives (`MEMORY`, `TOOL_CACHE`, `SESSION`) as **first-class types** | ✅ | Nobody — agent frameworks (LangChain, LlamaIndex) bolt this on top of generic stores |
 | `TOOL_CACHE` with **semantic-near-hit** lookup (cosine ≥ 0.95 of args embedding) | ✅ | Nobody — saves real money on expensive tool calls |
 | **MCP-native** wire protocol (stdio JSON-RPC 2.0) | ✅ | Nobody (MCP is from late 2024; everyone else writes adapter code) |
-| **Reactive subscriptions** with glob pattern + per-key channels | ✅ | DiceDB has reactive on KV; nobody has reactive on hybrid memory |
+| **Reactive subscriptions** with glob pattern + per-key channels | ✅ | Redis/Valkey have it on KV (`PSUBSCRIBE`); nobody has reactive *on hybrid memory* |
 | **gRPC streaming Subscribe** for typed cross-language consumers | ✅ | Nobody |
 | **Importance decay** (cross-restart Unix-epoch timestamps) | ✅ | Nobody — agent frameworks decay client-side |
 | Pure Rust core — no GC pauses, no FFI bottlenecks | ✅ | Qdrant ✅, LanceDB ✅; Pinecone/Weaviate/Milvus all have GC |
@@ -570,7 +570,6 @@ Phase 6.
 - [napi-rs](https://github.com/napi-rs/napi-rs) — Node bindings
 - [Apache Arrow](https://github.com/apache/arrow-rs) + [parquet](https://github.com/apache/arrow-rs) — cold-tier
 - [reqwest](https://github.com/seanmonstar/reqwest) + [rustls](https://github.com/rustls/rustls) — HTTP embedders
-- [DiceDB](https://github.com/DiceDB/dice) — reactive subscription model inspiration
 - [DuckDB](https://duckdb.org/) — embedded-first philosophy
 - [LanceDB](https://github.com/lancedb/lance) — comparative bench peer
 - [Model Context Protocol](https://modelcontextprotocol.io/) — agent integration standard

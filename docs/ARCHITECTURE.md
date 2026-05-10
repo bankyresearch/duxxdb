@@ -253,7 +253,7 @@ RECALL "user's refund issue last month"
 |---|---|---|
 | **Embedded (in-process)** | Rust agent code | Zero overhead |
 | **gRPC + protobuf** | Services, multi-lang | Typed, streaming, HTTP/2 |
-| **RESP3** | Existing Redis/DiceDB clients | Drop-in compat path |
+| **RESP3** | Existing Redis / Valkey clients | Drop-in compat path |
 | **MCP (stdio + SSE)** | Claude / GPT / any LLM agent | Zero-glue integration |
 
 ---
@@ -311,6 +311,5 @@ Standing on the shoulders of:
 - [usearch](https://github.com/unum-cloud/usearch) — HNSW
 - [tantivy](https://github.com/quickwit-oss/tantivy) — BM25
 - [redb](https://github.com/cberner/redb) — embedded KV
-- [DiceDB](https://github.com/DiceDB/dice) — reactive subscription model inspiration
 - [DuckDB](https://duckdb.org/) — embedded-first philosophy
 - [Model Context Protocol](https://modelcontextprotocol.io/) — agent integration standard
