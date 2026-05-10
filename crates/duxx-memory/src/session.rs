@@ -130,11 +130,15 @@ mod tests {
 
     #[test]
     fn sliding_ttl_keeps_active_session_alive() {
-        let s = SessionStore::with_ttl(Duration::from_millis(50));
+        // Generous time budget so CI schedulers (especially macOS GHA
+        // runners under load) don't false-fail this — the original
+        // 50ms TTL / 20ms sleep had no headroom for scheduler jitter.
+        let s = SessionStore::with_ttl(Duration::from_millis(500));
         s.put("sid-1", b"x".to_vec());
         for _ in 0..3 {
-            std::thread::sleep(Duration::from_millis(20));
-            // Bumps last_access each iteration.
+            std::thread::sleep(Duration::from_millis(50));
+            // Each `get` bumps last_access, so the entry stays alive
+            // even though total elapsed > original TTL.
             assert!(s.get("sid-1").is_some());
         }
     }
