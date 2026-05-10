@@ -1,0 +1,36 @@
+{
+  "name": "duxxdb",
+  "version": "0.1.0",
+  "description": "DuxxDB - the database built for AI agents (Node.js bindings)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "license": "Apache-2.0",
+  "keywords": [
+    "database",
+    "vector",
+    "search",
+    "ai",
+    "agent",
+    "rag",
+    "memory",
+    "duxxdb"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "napi": {
+    "name": "duxxdb",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node test.js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  }
+}

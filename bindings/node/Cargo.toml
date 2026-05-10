@@ -1,0 +1,22 @@
+[package]
+name = "duxxdb-node"
+description = "Node.js / TypeScript bindings for DuxxDB."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+duxx-core.workspace = true
+duxx-memory.workspace = true
+napi.workspace = true
+napi-derive.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true
