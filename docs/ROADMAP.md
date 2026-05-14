@@ -242,6 +242,48 @@ duxx-ai side: `DuxxExporter` in `duxx_ai/observability/duxx_exporter.py`
 (merged as PR #2). Plugs into the existing `Tracer` and flushes every
 finished trace via RESP.
 
+## Phase 7.5 — `duxx-replay` ✅ Shipped
+
+Deterministic agent replay with per-invocation overrides. **Strategic
+angle:** a replay run is just a new trace that links back to its
+source — so every existing `TRACE.*` query keeps working. Combine
+with Phase 7.4 and the full debug-fix-verify loop is four RESP calls:
+
+```
+EVAL.CLUSTER_FAILURES  run                       -> a cluster of similar failures
+REPLAY.START           source_trace [overrides]  -> kick off a replay
+(REPLAY.STEP + REPLAY.RECORD per invocation, OR
+ REPLAY.RECORD-only for caller-side execution)
+EVAL.SCORE             new-run row score
+EVAL.COMPARE           old-run new-run           -> "did v8 fix the cluster?"
+```
+
+The crate captures LLM/tool invocations and plays them back; it does
+NOT execute LLM calls itself. Caller code drives execution. Same
+posture as Braintrust / LangSmith — keeps the engine pure Rust storage.
+
+Capabilities:
+- Three replay modes: `Cached` (pure playback), `Live` (re-execute),
+  `Stepped` (pause between invocations).
+- Five override kinds: `SwapModel`, `SwapPrompt`, `InjectOutput`,
+  `SetTemperature`, `Skip`.
+- Fingerprinting via FNV-1a over the input payloads — two sessions
+  with the same fingerprint sent the same inputs in the same order.
+- `diff(source, replay)` returns per-invocation original vs replay
+  output + a `differing_count` summary.
+- `set_replay_trace_id` links a run to the new trace it produced so
+  `TRACE.SEARCH` can pull every replay of a source.
+- Reactive change feed (`PSUBSCRIBE replay.*`).
+
+Twelve RESP commands: `REPLAY.CAPTURE`, `REPLAY.START`, `REPLAY.STEP`,
+`REPLAY.RECORD`, `REPLAY.COMPLETE`, `REPLAY.FAIL`, `REPLAY.GET_SESSION`,
+`REPLAY.GET_RUN`, `REPLAY.LIST_SESSIONS`, `REPLAY.LIST_RUNS`,
+`REPLAY.DIFF`, `REPLAY.SET_TRACE`.
+
+Tests: 17 crate-level + 9 RESP-level. Workspace at 222 tests.
+
+---
+
 ## Phase 7.4 — `duxx-eval` ✅ Shipped
 
 Eval runs + per-row scores + regression detection + **semantic

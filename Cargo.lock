@@ -985,6 +985,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "duxx-replay"
+version = "0.1.1"
+dependencies = [
+ "duxx-core",
+ "duxx-reactive",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "duxx-server"
 version = "0.1.1"
 dependencies = [
@@ -997,6 +1012,7 @@ dependencies = [
  "duxx-memory",
  "duxx-prompts",
  "duxx-reactive",
+ "duxx-replay",
  "duxx-storage",
  "duxx-trace",
  "http-body-util",

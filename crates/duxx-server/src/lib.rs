@@ -32,6 +32,10 @@ pub mod tls;
 use duxx_datasets::{DatasetRegistry, DatasetRow};
 use duxx_embed::{Embedder, HashEmbedder};
 use duxx_eval::EvalRegistry;
+use duxx_replay::{
+    InvocationKind as ReplayInvocationKind, OverrideKind as ReplayOverrideKind, ReplayInvocation,
+    ReplayMode, ReplayOverride, ReplayRegistry,
+};
 use duxx_memory::{MemoryStore, SessionStore};
 use duxx_prompts::PromptRegistry;
 use duxx_reactive::{ChangeEvent, ChangeKind};
@@ -83,6 +87,10 @@ pub struct Server {
     /// Phase 7.4: eval runs + scores + regressions + semantic failure
     /// clustering. Surfaced via EVAL.* commands.
     evals: EvalRegistry,
+    /// Phase 7.5: deterministic agent replay. Captures LLM/tool
+    /// invocations against a trace_id and lets callers re-execute
+    /// with overrides. Surfaced via REPLAY.* commands.
+    replays: ReplayRegistry,
 }
 
 impl std::fmt::Debug for Server {
@@ -108,6 +116,7 @@ impl Server {
         let prompts = PromptRegistry::new(embedder.clone());
         let datasets = DatasetRegistry::new(embedder.clone());
         let evals = EvalRegistry::new(embedder.clone());
+        let replays = ReplayRegistry::new();
         Self {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
@@ -121,6 +130,7 @@ impl Server {
             prompts,
             datasets,
             evals,
+            replays,
         }
     }
 
@@ -179,6 +189,7 @@ impl Server {
         let prompts = PromptRegistry::new(embedder.clone());
         let datasets = DatasetRegistry::new(embedder.clone());
         let evals = EvalRegistry::new(embedder.clone());
+        let replays = ReplayRegistry::new();
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -192,6 +203,7 @@ impl Server {
             prompts,
             datasets,
             evals,
+            replays,
         })
     }
 
@@ -207,6 +219,7 @@ impl Server {
         let prompts = PromptRegistry::new(embedder.clone());
         let datasets = DatasetRegistry::new(embedder.clone());
         let evals = EvalRegistry::new(embedder.clone());
+        let replays = ReplayRegistry::new();
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -220,6 +233,7 @@ impl Server {
             prompts,
             datasets,
             evals,
+            replays,
         })
     }
 
@@ -638,6 +652,19 @@ impl Server {
             "EVAL.LIST" => self.cmd_eval_list(&args),
             "EVAL.COMPARE" => self.cmd_eval_compare(&args),
             "EVAL.CLUSTER_FAILURES" => self.cmd_eval_cluster_failures(&args),
+            // Phase 7.5: deterministic agent replay
+            "REPLAY.CAPTURE" => self.cmd_replay_capture(&args),
+            "REPLAY.START" => self.cmd_replay_start(&args),
+            "REPLAY.STEP" => self.cmd_replay_step(&args),
+            "REPLAY.RECORD" => self.cmd_replay_record(&args),
+            "REPLAY.COMPLETE" => self.cmd_replay_complete(&args),
+            "REPLAY.FAIL" => self.cmd_replay_fail(&args),
+            "REPLAY.GET_SESSION" => self.cmd_replay_get_session(&args),
+            "REPLAY.GET_RUN" => self.cmd_replay_get_run(&args),
+            "REPLAY.LIST_SESSIONS" => self.cmd_replay_list_sessions(),
+            "REPLAY.LIST_RUNS" => self.cmd_replay_list_runs(&args),
+            "REPLAY.DIFF" => self.cmd_replay_diff(&args),
+            "REPLAY.SET_TRACE" => self.cmd_replay_set_trace(&args),
             other => Response::Reply(err(format!("ERR unknown command '{other}'"))),
         }
     }
@@ -710,6 +737,9 @@ impl Server {
             "DATASET.SIZE", "DATASET.SPLITS", "DATASET.SEARCH", "DATASET.FROM_RECALL",
             "EVAL.START", "EVAL.SCORE", "EVAL.COMPLETE", "EVAL.FAIL", "EVAL.GET",
             "EVAL.SCORES", "EVAL.LIST", "EVAL.COMPARE", "EVAL.CLUSTER_FAILURES",
+            "REPLAY.CAPTURE", "REPLAY.START", "REPLAY.STEP", "REPLAY.RECORD",
+            "REPLAY.COMPLETE", "REPLAY.FAIL", "REPLAY.GET_SESSION", "REPLAY.GET_RUN",
+            "REPLAY.LIST_SESSIONS", "REPLAY.LIST_RUNS", "REPLAY.DIFF", "REPLAY.SET_TRACE",
         ];
         let arr: Vec<RespValue> = names.iter().map(|n| RespValue::bulk(*n)).collect();
         Response::Reply(RespValue::Array(arr))
@@ -1946,6 +1976,280 @@ impl Server {
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
     }
+
+    // ---------------------------------------------------------------- Phase 7.5: REPLAY.*
+
+    /// Access the underlying ReplayRegistry.
+    pub fn replays(&self) -> &ReplayRegistry {
+        &self.replays
+    }
+
+    /// `REPLAY.CAPTURE trace_id invocation_json`
+    ///
+    /// `invocation_json` is the JSON form of a [`ReplayInvocation`].
+    /// `idx` is auto-assigned in capture order; any value the caller
+    /// provides is overwritten.
+    fn cmd_replay_capture(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err(
+                "ERR REPLAY.CAPTURE expects: trace_id invocation_json",
+            ));
+        }
+        let trace_id = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR trace_id must be a string")),
+        };
+        let invocation_json = match arg_string(&args[2]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR invocation_json must be a string")),
+        };
+        let invocation: ReplayInvocation = match serde_json::from_str(invocation_json) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR invocation_json: {e}"))),
+        };
+        let idx = self.replays.capture(trace_id, invocation);
+        Response::Reply(RespValue::Integer(idx as i64))
+    }
+
+    /// `REPLAY.START source_trace_id [mode] [overrides_json] [metadata_json]`
+    ///
+    /// `mode` is one of `cached` / `live` / `stepped` (default `live`).
+    /// `overrides_json` is a JSON array of `ReplayOverride` objects.
+    fn cmd_replay_start(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err(
+                "ERR REPLAY.START expects: source_trace_id [mode] [overrides_json] [metadata_json]",
+            ));
+        }
+        let source = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR source_trace_id must be a string")),
+        };
+        let mode = match args.get(2).and_then(arg_string) {
+            None | Some("-") | Some("") | Some("live") => ReplayMode::Live,
+            Some("cached") => ReplayMode::Cached,
+            Some("stepped") => ReplayMode::Stepped,
+            Some(other) => {
+                return Response::Reply(err(format!("ERR unknown mode '{other}'")));
+            }
+        };
+        let overrides: Vec<ReplayOverride> = match args.get(3).and_then(arg_string) {
+            Some("-") | Some("") | None => Vec::new(),
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR overrides_json: {e}"))),
+            },
+        };
+        let metadata: serde_json::Value = match args.get(4).and_then(arg_string) {
+            Some("-") | Some("") | None => serde_json::Value::Null,
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR metadata_json: {e}"))),
+            },
+        };
+        match self.replays.start(source, mode, overrides, metadata) {
+            Ok(id) => Response::Reply(RespValue::BulkString(id.into_bytes())),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `REPLAY.STEP run_id` -> next invocation JSON (or Null when done).
+    fn cmd_replay_step(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR REPLAY.STEP expects: run_id"));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        match self.replays.step(run_id) {
+            Ok(Some(inv)) => match serde_json::to_vec(&inv) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            Ok(None) => Response::Reply(RespValue::Null),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `REPLAY.RECORD run_id invocation_idx output_json`
+    fn cmd_replay_record(&self, args: &[RespValue]) -> Response {
+        if args.len() != 4 {
+            return Response::Reply(err(
+                "ERR REPLAY.RECORD expects: run_id invocation_idx output_json",
+            ));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        let idx: usize = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR invocation_idx must be a non-negative integer")),
+        };
+        let output_json = match arg_string(&args[3]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR output_json must be a string")),
+        };
+        let output: serde_json::Value = match serde_json::from_str(output_json) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR output_json: {e}"))),
+        };
+        match self.replays.record_output(run_id, idx, output) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `REPLAY.COMPLETE run_id`
+    fn cmd_replay_complete(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR REPLAY.COMPLETE expects: run_id"));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        match self.replays.complete(run_id) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `REPLAY.FAIL run_id reason`
+    fn cmd_replay_fail(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err("ERR REPLAY.FAIL expects: run_id reason"));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        let reason = match arg_string(&args[2]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR reason must be a string")),
+        };
+        match self.replays.fail(run_id, reason) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `REPLAY.GET_SESSION trace_id` -> bulk JSON or Null.
+    fn cmd_replay_get_session(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR REPLAY.GET_SESSION expects: trace_id"));
+        }
+        let trace_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR trace_id must be a string")),
+        };
+        match self.replays.get_session(trace_id) {
+            Some(s) => match serde_json::to_vec(&s) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            None => Response::Reply(RespValue::Null),
+        }
+    }
+
+    /// `REPLAY.GET_RUN run_id` -> bulk JSON or Null.
+    fn cmd_replay_get_run(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR REPLAY.GET_RUN expects: run_id"));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        match self.replays.get_run(run_id) {
+            Some(r) => match serde_json::to_vec(&r) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            None => Response::Reply(RespValue::Null),
+        }
+    }
+
+    /// `REPLAY.LIST_SESSIONS`
+    fn cmd_replay_list_sessions(&self) -> Response {
+        let arr: Vec<RespValue> = self
+            .replays
+            .list_sessions()
+            .into_iter()
+            .filter_map(|s| serde_json::to_vec(&s).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `REPLAY.LIST_RUNS [source_trace_id]`
+    fn cmd_replay_list_runs(&self, args: &[RespValue]) -> Response {
+        let runs = match args.get(1).and_then(arg_string) {
+            Some(s) if !s.is_empty() && s != "-" => self.replays.list_runs_for(s),
+            _ => self.replays.list_runs(),
+        };
+        let arr: Vec<RespValue> = runs
+            .into_iter()
+            .filter_map(|r| serde_json::to_vec(&r).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `REPLAY.DIFF source_trace_id replay_run_id` -> bulk JSON.
+    fn cmd_replay_diff(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err(
+                "ERR REPLAY.DIFF expects: source_trace_id replay_run_id",
+            ));
+        }
+        let source = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR source_trace_id must be a string")),
+        };
+        let run = match arg_string(&args[2]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR replay_run_id must be a string")),
+        };
+        match self.replays.diff(source, run) {
+            Ok(diff) => match serde_json::to_vec(&diff) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `REPLAY.SET_TRACE run_id replay_trace_id` — link a replay run
+    /// to the trace it produced. Lets TRACE.* queries pull every
+    /// replay of a source by joining on this id.
+    fn cmd_replay_set_trace(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err(
+                "ERR REPLAY.SET_TRACE expects: run_id replay_trace_id",
+            ));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        let replay_trace = match arg_string(&args[2]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR replay_trace_id must be a string")),
+        };
+        match self.replays.set_replay_trace_id(run_id, replay_trace) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+}
+
+// Silence dead-code warnings for the imported types we don't reference
+// in this file but want to surface in the public API of duxx-server.
+#[allow(dead_code)]
+fn _replay_type_anchor(
+    _: ReplayInvocationKind,
+    _: ReplayOverrideKind,
+) {
 }
 
 /// Parse the rows_json payload of DATASET.ADD. Accepts either a JSON
@@ -3272,6 +3576,243 @@ mod tests {
                 assert!(msg.contains("score must be in"), "got: {msg}");
             }
             other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    // ---------- Phase 7.5: REPLAY.* commands ----------
+
+    fn replay_capture_args(trace_id: &str, idx_seed: u64, input_text: &str, output_text: &str) -> RespValue {
+        let inv = serde_json::json!({
+            "idx": 0,
+            "span_id": format!("span-{idx_seed}"),
+            "kind": {"kind": "llm_call"},
+            "model": "gpt-4o",
+            "input": {"prompt": input_text},
+            "output": output_text,
+            "recorded_at_unix_ns": 0
+        });
+        RespValue::Array(vec![
+            RespValue::bulk("REPLAY.CAPTURE"),
+            RespValue::bulk(trace_id),
+            RespValue::bulk(inv.to_string()),
+        ])
+    }
+
+    fn capture_three(s: &Server, trace_id: &str) {
+        s.dispatch(replay_capture_args(trace_id, 0, "hi", "hello world"));
+        s.dispatch(replay_capture_args(trace_id, 1, "2+2?", "4"));
+        s.dispatch(replay_capture_args(trace_id, 2, "bye", "goodbye"));
+    }
+
+    #[test]
+    fn replay_capture_returns_assigned_idx() {
+        let s = Server::new();
+        let r0 = s.dispatch(replay_capture_args("t1", 0, "hi", "ok"));
+        let r1 = s.dispatch(replay_capture_args("t1", 1, "again", "ok"));
+        match (r0, r1) {
+            (
+                Response::Reply(RespValue::Integer(a)),
+                Response::Reply(RespValue::Integer(b)),
+            ) => assert_eq!((a, b), (0, 1)),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_get_session_returns_captured_invocations() {
+        let s = Server::new();
+        capture_three(&s, "t1");
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.GET_SESSION"),
+            RespValue::bulk("t1"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"trace_id\":\"t1\""));
+                assert!(body.contains("\"fingerprint\":"));
+                // Three invocations got captured.
+                let count = body.matches("\"idx\":").count();
+                assert_eq!(count, 3);
+            }
+            other => panic!("expected bulk session JSON, got {other:?}"),
+        }
+    }
+
+    fn replay_start(s: &Server, source: &str, mode: &str, overrides_json: &str) -> String {
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.START"),
+            RespValue::bulk(source),
+            RespValue::bulk(mode),
+            RespValue::bulk(overrides_json),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                String::from_utf8(bytes).unwrap()
+            }
+            other => panic!("expected run_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_step_returns_invocations_in_order() {
+        let s = Server::new();
+        capture_three(&s, "t1");
+        let run = replay_start(&s, "t1", "live", "-");
+        for expected_idx in [0u64, 1, 2] {
+            let r = s.dispatch(RespValue::Array(vec![
+                RespValue::bulk("REPLAY.STEP"),
+                RespValue::bulk(&run),
+            ]));
+            match r {
+                Response::Reply(RespValue::BulkString(bytes)) => {
+                    let body = std::str::from_utf8(&bytes).unwrap();
+                    assert!(body.contains(&format!("\"idx\":{expected_idx}")));
+                }
+                other => panic!("expected invocation JSON, got {other:?}"),
+            }
+        }
+        // 4th step is the end of the session.
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.STEP"),
+            RespValue::bulk(&run),
+        ]));
+        matches!(r, Response::Reply(RespValue::Null));
+    }
+
+    #[test]
+    fn replay_start_with_swap_model_override() {
+        let s = Server::new();
+        capture_three(&s, "t1");
+        let overrides = r#"[{"at_idx": 1, "kind": {"kind": "swap_model", "model": "claude-4.5-sonnet"}}]"#;
+        let run = replay_start(&s, "t1", "live", overrides);
+        // Burn idx 0.
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.STEP"),
+            RespValue::bulk(&run),
+        ]));
+        // Idx 1 should come back with the swapped model.
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.STEP"),
+            RespValue::bulk(&run),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"model\":\"claude-4.5-sonnet\""));
+            }
+            other => panic!("expected invocation JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_record_and_diff_show_changes() {
+        let s = Server::new();
+        capture_three(&s, "t1");
+        let run = replay_start(&s, "t1", "live", "-");
+        // Match idx 0 (same as original), differ on idx 1.
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.RECORD"),
+            RespValue::bulk(&run),
+            RespValue::bulk("0"),
+            RespValue::bulk("\"hello world\""),
+        ]));
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.RECORD"),
+            RespValue::bulk(&run),
+            RespValue::bulk("1"),
+            RespValue::bulk("\"FIVE\""),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.DIFF"),
+            RespValue::bulk("t1"),
+            RespValue::bulk(&run),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                // idx 0 = same, idx 1 = differs, idx 2 = missing (differs).
+                assert!(body.contains("\"differing_count\":2"));
+            }
+            other => panic!("expected diff JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_complete_freezes_run() {
+        let s = Server::new();
+        capture_three(&s, "t1");
+        let run = replay_start(&s, "t1", "live", "-");
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.COMPLETE"),
+            RespValue::bulk(&run),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.GET_RUN"),
+            RespValue::bulk(&run),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"status\":\"completed\""));
+            }
+            other => panic!("expected run JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_list_runs_filters_by_source() {
+        let s = Server::new();
+        capture_three(&s, "t1");
+        s.dispatch(replay_capture_args("t2", 0, "x", "y"));
+        let _run_a = replay_start(&s, "t1", "live", "-");
+        let _run_b = replay_start(&s, "t2", "live", "-");
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.LIST_RUNS"),
+            RespValue::bulk("t1"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                // Only the t1 run comes back.
+                assert_eq!(items.len(), 1);
+                if let RespValue::BulkString(bytes) = &items[0] {
+                    let body = std::str::from_utf8(bytes).unwrap();
+                    assert!(body.contains("\"source_trace_id\":\"t1\""));
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_start_on_missing_session_errors() {
+        let s = Server::new();
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REPLAY.START"),
+            RespValue::bulk("does-not-exist"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("not found"), "got: {msg}");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_rejected_pre_auth() {
+        let s = Server::new().with_auth("secret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            replay_capture_args("t1", 0, "hi", "ok"),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("NOAUTH"), "got: {msg}");
+            }
+            other => panic!("expected NOAUTH, got {other:?}"),
         }
     }
 
