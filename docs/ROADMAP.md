@@ -242,6 +242,39 @@ duxx-ai side: `DuxxExporter` in `duxx_ai/observability/duxx_exporter.py`
 (merged as PR #2). Plugs into the existing `Tracer` and flushes every
 finished trace via RESP.
 
+## Phase 7.4 — `duxx-eval` ✅ Shipped
+
+Eval runs + per-row scores + regression detection + **semantic
+failure clustering** via the shared HNSW.
+
+The store-only posture matches Braintrust / LangSmith: callers run
+their own LLM-judge / exact_match / etc. and POST scores. DuxxDB
+records, summarizes, and **clusters semantically-similar failures**
+— the unique move because eval failures share the same vector
+space as memories, prompts, dataset rows, and traces.
+
+Capabilities:
+- `EvalRun` lifecycle: `start` → `score(many)` → `complete` / `fail`.
+- Per-row scores in `[0, 1]` with free-form notes JSON and an
+  optional `output_text` (used for failure clustering).
+- Frozen `EvalSummary` on completion: total / mean / p50 / p90 /
+  p99 / min / max / pass_rate_50.
+- `compare(run_a, run_b)` returns regressed / improved / new /
+  dropped rows + mean and pass-rate deltas.
+- `cluster_failures(run, thresholds, max)` greedy semantic
+  clustering over failing outputs.
+- `list_runs_for(dataset, version)` for cross-run diffs over a
+  fixed test set.
+- Reactive change feed (`PSUBSCRIBE eval.*`) for live dashboards.
+
+Nine RESP commands: `EVAL.START`, `EVAL.SCORE`, `EVAL.COMPLETE`,
+`EVAL.FAIL`, `EVAL.GET`, `EVAL.SCORES`, `EVAL.LIST`, `EVAL.COMPARE`,
+`EVAL.CLUSTER_FAILURES`.
+
+Tests: 12 crate-level + 8 RESP-level. Workspace at 196 tests.
+
+---
+
 ## Phase 7.3 — `duxx-datasets` ✅ Shipped
 
 Versioned eval datasets with **per-row semantic search** and a

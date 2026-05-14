@@ -866,6 +866,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "duxx-eval"
+version = "0.1.1"
+dependencies = [
+ "duxx-core",
+ "duxx-embed",
+ "duxx-index",
+ "duxx-reactive",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "duxx-grpc"
 version = "0.1.1"
 dependencies = [
@@ -976,6 +993,7 @@ dependencies = [
  "duxx-core",
  "duxx-datasets",
  "duxx-embed",
+ "duxx-eval",
  "duxx-memory",
  "duxx-prompts",
  "duxx-reactive",

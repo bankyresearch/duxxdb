@@ -1,0 +1,25 @@
+[package]
+name = "duxx-eval"
+description = "DuxxDB — eval runs, scores, regressions, and semantic failure clustering. Phase 7.4."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+duxx-core.workspace = true
+duxx-embed.workspace = true
+duxx-index.workspace = true
+duxx-reactive.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

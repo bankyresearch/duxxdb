@@ -31,6 +31,7 @@ pub mod tls;
 
 use duxx_datasets::{DatasetRegistry, DatasetRow};
 use duxx_embed::{Embedder, HashEmbedder};
+use duxx_eval::EvalRegistry;
 use duxx_memory::{MemoryStore, SessionStore};
 use duxx_prompts::PromptRegistry;
 use duxx_reactive::{ChangeEvent, ChangeKind};
@@ -79,6 +80,9 @@ pub struct Server {
     /// commands. Same shared embedder so dataset rows can be searched
     /// semantically alongside memories and prompts.
     datasets: DatasetRegistry,
+    /// Phase 7.4: eval runs + scores + regressions + semantic failure
+    /// clustering. Surfaced via EVAL.* commands.
+    evals: EvalRegistry,
 }
 
 impl std::fmt::Debug for Server {
@@ -103,6 +107,7 @@ impl Server {
         let dim = embedder.dim();
         let prompts = PromptRegistry::new(embedder.clone());
         let datasets = DatasetRegistry::new(embedder.clone());
+        let evals = EvalRegistry::new(embedder.clone());
         Self {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
@@ -115,6 +120,7 @@ impl Server {
             traces: TraceStore::new(),
             prompts,
             datasets,
+            evals,
         }
     }
 
@@ -172,6 +178,7 @@ impl Server {
         let memory = MemoryStore::with_storage(dim, 100_000, storage)?;
         let prompts = PromptRegistry::new(embedder.clone());
         let datasets = DatasetRegistry::new(embedder.clone());
+        let evals = EvalRegistry::new(embedder.clone());
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -184,6 +191,7 @@ impl Server {
             traces: TraceStore::new(),
             prompts,
             datasets,
+            evals,
         })
     }
 
@@ -198,6 +206,7 @@ impl Server {
         let memory = MemoryStore::open_at(dim, 100_000, dir)?;
         let prompts = PromptRegistry::new(embedder.clone());
         let datasets = DatasetRegistry::new(embedder.clone());
+        let evals = EvalRegistry::new(embedder.clone());
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -210,6 +219,7 @@ impl Server {
             traces: TraceStore::new(),
             prompts,
             datasets,
+            evals,
         })
     }
 
@@ -618,6 +628,16 @@ impl Server {
             "DATASET.SPLITS" => self.cmd_dataset_splits(&args),
             "DATASET.SEARCH" => self.cmd_dataset_search(&args),
             "DATASET.FROM_RECALL" => self.cmd_dataset_from_recall(&args),
+            // Phase 7.4: eval runs + regressions + failure clustering
+            "EVAL.START" => self.cmd_eval_start(&args),
+            "EVAL.SCORE" => self.cmd_eval_score(&args),
+            "EVAL.COMPLETE" => self.cmd_eval_complete(&args),
+            "EVAL.FAIL" => self.cmd_eval_fail(&args),
+            "EVAL.GET" => self.cmd_eval_get(&args),
+            "EVAL.SCORES" => self.cmd_eval_scores(&args),
+            "EVAL.LIST" => self.cmd_eval_list(&args),
+            "EVAL.COMPARE" => self.cmd_eval_compare(&args),
+            "EVAL.CLUSTER_FAILURES" => self.cmd_eval_cluster_failures(&args),
             other => Response::Reply(err(format!("ERR unknown command '{other}'"))),
         }
     }
@@ -688,6 +708,8 @@ impl Server {
             "DATASET.CREATE", "DATASET.ADD", "DATASET.GET", "DATASET.LIST", "DATASET.NAMES",
             "DATASET.TAG", "DATASET.UNTAG", "DATASET.DELETE", "DATASET.SAMPLE",
             "DATASET.SIZE", "DATASET.SPLITS", "DATASET.SEARCH", "DATASET.FROM_RECALL",
+            "EVAL.START", "EVAL.SCORE", "EVAL.COMPLETE", "EVAL.FAIL", "EVAL.GET",
+            "EVAL.SCORES", "EVAL.LIST", "EVAL.COMPARE", "EVAL.CLUSTER_FAILURES",
         ];
         let arr: Vec<RespValue> = names.iter().map(|n| RespValue::bulk(*n)).collect();
         Response::Reply(RespValue::Array(arr))
@@ -1672,6 +1694,255 @@ impl Server {
         });
         match self.datasets.add(dataset_name, rows, metadata) {
             Ok(version) => Response::Reply(RespValue::Integer(version as i64)),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    // ---------------------------------------------------------------- Phase 7.4: EVAL.*
+
+    /// Access the underlying EvalRegistry.
+    pub fn evals(&self) -> &EvalRegistry {
+        &self.evals
+    }
+
+    /// `EVAL.START dataset_name dataset_version prompt_name[-] prompt_version[-] model scorer [metadata_json]`
+    fn cmd_eval_start(&self, args: &[RespValue]) -> Response {
+        if args.len() < 7 {
+            return Response::Reply(err(
+                "ERR EVAL.START expects: dataset_name dataset_version prompt_name[-] prompt_version[-] model scorer [metadata_json]",
+            ));
+        }
+        let dataset_name = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR dataset_name must be a string")),
+        };
+        let dataset_version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR dataset_version must be a positive integer")),
+        };
+        let prompt_name = args
+            .get(3)
+            .and_then(arg_string)
+            .filter(|s| !s.is_empty() && *s != "-")
+            .map(|s| s.to_string());
+        let prompt_version = args
+            .get(4)
+            .and_then(arg_string)
+            .filter(|s| !s.is_empty() && *s != "-")
+            .and_then(|s| s.parse::<u64>().ok());
+        let model = match arg_string(&args[5]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR model must be a string")),
+        };
+        let scorer = match arg_string(&args[6]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR scorer must be a string")),
+        };
+        let metadata: serde_json::Value = match args.get(7).and_then(arg_string) {
+            Some("-") | Some("") | None => serde_json::Value::Null,
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR metadata_json: {e}"))),
+            },
+        };
+        let id = self.evals.start(
+            dataset_name,
+            dataset_version,
+            prompt_name,
+            prompt_version,
+            model,
+            scorer,
+            metadata,
+        );
+        Response::Reply(RespValue::BulkString(id.into_bytes()))
+    }
+
+    /// `EVAL.SCORE run_id row_id score [output_text] [notes_json]`
+    fn cmd_eval_score(&self, args: &[RespValue]) -> Response {
+        if args.len() < 4 {
+            return Response::Reply(err(
+                "ERR EVAL.SCORE expects: run_id row_id score [output_text] [notes_json]",
+            ));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        let row_id = match arg_string(&args[2]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR row_id must be a string")),
+        };
+        let score: f32 = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR score must be a float in [0, 1]")),
+        };
+        let output_text = args
+            .get(4)
+            .and_then(arg_string)
+            .map(|s| if s == "-" { "" } else { s }.to_string())
+            .unwrap_or_default();
+        let notes: serde_json::Value = match args.get(5).and_then(arg_string) {
+            Some("-") | Some("") | None => serde_json::Value::Null,
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR notes_json: {e}"))),
+            },
+        };
+        match self.evals.score(run_id, row_id, score, output_text, notes) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `EVAL.COMPLETE run_id` — returns the summary JSON.
+    fn cmd_eval_complete(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR EVAL.COMPLETE expects: run_id"));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        match self.evals.complete(run_id) {
+            Ok(summary) => match serde_json::to_vec(&summary) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `EVAL.FAIL run_id reason`
+    fn cmd_eval_fail(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err("ERR EVAL.FAIL expects: run_id reason"));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        let reason = match arg_string(&args[2]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR reason must be a string")),
+        };
+        match self.evals.fail(run_id, reason) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `EVAL.GET run_id` — returns the run as bulk JSON.
+    fn cmd_eval_get(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR EVAL.GET expects: run_id"));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        match self.evals.get(run_id) {
+            Some(r) => match serde_json::to_vec(&r) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            None => Response::Reply(RespValue::Null),
+        }
+    }
+
+    /// `EVAL.SCORES run_id` — every recorded score as JSON bulk payload.
+    fn cmd_eval_scores(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR EVAL.SCORES expects: run_id"));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        let arr: Vec<RespValue> = self
+            .evals
+            .scores(run_id)
+            .into_iter()
+            .filter_map(|s| serde_json::to_vec(&s).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `EVAL.LIST [dataset_name] [dataset_version]` — all runs, or
+    /// those for a specific dataset/version.
+    fn cmd_eval_list(&self, args: &[RespValue]) -> Response {
+        let runs = match (args.get(1).and_then(arg_string), args.get(2).and_then(arg_string).and_then(|s| s.parse::<u64>().ok())) {
+            (Some(name), Some(v)) => self.evals.list_runs_for(name, v),
+            _ => self.evals.list_runs(),
+        };
+        let arr: Vec<RespValue> = runs
+            .into_iter()
+            .filter_map(|r| serde_json::to_vec(&r).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `EVAL.COMPARE run_a run_b` — full comparison as bulk JSON.
+    fn cmd_eval_compare(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err("ERR EVAL.COMPARE expects: run_a run_b"));
+        }
+        let run_a = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_a must be a string")),
+        };
+        let run_b = match arg_string(&args[2]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_b must be a string")),
+        };
+        match self.evals.compare(run_a, run_b) {
+            Ok(cmp) => match serde_json::to_vec(&cmp) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `EVAL.CLUSTER_FAILURES run_id [score_threshold] [sim_threshold] [max_clusters]`
+    ///
+    /// The differentiator — semantic clustering of failures using the
+    /// shared HNSW. Defaults: score<0.5, sim>=0.8, max 10 clusters.
+    fn cmd_eval_cluster_failures(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err(
+                "ERR EVAL.CLUSTER_FAILURES expects: run_id [score_threshold] [sim_threshold] [max_clusters]",
+            ));
+        }
+        let run_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR run_id must be a string")),
+        };
+        let score_threshold: f32 = args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.5);
+        let sim_threshold: f32 = args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.8);
+        let max_clusters: usize = args
+            .get(4)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        match self
+            .evals
+            .cluster_failures(run_id, score_threshold, sim_threshold, max_clusters)
+        {
+            Ok(clusters) => {
+                let arr: Vec<RespValue> = clusters
+                    .into_iter()
+                    .filter_map(|c| serde_json::to_vec(&c).ok().map(RespValue::BulkString))
+                    .collect();
+                Response::Reply(RespValue::Array(arr))
+            }
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
     }
@@ -2785,6 +3056,247 @@ mod tests {
         match size {
             Response::Reply(RespValue::Integer(n)) => assert!(n >= 1),
             other => panic!("expected integer size, got {other:?}"),
+        }
+    }
+
+    // ---------- Phase 7.4: EVAL.* commands ----------
+
+    fn eval_start_run(s: &Server) -> String {
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.START"),
+            RespValue::bulk("qa-set"),
+            RespValue::bulk("1"),
+            RespValue::bulk("classifier"),
+            RespValue::bulk("3"),
+            RespValue::bulk("gpt-4o"),
+            RespValue::bulk("llm_judge"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                String::from_utf8(bytes).unwrap()
+            }
+            other => panic!("expected bulk run_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_start_returns_a_run_id() {
+        let s = Server::new();
+        let id = eval_start_run(&s);
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn eval_score_records_and_completes() {
+        let s = Server::new();
+        let id = eval_start_run(&s);
+        for (row, score) in [("a", "0.1"), ("b", "0.5"), ("c", "0.9")] {
+            let r = s.dispatch(RespValue::Array(vec![
+                RespValue::bulk("EVAL.SCORE"),
+                RespValue::bulk(&id),
+                RespValue::bulk(row),
+                RespValue::bulk(score),
+                RespValue::bulk("out"),
+            ]));
+            match r {
+                Response::Reply(RespValue::SimpleString(s)) => assert_eq!(s, "OK"),
+                other => panic!("expected +OK, got {other:?}"),
+            }
+        }
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.COMPLETE"),
+            RespValue::bulk(&id),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"total_scored\":3"));
+                assert!(body.contains("\"mean\":"));
+            }
+            other => panic!("expected summary JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_get_returns_run_with_summary() {
+        let s = Server::new();
+        let id = eval_start_run(&s);
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.SCORE"),
+            RespValue::bulk(&id),
+            RespValue::bulk("a"),
+            RespValue::bulk("0.5"),
+            RespValue::bulk("out"),
+        ]));
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.COMPLETE"),
+            RespValue::bulk(&id),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.GET"),
+            RespValue::bulk(&id),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"status\":\"completed\""));
+                assert!(body.contains("\"summary\":"));
+            }
+            other => panic!("expected bulk JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_compare_detects_regressions() {
+        let s = Server::new();
+        let a = eval_start_run(&s);
+        let b = eval_start_run(&s);
+        for (id, row, score) in [
+            (&a, "r1", "0.9"), (&a, "r2", "0.5"),
+            (&b, "r1", "0.6"), (&b, "r2", "0.9"),
+        ] {
+            s.dispatch(RespValue::Array(vec![
+                RespValue::bulk("EVAL.SCORE"),
+                RespValue::bulk(id.as_str()),
+                RespValue::bulk(row),
+                RespValue::bulk(score),
+                RespValue::bulk("out"),
+            ]));
+        }
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.COMPLETE"),
+            RespValue::bulk(&a),
+        ]));
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.COMPLETE"),
+            RespValue::bulk(&b),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.COMPARE"),
+            RespValue::bulk(&a),
+            RespValue::bulk(&b),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"row_id\":\"r1\"")); // regressed
+                assert!(body.contains("\"row_id\":\"r2\"")); // improved
+            }
+            other => panic!("expected bulk JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_cluster_failures_groups_similar_outputs() {
+        let s = Server::new();
+        let id = eval_start_run(&s);
+        for (row, text) in [
+            ("f1", "the model hallucinated a phone number"),
+            ("f2", "model hallucinated phone number for user"),
+            ("f3", "model hallucinated a different phone number"),
+            ("f4", "the model rejected the prompt as unsafe"),
+        ] {
+            s.dispatch(RespValue::Array(vec![
+                RespValue::bulk("EVAL.SCORE"),
+                RespValue::bulk(&id),
+                RespValue::bulk(row),
+                RespValue::bulk("0.1"),
+                RespValue::bulk(text),
+            ]));
+        }
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.COMPLETE"),
+            RespValue::bulk(&id),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.CLUSTER_FAILURES"),
+            RespValue::bulk(&id),
+            RespValue::bulk("0.5"),
+            RespValue::bulk("0.5"),
+            RespValue::bulk("10"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert!(!items.is_empty(), "expected at least one cluster");
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_list_filters_by_dataset() {
+        let s = Server::new();
+        let _a = eval_start_run(&s);
+        // Second run on a different dataset.
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.START"),
+            RespValue::bulk("other-set"),
+            RespValue::bulk("1"),
+            RespValue::bulk("-"),
+            RespValue::bulk("-"),
+            RespValue::bulk("gpt-4o"),
+            RespValue::bulk("exact_match"),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.LIST"),
+            RespValue::bulk("qa-set"),
+            RespValue::bulk("1"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                // Only qa-set runs should come back.
+                for item in &items {
+                    if let RespValue::BulkString(bytes) = item {
+                        let body = std::str::from_utf8(bytes).unwrap();
+                        assert!(body.contains("\"dataset_name\":\"qa-set\""));
+                    }
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_score_invalid_out_of_range_errors() {
+        let s = Server::new();
+        let id = eval_start_run(&s);
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("EVAL.SCORE"),
+            RespValue::bulk(&id),
+            RespValue::bulk("row"),
+            RespValue::bulk("1.5"),
+            RespValue::bulk("out"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("score must be in"), "got: {msg}");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_rejected_pre_auth() {
+        let s = Server::new().with_auth("secret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            RespValue::Array(vec![
+                RespValue::bulk("EVAL.START"),
+                RespValue::bulk("qa-set"),
+                RespValue::bulk("1"),
+                RespValue::bulk("-"),
+                RespValue::bulk("-"),
+                RespValue::bulk("gpt-4o"),
+                RespValue::bulk("llm_judge"),
+            ]),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("NOAUTH"), "got: {msg}");
+            }
+            other => panic!("expected NOAUTH, got {other:?}"),
         }
     }
 

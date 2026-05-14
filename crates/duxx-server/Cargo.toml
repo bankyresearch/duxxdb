@@ -66,6 +66,7 @@ duxx-embed = { workspace = true, features = ["http"] }
 duxx-trace.workspace = true
 duxx-prompts.workspace = true
 duxx-datasets.workspace = true
+duxx-eval.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
