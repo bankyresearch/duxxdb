@@ -50,3 +50,4 @@ bench/comparative/_lancedb_bench_tmp/
 *.swo
 *.pyc
 __pycache__/
+/duxx-ai/

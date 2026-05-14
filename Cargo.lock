@@ -945,6 +945,7 @@ dependencies = [
  "duxx-memory",
  "duxx-reactive",
  "duxx-storage",
+ "duxx-trace",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -952,6 +953,8 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -971,6 +974,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "duxx-trace"
+version = "0.1.0"
+dependencies = [
+ "duxx-core",
+ "duxx-reactive",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]

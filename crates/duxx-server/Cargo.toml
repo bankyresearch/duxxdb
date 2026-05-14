@@ -63,6 +63,9 @@ duxx-memory.workspace = true
 duxx-reactive.workspace = true
 duxx-storage.workspace = true
 duxx-embed = { workspace = true, features = ["http"] }
+duxx-trace.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true

@@ -32,6 +32,7 @@ pub mod tls;
 use duxx_embed::{Embedder, HashEmbedder};
 use duxx_memory::{MemoryStore, SessionStore};
 use duxx_reactive::{ChangeEvent, ChangeKind};
+use duxx_trace::{Span, SpanKind, SpanStatus, TraceSearch, TraceStore};
 use resp::RespValue;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -64,6 +65,9 @@ pub struct Server {
     /// When Some, the accept loop wraps each TcpStream in a rustls
     /// TlsStream before handing it to `handle_connection`. Phase 6.2.
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// Phase 7.1: in-process agent trace store. Surfaced via the
+    /// TRACE.* RESP commands.
+    traces: TraceStore,
 }
 
 impl std::fmt::Debug for Server {
@@ -95,6 +99,7 @@ impl Server {
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
             tls_config: None,
+            traces: TraceStore::new(),
         }
     }
 
@@ -159,6 +164,7 @@ impl Server {
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
             tls_config: None,
+            traces: TraceStore::new(),
         })
     }
 
@@ -180,6 +186,7 @@ impl Server {
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
             tls_config: None,
+            traces: TraceStore::new(),
         })
     }
 
@@ -557,6 +564,13 @@ impl Server {
             "UNSUBSCRIBE" => self.cmd_unsubscribe(&args),
             "PSUBSCRIBE" => self.cmd_psubscribe(&args),
             "PUNSUBSCRIBE" => self.cmd_punsubscribe(&args),
+            // Phase 7.1: agent observability
+            "TRACE.RECORD" => self.cmd_trace_record(&args),
+            "TRACE.CLOSE" => self.cmd_trace_close(&args),
+            "TRACE.GET" => self.cmd_trace_get(&args),
+            "TRACE.SUBTREE" => self.cmd_trace_subtree(&args),
+            "TRACE.THREAD" => self.cmd_trace_thread(&args),
+            "TRACE.SEARCH" => self.cmd_trace_search(&args),
             other => Response::Reply(err(format!("ERR unknown command '{other}'"))),
         }
     }
@@ -620,6 +634,8 @@ impl Server {
         let names = [
             "PING", "HELLO", "AUTH", "COMMAND", "INFO", "QUIT", "SET", "GET", "DEL",
             "REMEMBER", "RECALL", "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
+            "TRACE.RECORD", "TRACE.CLOSE", "TRACE.GET", "TRACE.SUBTREE", "TRACE.THREAD",
+            "TRACE.SEARCH",
         ];
         let arr: Vec<RespValue> = names.iter().map(|n| RespValue::bulk(*n)).collect();
         Response::Reply(RespValue::Array(arr))
@@ -825,7 +841,269 @@ impl Server {
             .collect();
         Response::Reply(RespValue::Array(arr))
     }
+
+    // ---------------------------------------------------------------- Phase 7.1: TRACE.*
+
+    /// Access the underlying TraceStore (used by tests / external
+    /// integrations that want to push spans directly).
+    pub fn traces(&self) -> &TraceStore {
+        &self.traces
+    }
+
+    /// `TRACE.RECORD trace_id span_id parent_span_id name attrs_json
+    /// [start_unix_ns] [end_unix_ns] [status] [kind] [thread_id]`
+    ///
+    /// `parent_span_id` may be the literal "null" / "-" to mean "no
+    /// parent" (root span). `attrs_json` may be `"-"` to mean an empty
+    /// object. Optional args default to: now / open / unset / internal /
+    /// no-thread.
+    fn cmd_trace_record(&self, args: &[RespValue]) -> Response {
+        if args.len() < 5 {
+            return Response::Reply(err(
+                "ERR TRACE.RECORD expects: trace_id span_id parent_span_id name attrs_json \
+                 [start_ns] [end_ns] [status] [kind] [thread_id]",
+            ));
+        }
+        let trace_id = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR trace_id must be a string")),
+        };
+        let span_id = match arg_string(&args[2]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR span_id must be a string")),
+        };
+        let parent_span_id = arg_string(&args[3]).and_then(|s| {
+            if s.is_empty() || s == "-" || s.eq_ignore_ascii_case("null") {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        });
+        let name = match arg_string(&args[4]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let attributes: serde_json::Value = if args.len() >= 6 {
+            match arg_string(&args[5]) {
+                Some("-") | Some("") => serde_json::Value::Null,
+                Some(s) => match serde_json::from_str(s) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Response::Reply(err(format!("ERR attrs_json: {e}")));
+                    }
+                },
+                None => serde_json::Value::Null,
+            }
+        } else {
+            serde_json::Value::Null
+        };
+        let now_ns = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        };
+        let start_unix_ns = args
+            .get(6)
+            .and_then(arg_string)
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or_else(now_ns);
+        let end_unix_ns = args
+            .get(7)
+            .and_then(arg_string)
+            .and_then(|s| {
+                if s == "-" || s.is_empty() {
+                    None
+                } else {
+                    s.parse::<u128>().ok()
+                }
+            });
+        let status = args
+            .get(8)
+            .and_then(arg_string)
+            .map(|s| match s.to_ascii_lowercase().as_str() {
+                "ok" => SpanStatus::Ok,
+                "error" | "err" => SpanStatus::Error,
+                _ => SpanStatus::Unset,
+            })
+            .unwrap_or(SpanStatus::Unset);
+        let kind = args
+            .get(9)
+            .and_then(arg_string)
+            .map(|s| match s.to_ascii_lowercase().as_str() {
+                "server" => SpanKind::Server,
+                "client" => SpanKind::Client,
+                "producer" => SpanKind::Producer,
+                "consumer" => SpanKind::Consumer,
+                _ => SpanKind::Internal,
+            })
+            .unwrap_or(SpanKind::Internal);
+        let thread_id = args.get(10).and_then(arg_string).and_then(|s| {
+            if s.is_empty() || s == "-" {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        });
+        let span = Span {
+            trace_id,
+            span_id,
+            parent_span_id,
+            thread_id,
+            name,
+            kind,
+            start_unix_ns,
+            end_unix_ns,
+            status,
+            attributes,
+        };
+        match self.traces.record_span(span) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `TRACE.CLOSE span_id end_unix_ns [status]`
+    fn cmd_trace_close(&self, args: &[RespValue]) -> Response {
+        if args.len() < 3 {
+            return Response::Reply(err("ERR TRACE.CLOSE expects: span_id end_unix_ns [status]"));
+        }
+        let span_id = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR span_id must be a string")),
+        };
+        let end_unix_ns = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse::<u128>().ok())
+        {
+            Some(n) => n,
+            None => return Response::Reply(err("ERR end_unix_ns must be a u128")),
+        };
+        let status = args
+            .get(3)
+            .and_then(arg_string)
+            .map(|s| match s.to_ascii_lowercase().as_str() {
+                "ok" => SpanStatus::Ok,
+                "error" | "err" => SpanStatus::Error,
+                _ => SpanStatus::Unset,
+            })
+            .unwrap_or(SpanStatus::Ok);
+        match self.traces.close_span(&span_id, end_unix_ns, status) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `TRACE.GET trace_id` — returns an array of span JSON blobs (one per span).
+    fn cmd_trace_get(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR TRACE.GET expects: trace_id"));
+        }
+        let trace_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR trace_id must be a string")),
+        };
+        spans_to_array_reply(self.traces.get_trace(trace_id))
+    }
+
+    /// `TRACE.SUBTREE span_id` — every span under (inclusive) `span_id`.
+    fn cmd_trace_subtree(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR TRACE.SUBTREE expects: span_id"));
+        }
+        let span_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR span_id must be a string")),
+        };
+        spans_to_array_reply(self.traces.subtree(span_id))
+    }
+
+    /// `TRACE.THREAD thread_id` — every span across every trace in `thread_id`.
+    fn cmd_trace_thread(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR TRACE.THREAD expects: thread_id"));
+        }
+        let thread_id = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR thread_id must be a string")),
+        };
+        spans_to_array_reply(self.traces.thread(thread_id))
+    }
+
+    /// `TRACE.SEARCH filter_json` — linear-scan filter. `filter_json`
+    /// keys mirror [`duxx_trace::TraceSearch`]:
+    ///   name_prefix, since, until, status, trace_id, kind, limit.
+    fn cmd_trace_search(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR TRACE.SEARCH expects: filter_json"));
+        }
+        let filter_json = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR filter_json must be a string")),
+        };
+        let filter = match parse_trace_search(filter_json) {
+            Ok(f) => f,
+            Err(e) => return Response::Reply(err(format!("ERR filter_json: {e}"))),
+        };
+        let mut hits = self.traces.search(&filter);
+        if filter.limit > 0 && hits.len() > filter.limit {
+            hits.truncate(filter.limit);
+        }
+        spans_to_array_reply(hits)
+    }
 }
+
+fn spans_to_array_reply(spans: Vec<Span>) -> Response {
+    let arr: Vec<RespValue> = spans
+        .into_iter()
+        .filter_map(|s| serde_json::to_vec(&s).ok().map(RespValue::BulkString))
+        .collect();
+    Response::Reply(RespValue::Array(arr))
+}
+
+fn parse_trace_search(json: &str) -> Result<TraceSearch, String> {
+    #[derive(serde::Deserialize, Default)]
+    struct Raw {
+        #[serde(default)]
+        name_prefix: Option<String>,
+        #[serde(default)]
+        since: Option<u128>,
+        #[serde(default)]
+        until: Option<u128>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        trace_id: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        limit: usize,
+    }
+    let raw: Raw = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(TraceSearch {
+        name_prefix: raw.name_prefix,
+        since: raw.since,
+        until: raw.until,
+        status: raw.status.and_then(|s| match s.to_ascii_lowercase().as_str() {
+            "ok" => Some(SpanStatus::Ok),
+            "error" | "err" => Some(SpanStatus::Error),
+            "unset" => Some(SpanStatus::Unset),
+            _ => None,
+        }),
+        trace_id: raw.trace_id,
+        kind: raw.kind.and_then(|s| match s.to_ascii_lowercase().as_str() {
+            "server" => Some(SpanKind::Server),
+            "client" => Some(SpanKind::Client),
+            "internal" => Some(SpanKind::Internal),
+            "producer" => Some(SpanKind::Producer),
+            "consumer" => Some(SpanKind::Consumer),
+            _ => None,
+        }),
+        limit: raw.limit,
+    })
+}
+
 
 impl Default for Server {
     fn default() -> Self {
@@ -1379,5 +1657,130 @@ mod tests {
         assert_eq!(response, "+PONG\r\n", "PING response over TLS");
 
         server_handle.abort();
+    }
+
+    // ---------- Phase 7.1: TRACE.* commands ----------
+
+    fn trace_record_args(
+        trace_id: &str,
+        span_id: &str,
+        parent: &str,
+        name: &str,
+        attrs_json: &str,
+    ) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::bulk("TRACE.RECORD"),
+            RespValue::bulk(trace_id),
+            RespValue::bulk(span_id),
+            RespValue::bulk(parent),
+            RespValue::bulk(name),
+            RespValue::bulk(attrs_json),
+        ])
+    }
+
+    #[test]
+    fn trace_record_then_get_returns_span_array() {
+        let s = Server::new();
+        let _ = s.dispatch(trace_record_args(
+            "t1",
+            "s1",
+            "-",
+            "agent.run",
+            "{\"model\":\"gpt-4o\"}",
+        ));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("TRACE.GET"),
+            RespValue::bulk("t1"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert_eq!(items.len(), 1, "one span in trace");
+                if let RespValue::BulkString(bytes) = &items[0] {
+                    let body = std::str::from_utf8(bytes).unwrap();
+                    assert!(body.contains("\"name\":\"agent.run\""));
+                    assert!(body.contains("\"model\":\"gpt-4o\""));
+                } else {
+                    panic!("expected bulk span payload");
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_subtree_returns_descendants() {
+        let s = Server::new();
+        s.dispatch(trace_record_args("t1", "root", "-", "agent.run", "-"));
+        s.dispatch(trace_record_args("t1", "child1", "root", "llm.call", "-"));
+        s.dispatch(trace_record_args("t1", "child2", "root", "tool.search", "-"));
+        s.dispatch(trace_record_args("t1", "grand", "child1", "embed", "-"));
+
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("TRACE.SUBTREE"),
+            RespValue::bulk("child1"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_close_marks_span_closed() {
+        let s = Server::new();
+        s.dispatch(trace_record_args("t1", "s1", "-", "agent.run", "-"));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("TRACE.CLOSE"),
+            RespValue::bulk("s1"),
+            RespValue::bulk("2000000"),
+            RespValue::bulk("ok"),
+        ]));
+        match r {
+            Response::Reply(RespValue::SimpleString(ref ok)) => assert_eq!(ok, "OK"),
+            other => panic!("expected +OK, got {other:?}"),
+        }
+        let span = s.traces().get_span("s1").unwrap();
+        assert_eq!(span.end_unix_ns, Some(2_000_000));
+        assert_eq!(span.status, duxx_trace::SpanStatus::Ok);
+    }
+
+    #[test]
+    fn trace_record_rejected_pre_auth() {
+        let s = Server::new().with_auth("secret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            trace_record_args("t1", "s1", "-", "agent.run", "-"),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("NOAUTH"), "got: {msg}");
+            }
+            other => panic!("expected NOAUTH error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_search_filters_by_name_prefix() {
+        let s = Server::new();
+        s.dispatch(trace_record_args("t1", "s1", "-", "llm.openai.completion", "-"));
+        s.dispatch(trace_record_args("t1", "s2", "-", "tool.web_search", "-"));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("TRACE.SEARCH"),
+            RespValue::bulk("{\"name_prefix\":\"llm.\"}"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert_eq!(items.len(), 1);
+                if let RespValue::BulkString(bytes) = &items[0] {
+                    let body = std::str::from_utf8(bytes).unwrap();
+                    assert!(body.contains("\"name\":\"llm.openai.completion\""));
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 }
