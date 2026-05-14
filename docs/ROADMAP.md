@@ -242,6 +242,32 @@ duxx-ai side: `DuxxExporter` in `duxx_ai/observability/duxx_exporter.py`
 (merged as PR #2). Plugs into the existing `Tracer` and flushes every
 finished trace via RESP.
 
+## Phase 7.3 — `duxx-datasets` ✅ Shipped
+
+Versioned eval datasets with **per-row semantic search** and a
+killer move competitors can't ship: `DATASET.FROM_RECALL` — turn any
+memory-recall result into a new dataset version in one RESP command.
+
+Capabilities:
+- Versioned snapshots (monotonic; deletes don't reuse numbers).
+- Per-row splits (`train` / `eval` / `test` or custom strings).
+- Tag aliases (`golden` / `staging` / `experimental`).
+- Semantic row search across the whole catalog or filtered by name.
+- Reactive change feed (`PSUBSCRIBE dataset.*`).
+- `add_from_texts` convenience for the simple case.
+
+Thirteen RESP commands: `DATASET.CREATE`, `DATASET.ADD`, `DATASET.GET`
+(by version or tag), `DATASET.LIST`, `DATASET.NAMES`, `DATASET.TAG`,
+`DATASET.UNTAG`, `DATASET.DELETE`, `DATASET.SAMPLE`, `DATASET.SIZE`,
+`DATASET.SPLITS`, `DATASET.SEARCH`, `DATASET.FROM_RECALL`.
+
+Tests: 16 crate-level + 8 RESP-level. Workspace at 176 tests.
+
+In-memory store; persistence lands in 7.x.b alongside trace +
+prompt persistence.
+
+---
+
 ## Phase 7.2 — `duxx-prompts` ✅ Shipped
 
 Versioned prompt registry with **semantic search across the catalog**

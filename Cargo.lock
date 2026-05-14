@@ -838,6 +838,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "duxx-datasets"
+version = "0.1.1"
+dependencies = [
+ "duxx-core",
+ "duxx-embed",
+ "duxx-index",
+ "duxx-reactive",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "duxx-embed"
 version = "0.1.1"
 dependencies = [
@@ -957,6 +974,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "duxx-core",
+ "duxx-datasets",
  "duxx-embed",
  "duxx-memory",
  "duxx-prompts",
@@ -978,6 +996,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

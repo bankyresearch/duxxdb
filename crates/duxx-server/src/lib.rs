@@ -29,6 +29,7 @@ pub mod metrics;
 pub mod resp;
 pub mod tls;
 
+use duxx_datasets::{DatasetRegistry, DatasetRow};
 use duxx_embed::{Embedder, HashEmbedder};
 use duxx_memory::{MemoryStore, SessionStore};
 use duxx_prompts::PromptRegistry;
@@ -74,6 +75,10 @@ pub struct Server {
     /// embedder as the memory store so prompts compete in the same
     /// semantic space as memories.
     prompts: PromptRegistry,
+    /// Phase 7.3: versioned eval datasets. Surfaced via DATASET.*
+    /// commands. Same shared embedder so dataset rows can be searched
+    /// semantically alongside memories and prompts.
+    datasets: DatasetRegistry,
 }
 
 impl std::fmt::Debug for Server {
@@ -97,6 +102,7 @@ impl Server {
     pub fn with_provider(embedder: Arc<dyn Embedder>) -> Self {
         let dim = embedder.dim();
         let prompts = PromptRegistry::new(embedder.clone());
+        let datasets = DatasetRegistry::new(embedder.clone());
         Self {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
@@ -108,6 +114,7 @@ impl Server {
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
+            datasets,
         }
     }
 
@@ -164,6 +171,7 @@ impl Server {
         let dim = embedder.dim();
         let memory = MemoryStore::with_storage(dim, 100_000, storage)?;
         let prompts = PromptRegistry::new(embedder.clone());
+        let datasets = DatasetRegistry::new(embedder.clone());
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -175,6 +183,7 @@ impl Server {
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
+            datasets,
         })
     }
 
@@ -188,6 +197,7 @@ impl Server {
         let dim = embedder.dim();
         let memory = MemoryStore::open_at(dim, 100_000, dir)?;
         let prompts = PromptRegistry::new(embedder.clone());
+        let datasets = DatasetRegistry::new(embedder.clone());
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -199,6 +209,7 @@ impl Server {
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
+            datasets,
         })
     }
 
@@ -593,6 +604,20 @@ impl Server {
             "PROMPT.DELETE" => self.cmd_prompt_delete(&args),
             "PROMPT.SEARCH" => self.cmd_prompt_search(&args),
             "PROMPT.DIFF" => self.cmd_prompt_diff(&args),
+            // Phase 7.3: versioned eval datasets
+            "DATASET.CREATE" => self.cmd_dataset_create(&args),
+            "DATASET.ADD" => self.cmd_dataset_add(&args),
+            "DATASET.GET" => self.cmd_dataset_get(&args),
+            "DATASET.LIST" => self.cmd_dataset_list(&args),
+            "DATASET.NAMES" => self.cmd_dataset_names(),
+            "DATASET.TAG" => self.cmd_dataset_tag(&args),
+            "DATASET.UNTAG" => self.cmd_dataset_untag(&args),
+            "DATASET.DELETE" => self.cmd_dataset_delete(&args),
+            "DATASET.SAMPLE" => self.cmd_dataset_sample(&args),
+            "DATASET.SIZE" => self.cmd_dataset_size(&args),
+            "DATASET.SPLITS" => self.cmd_dataset_splits(&args),
+            "DATASET.SEARCH" => self.cmd_dataset_search(&args),
+            "DATASET.FROM_RECALL" => self.cmd_dataset_from_recall(&args),
             other => Response::Reply(err(format!("ERR unknown command '{other}'"))),
         }
     }
@@ -660,6 +685,9 @@ impl Server {
             "TRACE.SEARCH",
             "PROMPT.PUT", "PROMPT.GET", "PROMPT.LIST", "PROMPT.NAMES", "PROMPT.TAG",
             "PROMPT.UNTAG", "PROMPT.DELETE", "PROMPT.SEARCH", "PROMPT.DIFF",
+            "DATASET.CREATE", "DATASET.ADD", "DATASET.GET", "DATASET.LIST", "DATASET.NAMES",
+            "DATASET.TAG", "DATASET.UNTAG", "DATASET.DELETE", "DATASET.SAMPLE",
+            "DATASET.SIZE", "DATASET.SPLITS", "DATASET.SEARCH", "DATASET.FROM_RECALL",
         ];
         let arr: Vec<RespValue> = names.iter().map(|n| RespValue::bulk(*n)).collect();
         Response::Reply(RespValue::Array(arr))
@@ -1301,6 +1329,387 @@ impl Server {
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
     }
+
+    // ---------------------------------------------------------------- Phase 7.3: DATASET.*
+
+    /// Access the underlying DatasetRegistry.
+    pub fn datasets(&self) -> &DatasetRegistry {
+        &self.datasets
+    }
+
+    /// `DATASET.CREATE name [schema_json]`
+    fn cmd_dataset_create(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err("ERR DATASET.CREATE expects: name [schema_json]"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let schema: serde_json::Value = match args.get(2).and_then(arg_string) {
+            Some("-") | Some("") | None => serde_json::Value::Null,
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR schema_json: {e}"))),
+            },
+        };
+        match self.datasets.create(name, schema) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `DATASET.ADD name rows_json [metadata_json]`
+    ///
+    /// `rows_json` is a JSON array. Each element either has the
+    /// canonical row shape (`{id, text, data, split, annotations}`)
+    /// or just `{text, split?}` for the minimal case.
+    fn cmd_dataset_add(&self, args: &[RespValue]) -> Response {
+        if args.len() < 3 {
+            return Response::Reply(err(
+                "ERR DATASET.ADD expects: name rows_json [metadata_json]",
+            ));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let rows_json = match arg_string(&args[2]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR rows_json must be a string")),
+        };
+        let raw: serde_json::Value = match serde_json::from_str(rows_json) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR rows_json: {e}"))),
+        };
+        let rows: Vec<DatasetRow> = match parse_rows(raw) {
+            Ok(rs) => rs,
+            Err(e) => return Response::Reply(err(format!("ERR rows_json: {e}"))),
+        };
+        let metadata: serde_json::Value = match args.get(3).and_then(arg_string) {
+            Some("-") | Some("") | None => serde_json::Value::Null,
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR metadata_json: {e}"))),
+            },
+        };
+        match self.datasets.add(name, rows, metadata) {
+            Ok(version) => Response::Reply(RespValue::Integer(version as i64)),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `DATASET.GET name [version|tag]`
+    fn cmd_dataset_get(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err("ERR DATASET.GET expects: name [version|tag]"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let ds = match args.get(2).and_then(arg_string) {
+            None => self.datasets.get_latest(&name),
+            Some(s) => match s.parse::<u64>() {
+                Ok(v) => self.datasets.get(&name, v),
+                Err(_) => self.datasets.get_by_tag(&name, s),
+            },
+        };
+        match ds {
+            Some(d) => match serde_json::to_vec(&d) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            None => Response::Reply(RespValue::Null),
+        }
+    }
+
+    /// `DATASET.LIST name` — every version as a JSON bulk payload.
+    fn cmd_dataset_list(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR DATASET.LIST expects: name"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let arr: Vec<RespValue> = self
+            .datasets
+            .list(name)
+            .into_iter()
+            .filter_map(|d| serde_json::to_vec(&d).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `DATASET.NAMES` — every known dataset name, lex order.
+    fn cmd_dataset_names(&self) -> Response {
+        let arr: Vec<RespValue> = self
+            .datasets
+            .names()
+            .into_iter()
+            .map(RespValue::bulk)
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `DATASET.TAG name version tag`
+    fn cmd_dataset_tag(&self, args: &[RespValue]) -> Response {
+        if args.len() != 4 {
+            return Response::Reply(err("ERR DATASET.TAG expects: name version tag"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version must be a positive integer")),
+        };
+        let tag = match arg_string(&args[3]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR tag must be a string")),
+        };
+        match self.datasets.tag(name, version, tag) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `DATASET.UNTAG name tag`
+    fn cmd_dataset_untag(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err("ERR DATASET.UNTAG expects: name tag"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let tag = match arg_string(&args[2]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR tag must be a string")),
+        };
+        let removed = self.datasets.untag(name, tag);
+        Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `DATASET.DELETE name version`
+    fn cmd_dataset_delete(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err("ERR DATASET.DELETE expects: name version"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version must be a positive integer")),
+        };
+        let removed = self.datasets.delete(name, version);
+        Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `DATASET.SAMPLE name version n [split]`
+    fn cmd_dataset_sample(&self, args: &[RespValue]) -> Response {
+        if args.len() < 4 {
+            return Response::Reply(err("ERR DATASET.SAMPLE expects: name version n [split]"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version must be a positive integer")),
+        };
+        let n: usize = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR n must be a non-negative integer")),
+        };
+        let split = args.get(4).and_then(arg_string).filter(|s| !s.is_empty() && *s != "-");
+        let rows = self.datasets.sample(name, version, n, split);
+        let arr: Vec<RespValue> = rows
+            .into_iter()
+            .filter_map(|r| serde_json::to_vec(&r).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `DATASET.SIZE name version [split]` — row count.
+    fn cmd_dataset_size(&self, args: &[RespValue]) -> Response {
+        if args.len() < 3 {
+            return Response::Reply(err("ERR DATASET.SIZE expects: name version [split]"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version must be a positive integer")),
+        };
+        let split = args.get(3).and_then(arg_string).filter(|s| !s.is_empty() && *s != "-");
+        Response::Reply(RespValue::Integer(self.datasets.size(name, version, split) as i64))
+    }
+
+    /// `DATASET.SPLITS name version` — distinct split names in a version.
+    fn cmd_dataset_splits(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err("ERR DATASET.SPLITS expects: name version"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version must be a positive integer")),
+        };
+        let splits = self.datasets.splits(name, version);
+        let arr: Vec<RespValue> = splits.into_iter().map(RespValue::bulk).collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `DATASET.SEARCH query [k] [name_filter]` — semantic row search.
+    fn cmd_dataset_search(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err("ERR DATASET.SEARCH expects: query [k] [name_filter]"));
+        }
+        let query = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR query must be a string")),
+        };
+        let k: usize = args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let name_filter = args
+            .get(3)
+            .and_then(arg_string)
+            .filter(|s| !s.is_empty() && *s != "-");
+        let hits = match self.datasets.search(query, k, name_filter) {
+            Ok(h) => h,
+            Err(e) => return Response::Reply(err(format!("ERR {e}"))),
+        };
+        let arr: Vec<RespValue> = hits
+            .into_iter()
+            .map(|h| {
+                RespValue::Array(vec![
+                    RespValue::bulk(h.dataset),
+                    RespValue::Integer(h.version as i64),
+                    RespValue::bulk(h.row.id),
+                    RespValue::bulk(format!("{:.6}", h.score)),
+                    RespValue::bulk(h.row.text),
+                ])
+            })
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `DATASET.FROM_RECALL key query k dataset_name [split]`
+    ///
+    /// Run a memory recall, then store every hit as a row in a NEW
+    /// version of `dataset_name`. Returns the assigned version.
+    /// This is the killer move: turn any agent-recall result into a
+    /// dataset in one round-trip. Memories, datasets, and prompts
+    /// share the same vector space.
+    fn cmd_dataset_from_recall(&self, args: &[RespValue]) -> Response {
+        if args.len() < 5 {
+            return Response::Reply(err(
+                "ERR DATASET.FROM_RECALL expects: key query k dataset_name [split]",
+            ));
+        }
+        let key = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR key must be a string")),
+        };
+        let query = match arg_string(&args[2]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR query must be a string")),
+        };
+        let k: usize = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR k must be a positive integer")),
+        };
+        let dataset_name = match arg_string(&args[4]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR dataset_name must be a string")),
+        };
+        let split = args
+            .get(5)
+            .and_then(arg_string)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let qvec = match self.embedder.embed(query) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
+        };
+        let hits = match self.memory.recall(key, query, &qvec, k) {
+            Ok(h) => h,
+            Err(e) => return Response::Reply(err(format!("ERR recall: {e}"))),
+        };
+        let rows: Vec<DatasetRow> = hits
+            .into_iter()
+            .map(|h| {
+                DatasetRow::new(h.memory.text)
+                    .with_split(split.clone())
+                    .with_annotations(serde_json::json!({
+                        "source": "memory.recall",
+                        "memory_id": h.memory.id,
+                        "key": h.memory.key,
+                        "score": h.score,
+                    }))
+            })
+            .collect();
+        let metadata = serde_json::json!({
+            "source": "memory.recall",
+            "query": query,
+            "key": key,
+            "k": k,
+        });
+        match self.datasets.add(dataset_name, rows, metadata) {
+            Ok(version) => Response::Reply(RespValue::Integer(version as i64)),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+}
+
+/// Parse the rows_json payload of DATASET.ADD. Accepts either a JSON
+/// array of objects OR a JSON array of strings (treated as `text` only,
+/// auto-id, no split).
+fn parse_rows(raw: serde_json::Value) -> std::result::Result<Vec<DatasetRow>, String> {
+    let arr = match raw {
+        serde_json::Value::Array(a) => a,
+        _ => return Err("expected a JSON array".into()),
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        match v {
+            serde_json::Value::String(s) => {
+                out.push(DatasetRow::new(s));
+            }
+            serde_json::Value::Object(_) => {
+                let row: DatasetRow = serde_json::from_value(v)
+                    .map_err(|e| format!("row decode: {e}"))?;
+                // Fill in an id if the caller omitted one.
+                let row = if row.id.is_empty() {
+                    DatasetRow { id: uuid::Uuid::new_v4().simple().to_string(), ..row }
+                } else {
+                    row
+                };
+                out.push(row);
+            }
+            other => {
+                return Err(format!(
+                    "expected string or object per row, got {other:?}"
+                ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn spans_to_array_reply(spans: Vec<Span>) -> Response {
@@ -2173,6 +2582,226 @@ mod tests {
                 assert!(body.contains("+NEW line"), "missing added line, got:\n{body}");
             }
             other => panic!("expected bulk diff, got {other:?}"),
+        }
+    }
+
+    // ---------- Phase 7.3: DATASET.* commands ----------
+
+    fn dataset_add_args(name: &str, rows_json: &str) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::bulk("DATASET.ADD"),
+            RespValue::bulk(name),
+            RespValue::bulk(rows_json),
+        ])
+    }
+
+    #[test]
+    fn dataset_add_returns_monotonic_version() {
+        let s = Server::new();
+        let v1 = s.dispatch(dataset_add_args(
+            "d",
+            r#"[{"text": "hello", "split": "train"}]"#,
+        ));
+        let v2 = s.dispatch(dataset_add_args(
+            "d",
+            r#"[{"text": "world", "split": "train"}]"#,
+        ));
+        match (v1, v2) {
+            (
+                Response::Reply(RespValue::Integer(a)),
+                Response::Reply(RespValue::Integer(b)),
+            ) => {
+                assert_eq!((a, b), (1, 2));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dataset_get_returns_latest_with_rows() {
+        let s = Server::new();
+        s.dispatch(dataset_add_args(
+            "d",
+            r#"[{"text": "q1", "split": "eval"}, {"text": "q2", "split": "eval"}]"#,
+        ));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.GET"),
+            RespValue::bulk("d"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"version\":1"));
+                assert!(body.contains("\"text\":\"q1\""));
+            }
+            other => panic!("expected bulk JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dataset_size_and_splits_reflect_per_split_counts() {
+        let s = Server::new();
+        s.dispatch(dataset_add_args(
+            "d",
+            r#"[
+                {"text": "a", "split": "train"},
+                {"text": "b", "split": "train"},
+                {"text": "c", "split": "eval"}
+            ]"#,
+        ));
+        let size = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.SIZE"),
+            RespValue::bulk("d"),
+            RespValue::bulk("1"),
+        ]));
+        match size {
+            Response::Reply(RespValue::Integer(n)) => assert_eq!(n, 3),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let size_eval = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.SIZE"),
+            RespValue::bulk("d"),
+            RespValue::bulk("1"),
+            RespValue::bulk("eval"),
+        ]));
+        match size_eval {
+            Response::Reply(RespValue::Integer(n)) => assert_eq!(n, 1),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let splits = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.SPLITS"),
+            RespValue::bulk("d"),
+            RespValue::bulk("1"),
+        ]));
+        if let Response::Reply(RespValue::Array(items)) = splits {
+            assert_eq!(items.len(), 2);
+        } else {
+            panic!("expected array of splits");
+        }
+    }
+
+    #[test]
+    fn dataset_sample_filters_by_split() {
+        let s = Server::new();
+        s.dispatch(dataset_add_args(
+            "d",
+            r#"[
+                {"text": "a", "split": "train"},
+                {"text": "b", "split": "train"},
+                {"text": "c", "split": "eval"},
+                {"text": "d", "split": "eval"}
+            ]"#,
+        ));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.SAMPLE"),
+            RespValue::bulk("d"),
+            RespValue::bulk("1"),
+            RespValue::bulk("10"),
+            RespValue::bulk("eval"),
+        ]));
+        if let Response::Reply(RespValue::Array(items)) = r {
+            assert_eq!(items.len(), 2);
+        } else {
+            panic!("expected array of eval rows");
+        }
+    }
+
+    #[test]
+    fn dataset_search_finds_semantically_close_rows() {
+        let s = Server::new();
+        s.dispatch(dataset_add_args(
+            "d",
+            r#"[
+                {"text": "hello world how are you", "split": "eval"},
+                {"text": "goodbye see you later", "split": "eval"}
+            ]"#,
+        ));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.SEARCH"),
+            RespValue::bulk("hello world"),
+            RespValue::bulk("1"),
+        ]));
+        if let Response::Reply(RespValue::Array(items)) = r {
+            assert!(!items.is_empty());
+            if let RespValue::Array(first) = &items[0] {
+                if let RespValue::BulkString(text_bytes) = &first[4] {
+                    let txt = std::str::from_utf8(text_bytes).unwrap();
+                    assert!(txt.contains("hello"));
+                }
+            }
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    #[test]
+    fn dataset_delete_does_not_reuse_version() {
+        let s = Server::new();
+        s.dispatch(dataset_add_args("d", r#"[{"text":"v1"}]"#));
+        s.dispatch(dataset_add_args("d", r#"[{"text":"v2"}]"#));
+        let _ = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.DELETE"),
+            RespValue::bulk("d"),
+            RespValue::bulk("2"),
+        ]));
+        let v3 = s.dispatch(dataset_add_args("d", r#"[{"text":"v3"}]"#));
+        match v3 {
+            Response::Reply(RespValue::Integer(v)) => assert_eq!(v, 3),
+            other => panic!("expected v=3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dataset_from_recall_lifts_memories_into_a_new_dataset() {
+        let s = Server::new();
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REMEMBER"),
+            RespValue::bulk("alice"),
+            RespValue::bulk("I lost my wallet at the cafe"),
+        ]));
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("REMEMBER"),
+            RespValue::bulk("alice"),
+            RespValue::bulk("Favorite color is blue"),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.FROM_RECALL"),
+            RespValue::bulk("alice"),
+            RespValue::bulk("wallet"),
+            RespValue::bulk("2"),
+            RespValue::bulk("recall-dump"),
+            RespValue::bulk("eval"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Integer(v)) => assert!(v >= 1),
+            other => panic!("expected dataset version, got {other:?}"),
+        }
+        // The new dataset version should now exist with up to 2 rows.
+        let size = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("DATASET.SIZE"),
+            RespValue::bulk("recall-dump"),
+            RespValue::bulk("1"),
+        ]));
+        match size {
+            Response::Reply(RespValue::Integer(n)) => assert!(n >= 1),
+            other => panic!("expected integer size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dataset_rejected_pre_auth() {
+        let s = Server::new().with_auth("secret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            dataset_add_args("d", r#"[{"text":"x"}]"#),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("NOAUTH"), "got: {msg}");
+            }
+            other => panic!("expected NOAUTH error, got {other:?}"),
         }
     }
 
