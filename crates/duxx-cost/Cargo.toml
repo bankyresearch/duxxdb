@@ -1,0 +1,25 @@
+[package]
+name = "duxx-cost"
+description = "DuxxDB — token + cost ledger with budgets and semantic attribution. Phase 7.6."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+duxx-core.workspace = true
+duxx-embed.workspace = true
+duxx-index.workspace = true
+duxx-reactive.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

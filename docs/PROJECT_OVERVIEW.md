@@ -172,8 +172,9 @@ surfaces from one binary.
 
 ## 5. Capabilities today
 
-All of Phase 0 → 6.2 + 7.1 + 7.2 + 7.3 + 7.4 + 7.5 ships. **222
-tests passing** workspace-wide; CI matrix on Linux + macOS + Windows.
+**Phase 7 complete.** All of Phase 0 → 6.2 + 7.1 through 7.6 ships.
+**248 tests passing** workspace-wide; CI matrix on Linux + macOS +
+Windows.
 
 ### Storage layer
 
@@ -545,6 +546,7 @@ Full version: [ROADMAP.md](ROADMAP.md). Snapshot:
 | **7.3** | **`duxx-datasets` — versioned eval datasets + DATASET.FROM_RECALL (13 RESP commands)** | ✅ |
 | **7.4** | **`duxx-eval` — runs, scores, regressions, semantic failure clustering (9 RESP commands)** | ✅ |
 | **7.5** | **`duxx-replay` — deterministic agent replay with per-invocation overrides (12 RESP commands)** | ✅ |
+| **7.6** | **`duxx-cost` — token + cost ledger, budgets, semantic clustering of spend (10 RESP commands)** | ✅ |
 | 7.4 | `duxx-eval` — eval runs + scorers + regression detection | Planned |
 | 7.5 | `duxx-replay` — deterministic agent replay | Planned |
 | 7.6 | `duxx-cost` — token + cost ledger with budgets | Planned |

@@ -68,6 +68,7 @@ duxx-prompts.workspace = true
 duxx-datasets.workspace = true
 duxx-eval.workspace = true
 duxx-replay.workspace = true
+duxx-cost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

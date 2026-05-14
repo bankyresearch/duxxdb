@@ -838,6 +838,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "duxx-cost"
+version = "0.1.1"
+dependencies = [
+ "duxx-core",
+ "duxx-embed",
+ "duxx-index",
+ "duxx-reactive",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "duxx-datasets"
 version = "0.1.1"
 dependencies = [
@@ -1006,6 +1023,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "duxx-core",
+ "duxx-cost",
  "duxx-datasets",
  "duxx-embed",
  "duxx-eval",

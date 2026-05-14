@@ -242,6 +242,62 @@ duxx-ai side: `DuxxExporter` in `duxx_ai/observability/duxx_exporter.py`
 (merged as PR #2). Plugs into the existing `Tracer` and flushes every
 finished trace via RESP.
 
+## Phase 7.6 — `duxx-cost` ✅ Shipped
+
+Token + cost ledger with per-tenant budgets and **semantic
+clustering of expensive queries**. Final crate of the Phase 7
+full-stack agent backend.
+
+Posture: pure ledger. Callers pass `cost_usd` directly (DuxxDB never
+ships baked-in pricing tables because model prices change weekly).
+Billing integration is the caller's job.
+
+Capabilities:
+- Append-only `CostEntry` records: tenant, model, tokens_(in,out),
+  cost_usd, optional links to trace_id / run_id / prompt / input_text,
+  free-form metadata.
+- Filtered queries + 5-axis aggregations (Tenant / Model / Prompt /
+  DayUtc / None) with rolling time windows.
+- Per-tenant budgets across Daily / Weekly / Monthly / custom-secs
+  periods with a configurable warn threshold (default 80%).
+- Rolling budget-status calculation: `Ok` → `Warning` → `Exceeded`.
+- Active alert feed (`cost.alerts` channel via `PSUBSCRIBE`).
+- **Semantic clustering of expensive queries** via the shared HNSW:
+  "what kind of queries cost me the most this week?" Answers via
+  one call. Pulls the top-N entries by `cost_usd`, embeds each
+  `input_text`, greedy-clusters by cosine similarity, sorts clusters
+  by total spend desc.
+
+Ten RESP commands: `COST.RECORD`, `COST.QUERY`, `COST.AGGREGATE`,
+`COST.TOTAL`, `COST.SET_BUDGET`, `COST.GET_BUDGET`,
+`COST.DELETE_BUDGET`, `COST.STATUS`, `COST.ALERTS`,
+`COST.CLUSTER_EXPENSIVE`.
+
+Tests: 16 crate-level + 10 RESP-level. Workspace at 248 tests.
+
+---
+
+## 🎉 Phase 7 complete
+
+Six new agent-native primitives shipped over the Phase 7 arc:
+
+| Slot | Crate | Surface | What it does |
+|---|---|---|---|
+| 7.1 | `duxx-trace` | 6 RESP commands | Spans / Traces / Threads, OTel-compatible shape |
+| 7.2 | `duxx-prompts` | 9 RESP commands | Versioned prompt registry + semantic search |
+| 7.3 | `duxx-datasets` | 13 RESP commands | Versioned eval datasets + DATASET.FROM_RECALL |
+| 7.4 | `duxx-eval` | 9 RESP commands | Eval runs + regressions + semantic failure clustering |
+| 7.5 | `duxx-replay` | 12 RESP commands | Deterministic replay with per-invocation overrides |
+| 7.6 | `duxx-cost` | 10 RESP commands | Cost ledger + budgets + semantic clustering of spend |
+
+**248 workspace tests pass on Linux + macOS + Windows.** The full
+debug-fix-verify loop now lives entirely on the server side. Every
+primitive shares one HNSW vector space, so cross-primitive semantic
+queries ("find datasets that look like this failure cluster", "find
+prompts that look like the ones blowing my budget") work for free.
+
+---
+
 ## Phase 7.5 — `duxx-replay` ✅ Shipped
 
 Deterministic agent replay with per-invocation overrides. **Strategic

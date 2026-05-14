@@ -36,6 +36,7 @@ use duxx_replay::{
     InvocationKind as ReplayInvocationKind, OverrideKind as ReplayOverrideKind, ReplayInvocation,
     ReplayMode, ReplayOverride, ReplayRegistry,
 };
+use duxx_cost::{BudgetPeriod, CostEntry, CostFilter, CostLedger, GroupBy};
 use duxx_memory::{MemoryStore, SessionStore};
 use duxx_prompts::PromptRegistry;
 use duxx_reactive::{ChangeEvent, ChangeKind};
@@ -91,6 +92,10 @@ pub struct Server {
     /// invocations against a trace_id and lets callers re-execute
     /// with overrides. Surfaced via REPLAY.* commands.
     replays: ReplayRegistry,
+    /// Phase 7.6: token + cost ledger with per-tenant budgets and
+    /// semantic clustering of expensive queries. Surfaced via the
+    /// COST.* RESP commands.
+    costs: CostLedger,
 }
 
 impl std::fmt::Debug for Server {
@@ -117,6 +122,7 @@ impl Server {
         let datasets = DatasetRegistry::new(embedder.clone());
         let evals = EvalRegistry::new(embedder.clone());
         let replays = ReplayRegistry::new();
+        let costs = CostLedger::new(embedder.clone());
         Self {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
@@ -131,6 +137,7 @@ impl Server {
             datasets,
             evals,
             replays,
+            costs,
         }
     }
 
@@ -190,6 +197,7 @@ impl Server {
         let datasets = DatasetRegistry::new(embedder.clone());
         let evals = EvalRegistry::new(embedder.clone());
         let replays = ReplayRegistry::new();
+        let costs = CostLedger::new(embedder.clone());
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -204,6 +212,7 @@ impl Server {
             datasets,
             evals,
             replays,
+            costs,
         })
     }
 
@@ -220,6 +229,7 @@ impl Server {
         let datasets = DatasetRegistry::new(embedder.clone());
         let evals = EvalRegistry::new(embedder.clone());
         let replays = ReplayRegistry::new();
+        let costs = CostLedger::new(embedder.clone());
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -234,6 +244,7 @@ impl Server {
             datasets,
             evals,
             replays,
+            costs,
         })
     }
 
@@ -665,6 +676,17 @@ impl Server {
             "REPLAY.LIST_RUNS" => self.cmd_replay_list_runs(&args),
             "REPLAY.DIFF" => self.cmd_replay_diff(&args),
             "REPLAY.SET_TRACE" => self.cmd_replay_set_trace(&args),
+            // Phase 7.6: token + cost ledger
+            "COST.RECORD" => self.cmd_cost_record(&args),
+            "COST.QUERY" => self.cmd_cost_query(&args),
+            "COST.AGGREGATE" => self.cmd_cost_aggregate(&args),
+            "COST.TOTAL" => self.cmd_cost_total(&args),
+            "COST.SET_BUDGET" => self.cmd_cost_set_budget(&args),
+            "COST.GET_BUDGET" => self.cmd_cost_get_budget(&args),
+            "COST.DELETE_BUDGET" => self.cmd_cost_delete_budget(&args),
+            "COST.STATUS" => self.cmd_cost_status(&args),
+            "COST.ALERTS" => self.cmd_cost_alerts(),
+            "COST.CLUSTER_EXPENSIVE" => self.cmd_cost_cluster_expensive(&args),
             other => Response::Reply(err(format!("ERR unknown command '{other}'"))),
         }
     }
@@ -740,6 +762,9 @@ impl Server {
             "REPLAY.CAPTURE", "REPLAY.START", "REPLAY.STEP", "REPLAY.RECORD",
             "REPLAY.COMPLETE", "REPLAY.FAIL", "REPLAY.GET_SESSION", "REPLAY.GET_RUN",
             "REPLAY.LIST_SESSIONS", "REPLAY.LIST_RUNS", "REPLAY.DIFF", "REPLAY.SET_TRACE",
+            "COST.RECORD", "COST.QUERY", "COST.AGGREGATE", "COST.TOTAL",
+            "COST.SET_BUDGET", "COST.GET_BUDGET", "COST.DELETE_BUDGET",
+            "COST.STATUS", "COST.ALERTS", "COST.CLUSTER_EXPENSIVE",
         ];
         let arr: Vec<RespValue> = names.iter().map(|n| RespValue::bulk(*n)).collect();
         Response::Reply(RespValue::Array(arr))
@@ -2238,6 +2263,288 @@ impl Server {
         };
         match self.replays.set_replay_trace_id(run_id, replay_trace) {
             Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    // ---------------------------------------------------------------- Phase 7.6: COST.*
+
+    /// Access the underlying CostLedger.
+    pub fn costs(&self) -> &CostLedger {
+        &self.costs
+    }
+
+    /// `COST.RECORD tenant model tokens_in tokens_out cost_usd [input_text] [metadata_json]`
+    fn cmd_cost_record(&self, args: &[RespValue]) -> Response {
+        if args.len() < 6 {
+            return Response::Reply(err(
+                "ERR COST.RECORD expects: tenant model tokens_in tokens_out cost_usd [input_text] [metadata_json]",
+            ));
+        }
+        let tenant = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR tenant must be a string")),
+        };
+        let model = match arg_string(&args[2]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR model must be a string")),
+        };
+        let tokens_in: u64 = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR tokens_in must be a non-negative integer")),
+        };
+        let tokens_out: u64 = match args.get(4).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR tokens_out must be a non-negative integer")),
+        };
+        let cost_usd: f64 = match args.get(5).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR cost_usd must be a non-negative float")),
+        };
+        let input_text = args
+            .get(6)
+            .and_then(arg_string)
+            .map(|s| if s == "-" { "" } else { s }.to_string())
+            .unwrap_or_default();
+        let metadata: serde_json::Value = match args.get(7).and_then(arg_string) {
+            Some("-") | Some("") | None => serde_json::Value::Null,
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR metadata_json: {e}"))),
+            },
+        };
+        let entry = CostEntry {
+            id: String::new(),
+            tenant,
+            model,
+            tokens_in,
+            tokens_out,
+            cost_usd,
+            trace_id: None,
+            run_id: None,
+            prompt_name: None,
+            prompt_version: None,
+            input_text,
+            metadata,
+            recorded_at_unix_ns: 0,
+        };
+        match self.costs.record(entry) {
+            Ok(id) => Response::Reply(RespValue::BulkString(id.into_bytes())),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    fn parse_cost_filter(s: Option<&str>) -> std::result::Result<CostFilter, String> {
+        match s {
+            None | Some("-") | Some("") => Ok(CostFilter::default()),
+            Some(json) => serde_json::from_str(json).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// `COST.QUERY [filter_json]` — returns entries newest first.
+    fn cmd_cost_query(&self, args: &[RespValue]) -> Response {
+        let filter = match Self::parse_cost_filter(args.get(1).and_then(arg_string)) {
+            Ok(f) => f,
+            Err(e) => return Response::Reply(err(format!("ERR filter_json: {e}"))),
+        };
+        let arr: Vec<RespValue> = self
+            .costs
+            .query(&filter)
+            .into_iter()
+            .filter_map(|e| serde_json::to_vec(&e).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `COST.AGGREGATE group_by [filter_json]`
+    /// `group_by` ∈ tenant | model | prompt | day | none.
+    fn cmd_cost_aggregate(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err(
+                "ERR COST.AGGREGATE expects: group_by [filter_json]",
+            ));
+        }
+        let group_by = match arg_string(&args[1]).map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("tenant") => GroupBy::Tenant,
+            Some("model") => GroupBy::Model,
+            Some("prompt") => GroupBy::Prompt,
+            Some("day") | Some("day_utc") => GroupBy::DayUtc,
+            Some("none") | Some("all") => GroupBy::None,
+            other => {
+                return Response::Reply(err(format!(
+                    "ERR unknown group_by '{}' (use: tenant | model | prompt | day | none)",
+                    other.unwrap_or("")
+                )));
+            }
+        };
+        let filter = match Self::parse_cost_filter(args.get(2).and_then(arg_string)) {
+            Ok(f) => f,
+            Err(e) => return Response::Reply(err(format!("ERR filter_json: {e}"))),
+        };
+        let arr: Vec<RespValue> = self
+            .costs
+            .aggregate(&filter, group_by)
+            .into_iter()
+            .filter_map(|b| serde_json::to_vec(&b).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `COST.TOTAL tenant [since_unix_ns] [until_unix_ns]`
+    fn cmd_cost_total(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err(
+                "ERR COST.TOTAL expects: tenant [since_unix_ns] [until_unix_ns]",
+            ));
+        }
+        let tenant = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR tenant must be a string")),
+        };
+        let since = args.get(2).and_then(arg_string).and_then(|s| s.parse::<u128>().ok());
+        let until = args.get(3).and_then(arg_string).and_then(|s| s.parse::<u128>().ok());
+        let total = self.costs.total_for(tenant, since, until);
+        Response::Reply(RespValue::BulkString(format!("{total:.6}").into_bytes()))
+    }
+
+    /// `COST.SET_BUDGET tenant period amount_usd [warn_pct] [metadata_json]`
+    /// period ∈ daily | weekly | monthly | <seconds>
+    fn cmd_cost_set_budget(&self, args: &[RespValue]) -> Response {
+        if args.len() < 4 {
+            return Response::Reply(err(
+                "ERR COST.SET_BUDGET expects: tenant period amount_usd [warn_pct] [metadata_json]",
+            ));
+        }
+        let tenant = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR tenant must be a string")),
+        };
+        let period = match arg_string(&args[2]).map(|s| s.to_ascii_lowercase()) {
+            Some(s) if s == "daily" => BudgetPeriod::Daily,
+            Some(s) if s == "weekly" => BudgetPeriod::Weekly,
+            Some(s) if s == "monthly" => BudgetPeriod::Monthly,
+            Some(s) => match s.parse::<u64>() {
+                Ok(secs) => BudgetPeriod::Custom { secs },
+                Err(_) => {
+                    return Response::Reply(err(format!(
+                        "ERR unknown period '{s}' (use: daily | weekly | monthly | <seconds>)"
+                    )));
+                }
+            },
+            None => return Response::Reply(err("ERR period must be a string")),
+        };
+        let amount: f64 = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR amount_usd must be a non-negative float")),
+        };
+        let warn_pct: f32 = args
+            .get(4)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.8);
+        let metadata: serde_json::Value = match args.get(5).and_then(arg_string) {
+            Some("-") | Some("") | None => serde_json::Value::Null,
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR metadata_json: {e}"))),
+            },
+        };
+        match self.costs.set_budget(tenant, period, amount, warn_pct, metadata) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `COST.GET_BUDGET tenant`
+    fn cmd_cost_get_budget(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR COST.GET_BUDGET expects: tenant"));
+        }
+        let tenant = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR tenant must be a string")),
+        };
+        match self.costs.get_budget(tenant) {
+            Some(b) => match serde_json::to_vec(&b) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            None => Response::Reply(RespValue::Null),
+        }
+    }
+
+    /// `COST.DELETE_BUDGET tenant`
+    fn cmd_cost_delete_budget(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR COST.DELETE_BUDGET expects: tenant"));
+        }
+        let tenant = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR tenant must be a string")),
+        };
+        let removed = self.costs.delete_budget(tenant);
+        Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `COST.STATUS tenant`
+    fn cmd_cost_status(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR COST.STATUS expects: tenant"));
+        }
+        let tenant = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR tenant must be a string")),
+        };
+        let status = self.costs.budget_status(tenant);
+        let s = match status {
+            duxx_cost::BudgetStatus::NoBudget => "no_budget",
+            duxx_cost::BudgetStatus::Ok => "ok",
+            duxx_cost::BudgetStatus::Warning => "warning",
+            duxx_cost::BudgetStatus::Exceeded => "exceeded",
+        };
+        Response::Reply(RespValue::BulkString(s.as_bytes().to_vec()))
+    }
+
+    /// `COST.ALERTS`
+    fn cmd_cost_alerts(&self) -> Response {
+        let arr: Vec<RespValue> = self
+            .costs
+            .alerts()
+            .into_iter()
+            .filter_map(|a| serde_json::to_vec(&a).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `COST.CLUSTER_EXPENSIVE [filter_json] [sim_threshold] [max_clusters] [top_n]`
+    fn cmd_cost_cluster_expensive(&self, args: &[RespValue]) -> Response {
+        let filter = match Self::parse_cost_filter(args.get(1).and_then(arg_string)) {
+            Ok(f) => f,
+            Err(e) => return Response::Reply(err(format!("ERR filter_json: {e}"))),
+        };
+        let sim_threshold: f32 = args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.7);
+        let max_clusters: usize = args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let top_n: usize = args
+            .get(4)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+        match self.costs.cluster_expensive(&filter, sim_threshold, max_clusters, top_n) {
+            Ok(clusters) => {
+                let arr: Vec<RespValue> = clusters
+                    .into_iter()
+                    .filter_map(|c| serde_json::to_vec(&c).ok().map(RespValue::BulkString))
+                    .collect();
+                Response::Reply(RespValue::Array(arr))
+            }
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
     }
@@ -3796,6 +4103,239 @@ mod tests {
                 assert!(msg.contains("not found"), "got: {msg}");
             }
             other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    // ---------- Phase 7.6: COST.* commands ----------
+
+    fn cost_record_args(tenant: &str, model: &str, tok_in: u64, tok_out: u64, usd: &str, input: &str) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::bulk("COST.RECORD"),
+            RespValue::bulk(tenant),
+            RespValue::bulk(model),
+            RespValue::bulk(tok_in.to_string()),
+            RespValue::bulk(tok_out.to_string()),
+            RespValue::bulk(usd),
+            RespValue::bulk(input),
+        ])
+    }
+
+    #[test]
+    fn cost_record_returns_uuid() {
+        let s = Server::new();
+        let r = s.dispatch(cost_record_args("acme", "gpt-4o", 100, 200, "0.01", "hi"));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let id = String::from_utf8(bytes).unwrap();
+                assert_eq!(id.len(), 32, "uuid simple form");
+            }
+            other => panic!("expected bulk id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_query_returns_entries() {
+        let s = Server::new();
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "1.00", "a"));
+        s.dispatch(cost_record_args("acme", "claude", 1, 1, "2.00", "b"));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.QUERY"),
+            RespValue::bulk(r#"{"tenant": "acme"}"#),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => assert_eq!(items.len(), 2),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_aggregate_groups_correctly() {
+        let s = Server::new();
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "1.00", ""));
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "2.00", ""));
+        s.dispatch(cost_record_args("globex", "gpt-4o", 1, 1, "5.00", ""));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.AGGREGATE"),
+            RespValue::bulk("tenant"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert_eq!(items.len(), 2);
+                if let RespValue::BulkString(bytes) = &items[0] {
+                    let body = std::str::from_utf8(bytes).unwrap();
+                    // Sorted by total desc → globex (5.0) first.
+                    assert!(body.contains("\"key\":\"globex\""));
+                    assert!(body.contains("\"total_usd\":5"));
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_total_returns_dollar_sum() {
+        let s = Server::new();
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "1.25", ""));
+        s.dispatch(cost_record_args("acme", "claude", 1, 1, "0.50", ""));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.TOTAL"),
+            RespValue::bulk("acme"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                let v: f64 = body.parse().unwrap();
+                assert!((v - 1.75).abs() < 0.001);
+            }
+            other => panic!("expected bulk float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_budget_status_transitions() {
+        let s = Server::new();
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.SET_BUDGET"),
+            RespValue::bulk("acme"),
+            RespValue::bulk("daily"),
+            RespValue::bulk("10.0"),
+            RespValue::bulk("0.8"),
+        ]));
+        // Empty → ok.
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.STATUS"),
+            RespValue::bulk("acme"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(b)) => {
+                assert_eq!(std::str::from_utf8(&b).unwrap(), "ok");
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+        // Cross warn line.
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "9.0", ""));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.STATUS"),
+            RespValue::bulk("acme"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(b)) => {
+                assert_eq!(std::str::from_utf8(&b).unwrap(), "warning");
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+        // Cross budget.
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "5.0", ""));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.STATUS"),
+            RespValue::bulk("acme"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(b)) => {
+                assert_eq!(std::str::from_utf8(&b).unwrap(), "exceeded");
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_alerts_returns_only_at_or_above_warn() {
+        let s = Server::new();
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.SET_BUDGET"),
+            RespValue::bulk("acme"),
+            RespValue::bulk("daily"),
+            RespValue::bulk("10.0"),
+            RespValue::bulk("0.8"),
+        ]));
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.SET_BUDGET"),
+            RespValue::bulk("globex"),
+            RespValue::bulk("daily"),
+            RespValue::bulk("100.0"),
+            RespValue::bulk("0.8"),
+        ]));
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "9.0", ""));
+        s.dispatch(cost_record_args("globex", "gpt-4o", 1, 1, "1.0", ""));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.ALERTS"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert_eq!(items.len(), 1);
+                if let RespValue::BulkString(bytes) = &items[0] {
+                    let body = std::str::from_utf8(bytes).unwrap();
+                    assert!(body.contains("\"tenant\":\"acme\""));
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_cluster_expensive_returns_clusters() {
+        let s = Server::new();
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "5.0", "user asked phone number"));
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "4.0", "phone number lookup"));
+        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "0.01", "what's the weather"));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.CLUSTER_EXPENSIVE"),
+            RespValue::bulk("-"),
+            RespValue::bulk("0.5"),
+            RespValue::bulk("5"),
+            RespValue::bulk("50"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert!(!items.is_empty(), "expected at least one cluster");
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_delete_budget_returns_one_when_existed() {
+        let s = Server::new();
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.SET_BUDGET"),
+            RespValue::bulk("acme"),
+            RespValue::bulk("daily"),
+            RespValue::bulk("10.0"),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.DELETE_BUDGET"),
+            RespValue::bulk("acme"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Integer(n)) => assert_eq!(n, 1),
+            other => panic!("expected 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_get_budget_missing_returns_null() {
+        let s = Server::new();
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("COST.GET_BUDGET"),
+            RespValue::bulk("no-such-tenant"),
+        ]));
+        matches!(r, Response::Reply(RespValue::Null));
+    }
+
+    #[test]
+    fn cost_rejected_pre_auth() {
+        let s = Server::new().with_auth("secret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            cost_record_args("acme", "gpt-4o", 1, 1, "0.01", "hi"),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("NOAUTH"), "got: {msg}");
+            }
+            other => panic!("expected NOAUTH, got {other:?}"),
         }
     }
 
