@@ -39,6 +39,23 @@ impl MemoryStore {
         }
     }
 
+    /// Open a fully-persistent store rooted at `dir`. Rows + tantivy
+    /// BM25 index + HNSW dump all live under the directory, so a
+    /// graceful close + reopen skips the index rebuild (sub-second cold
+    /// start on the order of 100k memories).
+    ///
+    /// Hard kills fall back to a row-rebuild path that takes time
+    /// proportional to the corpus size. New in duxxdb v0.1.1.
+    ///
+    /// >>> store = duxxdb.MemoryStore.open_at(dim=4, capacity=100_000, dir="./data/duxx")
+    #[staticmethod]
+    #[pyo3(signature = (dim, capacity, dir))]
+    fn open_at(dim: usize, capacity: usize, dir: &str) -> PyResult<Self> {
+        let inner = RustMemoryStore::open_at(dim, capacity, dir)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
     fn remember(&self, key: &str, text: &str, embedding: Vec<f32>) -> PyResult<u64> {
         if embedding.len() != self.inner.dim() {
             return Err(PyValueError::new_err(format!(
@@ -82,6 +99,49 @@ impl MemoryStore {
             .collect())
     }
 
+    /// Forget one row by id. Returns True if the id existed.
+    /// New in duxxdb v0.1.1.
+    fn forget(&self, id: u64) -> bool {
+        self.inner.forget(id)
+    }
+
+    /// Configure a soft maximum number of rows. When the cap is
+    /// exceeded, every subsequent `remember` evicts the row with the
+    /// lowest decayed importance until the count is back at the cap.
+    /// Pass `None` to disable the cap.
+    /// New in duxxdb v0.1.1.
+    #[pyo3(signature = (cap = None))]
+    fn set_max_rows(&self, cap: Option<usize>) {
+        self.inner.set_max_rows(cap);
+    }
+
+    /// Currently configured row cap, or None if unlimited.
+    /// New in duxxdb v0.1.1.
+    fn max_rows(&self) -> Option<usize> {
+        self.inner.max_rows()
+    }
+
+    /// Set the half-life (in seconds) used by the cap eviction policy
+    /// when weighting effective importance. Default 24h.
+    /// New in duxxdb v0.1.1.
+    fn set_eviction_half_life(&self, seconds: f64) {
+        let nanos = (seconds * 1_000_000_000f64).max(0.0) as u64;
+        self.inner
+            .set_eviction_half_life(Duration::from_nanos(nanos));
+    }
+
+    /// Total number of rows evicted by the cap since process start.
+    /// New in duxxdb v0.1.1.
+    fn evictions_total(&self) -> u64 {
+        self.inner.evictions_total()
+    }
+
+    /// Whether this store is backed by durable on-disk storage.
+    /// New in duxxdb v0.1.1.
+    fn is_persistent(&self) -> bool {
+        self.inner.is_persistent()
+    }
+
     #[getter]
     fn dim(&self) -> usize {
         self.inner.dim()
@@ -93,9 +153,10 @@ impl MemoryStore {
 
     fn __repr__(&self) -> String {
         format!(
-            "<MemoryStore dim={} memories={}>",
+            "<MemoryStore dim={} memories={} persistent={}>",
             self.inner.dim(),
-            self.inner.len()
+            self.inner.len(),
+            self.inner.is_persistent()
         )
     }
 }

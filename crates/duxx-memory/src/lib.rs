@@ -306,7 +306,7 @@ impl MemoryStore {
     /// `by_id` (see below), so an evicted row never appears in
     /// results. Reclaiming the index memory itself requires HNSW
     /// tombstones + tantivy deletes, which is Phase 6.3 work.
-    fn forget(&self, id: u64) -> bool {
+    pub fn forget(&self, id: u64) -> bool {
         let removed = self.inner.by_id.write().remove(&id).is_some();
         if removed {
             if let Some(s) = &self.inner.storage {
