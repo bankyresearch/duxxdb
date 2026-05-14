@@ -228,6 +228,41 @@ graceful drain on rolling restarts — no sidecars required.
 
 ---
 
+## Phase 7.1 — `duxx-trace` ✅ Shipped (v0.1.1)
+
+Agent observability — Span / Trace / Thread primitives that match
+the OTel + OpenInference shape. Six RESP commands surface the API:
+`TRACE.RECORD`, `TRACE.CLOSE`, `TRACE.GET`, `TRACE.SUBTREE`,
+`TRACE.THREAD`, `TRACE.SEARCH`. `PSUBSCRIBE trace.*` for live tail.
+
+In-memory store; persistence + tantivy-backed JSON-attribute search
+land in 7.1b.
+
+duxx-ai side: `DuxxExporter` in `duxx_ai/observability/duxx_exporter.py`
+(merged as PR #2). Plugs into the existing `Tracer` and flushes every
+finished trace via RESP.
+
+## Phase 7.2 — `duxx-prompts` ✅ Shipped
+
+Versioned prompt registry with **semantic search across the catalog**
+(uses DuxxDB's existing embedder — competitors don't ship this).
+
+Capabilities:
+- Monotonic versioning per name (1, 2, 3, … — never reused on delete)
+- Tag aliases (`prod` / `staging` / `experimental`) — operators move
+  a tag to ship a new prompt without touching agent code
+- Semantic search via HNSW + the shared embedder
+- Line-diff between any two versions
+- `PSUBSCRIBE prompt.*` so running agents hot-reload on every put/tag
+
+Nine RESP commands: `PROMPT.PUT`, `PROMPT.GET` (by version or tag),
+`PROMPT.LIST`, `PROMPT.NAMES`, `PROMPT.TAG`, `PROMPT.UNTAG`,
+`PROMPT.DELETE`, `PROMPT.SEARCH`, `PROMPT.DIFF`.
+
+In-memory store; persistence lands in 7.2b alongside trace persistence.
+
+---
+
 ## Phase 6.3+ — Future hardening
 
 Tracked, not yet scheduled.

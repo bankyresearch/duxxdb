@@ -916,6 +916,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "duxx-prompts"
+version = "0.1.1"
+dependencies = [
+ "duxx-core",
+ "duxx-embed",
+ "duxx-index",
+ "duxx-reactive",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "duxx-query"
 version = "0.1.1"
 dependencies = [
@@ -943,6 +959,7 @@ dependencies = [
  "duxx-core",
  "duxx-embed",
  "duxx-memory",
+ "duxx-prompts",
  "duxx-reactive",
  "duxx-storage",
  "duxx-trace",

@@ -15,6 +15,7 @@ members = [
     "crates/duxx-grpc",
     "crates/duxx-coldtier",
     "crates/duxx-trace",
+    "crates/duxx-prompts",
     "bindings/python",
 ]
 # bindings/node is intentionally NOT a workspace member: napi-build
@@ -109,7 +110,8 @@ duxx-query = { path = "crates/duxx-query", version = "0.1.0" }
 duxx-memory = { path = "crates/duxx-memory", version = "0.1.0" }
 duxx-reactive = { path = "crates/duxx-reactive", version = "0.1.0" }
 duxx-embed = { path = "crates/duxx-embed", version = "0.1.0" }
-duxx-trace = { path = "crates/duxx-trace", version = "0.1.0" }
+duxx-trace = { path = "crates/duxx-trace", version = "0.1.1" }
+duxx-prompts = { path = "crates/duxx-prompts", version = "0.1.1" }
 
 # HTTP client for OpenAI / Cohere embedders. rustls-tls = no OpenSSL native build,
 # blocking = sync API matches our embedder trait.

@@ -31,6 +31,7 @@ pub mod tls;
 
 use duxx_embed::{Embedder, HashEmbedder};
 use duxx_memory::{MemoryStore, SessionStore};
+use duxx_prompts::PromptRegistry;
 use duxx_reactive::{ChangeEvent, ChangeKind};
 use duxx_trace::{Span, SpanKind, SpanStatus, TraceSearch, TraceStore};
 use resp::RespValue;
@@ -68,6 +69,11 @@ pub struct Server {
     /// Phase 7.1: in-process agent trace store. Surfaced via the
     /// TRACE.* RESP commands.
     traces: TraceStore,
+    /// Phase 7.2: versioned prompt registry with semantic search.
+    /// Surfaced via the PROMPT.* RESP commands. Shares the same
+    /// embedder as the memory store so prompts compete in the same
+    /// semantic space as memories.
+    prompts: PromptRegistry,
 }
 
 impl std::fmt::Debug for Server {
@@ -90,6 +96,7 @@ impl Server {
     /// Build with an explicit embedder; in-memory only.
     pub fn with_provider(embedder: Arc<dyn Embedder>) -> Self {
         let dim = embedder.dim();
+        let prompts = PromptRegistry::new(embedder.clone());
         Self {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
@@ -100,6 +107,7 @@ impl Server {
             metrics: None,
             tls_config: None,
             traces: TraceStore::new(),
+            prompts,
         }
     }
 
@@ -155,6 +163,7 @@ impl Server {
     ) -> anyhow::Result<Self> {
         let dim = embedder.dim();
         let memory = MemoryStore::with_storage(dim, 100_000, storage)?;
+        let prompts = PromptRegistry::new(embedder.clone());
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -165,6 +174,7 @@ impl Server {
             metrics: None,
             tls_config: None,
             traces: TraceStore::new(),
+            prompts,
         })
     }
 
@@ -177,6 +187,7 @@ impl Server {
     ) -> anyhow::Result<Self> {
         let dim = embedder.dim();
         let memory = MemoryStore::open_at(dim, 100_000, dir)?;
+        let prompts = PromptRegistry::new(embedder.clone());
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
@@ -187,6 +198,7 @@ impl Server {
             metrics: None,
             tls_config: None,
             traces: TraceStore::new(),
+            prompts,
         })
     }
 
@@ -571,6 +583,16 @@ impl Server {
             "TRACE.SUBTREE" => self.cmd_trace_subtree(&args),
             "TRACE.THREAD" => self.cmd_trace_thread(&args),
             "TRACE.SEARCH" => self.cmd_trace_search(&args),
+            // Phase 7.2: versioned prompt registry
+            "PROMPT.PUT" => self.cmd_prompt_put(&args),
+            "PROMPT.GET" => self.cmd_prompt_get(&args),
+            "PROMPT.LIST" => self.cmd_prompt_list(&args),
+            "PROMPT.NAMES" => self.cmd_prompt_names(),
+            "PROMPT.TAG" => self.cmd_prompt_tag(&args),
+            "PROMPT.UNTAG" => self.cmd_prompt_untag(&args),
+            "PROMPT.DELETE" => self.cmd_prompt_delete(&args),
+            "PROMPT.SEARCH" => self.cmd_prompt_search(&args),
+            "PROMPT.DIFF" => self.cmd_prompt_diff(&args),
             other => Response::Reply(err(format!("ERR unknown command '{other}'"))),
         }
     }
@@ -636,6 +658,8 @@ impl Server {
             "REMEMBER", "RECALL", "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
             "TRACE.RECORD", "TRACE.CLOSE", "TRACE.GET", "TRACE.SUBTREE", "TRACE.THREAD",
             "TRACE.SEARCH",
+            "PROMPT.PUT", "PROMPT.GET", "PROMPT.LIST", "PROMPT.NAMES", "PROMPT.TAG",
+            "PROMPT.UNTAG", "PROMPT.DELETE", "PROMPT.SEARCH", "PROMPT.DIFF",
         ];
         let arr: Vec<RespValue> = names.iter().map(|n| RespValue::bulk(*n)).collect();
         Response::Reply(RespValue::Array(arr))
@@ -1051,6 +1075,231 @@ impl Server {
             hits.truncate(filter.limit);
         }
         spans_to_array_reply(hits)
+    }
+
+    // ---------------------------------------------------------------- Phase 7.2: PROMPT.*
+
+    /// Access the underlying PromptRegistry (used by tests / external
+    /// integrations that want to call the typed API directly).
+    pub fn prompts(&self) -> &PromptRegistry {
+        &self.prompts
+    }
+
+    /// `PROMPT.PUT name content [metadata_json]`
+    ///
+    /// Inserts a new version of `name`. The registry assigns a
+    /// monotonic version number (1, 2, 3, ...). `metadata_json` may be
+    /// `"-"` / `""` to mean an empty object. Returns the assigned
+    /// version as an integer reply.
+    fn cmd_prompt_put(&self, args: &[RespValue]) -> Response {
+        if args.len() < 3 {
+            return Response::Reply(err(
+                "ERR PROMPT.PUT expects: name content [metadata_json]",
+            ));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let content = match arg_string(&args[2]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR content must be a string")),
+        };
+        let metadata: serde_json::Value = match args.get(3).and_then(arg_string) {
+            Some("-") | Some("") | None => serde_json::Value::Object(serde_json::Map::new()),
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR metadata_json: {e}"))),
+            },
+        };
+        match self.prompts.put(name, content, metadata) {
+            Ok(version) => Response::Reply(RespValue::Integer(version as i64)),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `PROMPT.GET name [version | tag]`
+    ///
+    /// Without the second argument, returns the latest version. With
+    /// a numeric second argument, returns that exact version. With a
+    /// non-numeric second argument, treats it as a tag.
+    /// Returns the prompt as a single bulk JSON payload (or a nil
+    /// bulk-string when not found).
+    fn cmd_prompt_get(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err("ERR PROMPT.GET expects: name [version|tag]"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let prompt = match args.get(2).and_then(arg_string) {
+            None => self.prompts.get_latest(&name),
+            Some(s) => match s.parse::<u64>() {
+                Ok(v) => self.prompts.get(&name, v),
+                Err(_) => self.prompts.get_by_tag(&name, s),
+            },
+        };
+        match prompt {
+            Some(p) => match serde_json::to_vec(&p) {
+                Ok(bytes) => Response::Reply(RespValue::BulkString(bytes)),
+                Err(e) => Response::Reply(err(format!("ERR encode: {e}"))),
+            },
+            None => Response::Reply(RespValue::Null),
+        }
+    }
+
+    /// `PROMPT.LIST name` — every version of `name`, ascending,
+    /// each as a JSON bulk payload.
+    fn cmd_prompt_list(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR PROMPT.LIST expects: name"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let arr: Vec<RespValue> = self
+            .prompts
+            .list(name)
+            .into_iter()
+            .filter_map(|p| serde_json::to_vec(&p).ok().map(RespValue::BulkString))
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `PROMPT.NAMES` — every prompt name in the registry,
+    /// lexicographic.
+    fn cmd_prompt_names(&self) -> Response {
+        let arr: Vec<RespValue> = self
+            .prompts
+            .names()
+            .into_iter()
+            .map(RespValue::bulk)
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `PROMPT.TAG name version tag` — point `tag` at `version`.
+    /// Moves the tag if it already exists.
+    fn cmd_prompt_tag(&self, args: &[RespValue]) -> Response {
+        if args.len() != 4 {
+            return Response::Reply(err("ERR PROMPT.TAG expects: name version tag"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version must be a positive integer")),
+        };
+        let tag = match arg_string(&args[3]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR tag must be a string")),
+        };
+        match self.prompts.tag(name, version, tag) {
+            Ok(_) => Response::Reply(simple("OK")),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `PROMPT.UNTAG name tag` — remove a tag. Returns the integer 1
+    /// if the tag existed, 0 otherwise.
+    fn cmd_prompt_untag(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err("ERR PROMPT.UNTAG expects: name tag"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let tag = match arg_string(&args[2]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR tag must be a string")),
+        };
+        let removed = self.prompts.untag(name, tag);
+        Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `PROMPT.DELETE name version` — hard-delete one version. The
+    /// version number is NOT reused on subsequent `PROMPT.PUT`.
+    /// Returns 1 if deleted, 0 otherwise.
+    fn cmd_prompt_delete(&self, args: &[RespValue]) -> Response {
+        if args.len() != 3 {
+            return Response::Reply(err("ERR PROMPT.DELETE expects: name version"));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version must be a positive integer")),
+        };
+        let removed = self.prompts.delete(name, version);
+        Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `PROMPT.SEARCH query [k]` — semantic search across the
+    /// catalog. Returns up to `k` hits as nested arrays:
+    /// `[name, version, score_str, content]`.
+    fn cmd_prompt_search(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err("ERR PROMPT.SEARCH expects: query [k]"));
+        }
+        let query = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR query must be a string")),
+        };
+        let k: usize = args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let hits = match self.prompts.search(query, k) {
+            Ok(h) => h,
+            Err(e) => return Response::Reply(err(format!("ERR {e}"))),
+        };
+        let arr: Vec<RespValue> = hits
+            .into_iter()
+            .map(|h| {
+                RespValue::Array(vec![
+                    RespValue::bulk(h.prompt.name),
+                    RespValue::Integer(h.prompt.version as i64),
+                    RespValue::bulk(format!("{:.6}", h.score)),
+                    RespValue::bulk(h.prompt.content),
+                ])
+            })
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `PROMPT.DIFF name version_a version_b` — line diff between
+    /// two versions. Each output line is prefixed with " ", "-",
+    /// or "+".
+    fn cmd_prompt_diff(&self, args: &[RespValue]) -> Response {
+        if args.len() != 4 {
+            return Response::Reply(err(
+                "ERR PROMPT.DIFF expects: name version_a version_b",
+            ));
+        }
+        let name = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR name must be a string")),
+        };
+        let va: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version_a must be a positive integer")),
+        };
+        let vb: u64 = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return Response::Reply(err("ERR version_b must be a positive integer")),
+        };
+        match self.prompts.diff(name, va, vb) {
+            Ok(d) => Response::Reply(RespValue::BulkString(d.into_bytes())),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
     }
 }
 
@@ -1752,6 +2001,187 @@ mod tests {
         let mut authed = false;
         let r = s.dispatch_with_auth(
             trace_record_args("t1", "s1", "-", "agent.run", "-"),
+            false,
+            &mut authed,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => {
+                assert!(msg.contains("NOAUTH"), "got: {msg}");
+            }
+            other => panic!("expected NOAUTH error, got {other:?}"),
+        }
+    }
+
+    // ---------- Phase 7.2: PROMPT.* commands ----------
+
+    fn prompt_put_args(name: &str, content: &str, metadata: &str) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::bulk("PROMPT.PUT"),
+            RespValue::bulk(name),
+            RespValue::bulk(content),
+            RespValue::bulk(metadata),
+        ])
+    }
+
+    #[test]
+    fn prompt_put_returns_monotonic_versions() {
+        let s = Server::new();
+        let v1 = s.dispatch(prompt_put_args("greet", "Hi", "-"));
+        let v2 = s.dispatch(prompt_put_args("greet", "Hi!", "-"));
+        match (v1, v2) {
+            (
+                Response::Reply(RespValue::Integer(a)),
+                Response::Reply(RespValue::Integer(b)),
+            ) => {
+                assert_eq!((a, b), (1, 2));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_get_returns_latest_by_default() {
+        let s = Server::new();
+        s.dispatch(prompt_put_args("g", "first", "-"));
+        s.dispatch(prompt_put_args("g", "second", "-"));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("PROMPT.GET"),
+            RespValue::bulk("g"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"content\":\"second\""));
+                assert!(body.contains("\"version\":2"));
+            }
+            other => panic!("expected bulk JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_get_by_tag_resolves_alias() {
+        let s = Server::new();
+        s.dispatch(prompt_put_args("g", "first", "-"));
+        s.dispatch(prompt_put_args("g", "second", "-"));
+        s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("PROMPT.TAG"),
+            RespValue::bulk("g"),
+            RespValue::bulk("1"),
+            RespValue::bulk("prod"),
+        ]));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("PROMPT.GET"),
+            RespValue::bulk("g"),
+            RespValue::bulk("prod"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("\"content\":\"first\""));
+            }
+            other => panic!("expected bulk JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_get_missing_returns_null() {
+        let s = Server::new();
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("PROMPT.GET"),
+            RespValue::bulk("does-not-exist"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Null) => {}
+            other => panic!("expected Null, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_list_returns_all_versions() {
+        let s = Server::new();
+        for _ in 0..3 {
+            s.dispatch(prompt_put_args("g", "x", "-"));
+        }
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("PROMPT.LIST"),
+            RespValue::bulk("g"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert_eq!(items.len(), 3);
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_search_finds_semantically_close_prompts() {
+        let s = Server::new();
+        s.dispatch(prompt_put_args("a", "hello world how are you", "-"));
+        s.dispatch(prompt_put_args("b", "goodbye see you later", "-"));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("PROMPT.SEARCH"),
+            RespValue::bulk("hello world"),
+            RespValue::bulk("1"),
+        ]));
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert!(!items.is_empty());
+                if let RespValue::Array(first) = &items[0] {
+                    // First hit should be prompt "a" which contains "hello"
+                    if let RespValue::BulkString(name_bytes) = &first[0] {
+                        assert_eq!(name_bytes.as_slice(), b"a");
+                    }
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_delete_does_not_reuse_version_number() {
+        let s = Server::new();
+        s.dispatch(prompt_put_args("g", "v1", "-"));
+        s.dispatch(prompt_put_args("g", "v2", "-"));
+        let _ = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("PROMPT.DELETE"),
+            RespValue::bulk("g"),
+            RespValue::bulk("2"),
+        ]));
+        let r = s.dispatch(prompt_put_args("g", "v3", "-"));
+        match r {
+            Response::Reply(RespValue::Integer(v)) => assert_eq!(v, 3),
+            other => panic!("expected version=3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_diff_marks_added_and_removed_lines() {
+        let s = Server::new();
+        s.dispatch(prompt_put_args("g", "line a\nshared\nline c", "-"));
+        s.dispatch(prompt_put_args("g", "line a\nshared\nNEW line", "-"));
+        let r = s.dispatch(RespValue::Array(vec![
+            RespValue::bulk("PROMPT.DIFF"),
+            RespValue::bulk("g"),
+            RespValue::bulk("1"),
+            RespValue::bulk("2"),
+        ]));
+        match r {
+            Response::Reply(RespValue::BulkString(bytes)) => {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.contains("-line c"), "missing removed line, got:\n{body}");
+                assert!(body.contains("+NEW line"), "missing added line, got:\n{body}");
+            }
+            other => panic!("expected bulk diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_rejected_pre_auth() {
+        let s = Server::new().with_auth("secret");
+        let mut authed = false;
+        let r = s.dispatch_with_auth(
+            prompt_put_args("g", "hi", "-"),
             false,
             &mut authed,
         );
