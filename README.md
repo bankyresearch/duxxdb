@@ -44,6 +44,41 @@ DuxxDB just spoke RESP — `redis-cli`, `valkey-cli`, `redis-rs`,
 
 ---
 
+## The Duxx Stack
+
+DuxxDB is the **storage engine** half. The **framework** half is
+[**duxx-ai**](https://github.com/bankyresearch/duxx-ai) — an
+Apache 2.0 Python SDK for building, fine-tuning, orchestrating, and
+governing AI agents:
+
+```
+   ┌─ duxx-ai (Python) ────────────────────────────────────┐
+   │  agents · graph · crew · tools · memory · guardrails  │
+   │  RBAC · observability · fine-tune · adaptive routing  │
+   └────────────────────┬──────────────────────────────────┘
+                        │ uses (memory / traces / prompts / eval / cost)
+   ┌────────────────────▼──────────────────────────────────┐
+   │  DuxxDB (Rust) — storage + retrieval + observability  │
+   │  hybrid recall · TLS · MCP · gRPC · RESP · Parquet    │
+   └───────────────────────────────────────────────────────┘
+```
+
+| You're building... | Reach for |
+|---|---|
+| The agent itself (Python) | [`duxx-ai`](https://pypi.org/project/duxx-ai/) — agents, crews, tools, governance |
+| The storage / retrieval layer | **`duxxdb`** (this repo) — single binary, six client surfaces |
+| Both together | `pip install duxx-ai duxxdb` — the full Apache 2.0 agent stack |
+
+**Why one stack, two projects?** Rust gets you sub-ms hybrid recall +
+TLS + multi-platform binaries. Python gets you the agent-developer
+ecosystem (LangChain integrations, LLM SDKs, ML libraries). Each side
+plays to its strengths; they ship independently with semver.
+
+LangChain ↔ LangSmith is the closest analogy in the proprietary world.
+Duxx is the Apache 2.0 counterpart.
+
+---
+
 ## Why DuxxDB?
 
 A typical agent stack today glues three databases together:
@@ -294,6 +329,7 @@ patterns: [docs/PROJECT_OVERVIEW.md § 8](docs/PROJECT_OVERVIEW.md#8-competitive
 | [INSTALLATION.md](docs/INSTALLATION.md) | Picking install method per OS |
 | [USER_GUIDE.md](docs/USER_GUIDE.md) | Writing client code in any of 6 languages |
 | [INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md) | Wiring DuxxDB into a chatbot, voice bot, or autonomous agent (with diagrams) |
+| [DUXX_STACK_INTEGRATION.md](docs/DUXX_STACK_INTEGRATION.md) | How **duxx-ai** (Python framework) plugs into DuxxDB — backend protocol, API contracts, deployment shapes |
 | [FAQ.md](docs/FAQ.md) | "Is DuxxDB right for me?" — when to use, when not to, framework support, migration |
 | [PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md) | Pitching DuxxDB to a teammate / making a build-vs-buy call |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Understanding the internals before contributing |

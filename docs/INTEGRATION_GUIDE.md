@@ -12,6 +12,7 @@ Postgres / Redis / vector DB.
 
 ## Table of contents
 
+- [The Duxx Stack — duxx-ai + DuxxDB](#the-duxx-stack--duxx-ai--duxxdb) ★ start here for Python users
 - [The 30-second mental model](#the-30-second-mental-model)
 - **Wiring recipes**
   - [1. Hello, agent (Python, no framework)](#1-hello-agent-python-no-framework)
@@ -29,6 +30,116 @@ Postgres / Redis / vector DB.
   - [Pinecone → DuxxDB](#migration-pinecone--duxxdb)
   - [Qdrant → DuxxDB](#migration-qdrant--duxxdb)
   - [Redis + Qdrant + Postgres → DuxxDB](#migration-three-stores--one)
+
+---
+
+## The Duxx Stack — duxx-ai + DuxxDB
+
+For Python developers building agents, **the fastest path is the Duxx
+Stack:**
+[`duxx-ai`](https://github.com/bankyresearch/duxx-ai) as the framework,
+DuxxDB as the storage + retrieval engine underneath.
+
+```mermaid
+flowchart TB
+    subgraph App["Your application (Python)"]
+        A["from duxx_ai import Agent, Crew, MemoryManager"]
+    end
+
+    subgraph DA["duxx-ai (pip install duxx-ai)"]
+        AG["Agents · Crew · Graph"]
+        TL["40+ Tools (email, calendar, DB, API, ...)"]
+        ME["MemoryManager (5-tier)"]
+        GV["Governance · RBAC · Guardrails"]
+        OB["Observability (Tracer, Evaluator)"]
+        RR["Adaptive Router · Fine-tune"]
+    end
+
+    subgraph DB["DuxxDB (pip install duxxdb)"]
+        MS["MemoryStore (hybrid recall)"]
+        TC["ToolCache (semantic-near-hit)"]
+        SS["SessionStore"]
+        TS["TraceStore (Phase 7.1)"]
+        PR["PromptRegistry (Phase 7.2)"]
+        EV["EvalStore (Phase 7.4)"]
+        CL["CostLedger (Phase 7.6)"]
+    end
+
+    A --> AG
+    AG --> ME
+    AG --> TL
+    AG --> GV
+    AG --> OB
+    AG --> RR
+    ME -.->|backend=DuxxBackend| MS
+    TL -.->|cache=DuxxBackend|   TC
+    ME -.->|sessions|            SS
+    OB -.->|traces (planned)|    TS
+    OB -.->|evals (planned)|     EV
+    RR -.->|cost ledger (planned)| CL
+```
+
+### Why pair them
+
+|  | duxx-ai alone | DuxxDB alone | duxx-ai + DuxxDB |
+|---|---|---|---|
+| Agent orchestration | ✅ | (use any framework) | ✅ |
+| Multi-tier memory | ✅ in-memory + JSON files | ✅ persistent + hybrid recall | ✅ persistent + agent-aware |
+| Sub-ms recall | ✗ Python dicts only | ✅ HNSW + BM25 + RRF | ✅ |
+| Survives restart | only with manual save | ✅ `dir:` backend | ✅ |
+| MCP server (Claude Desktop) | ✗ | ✅ | ✅ via DuxxDB |
+| TLS + auth + Prometheus | ✗ | ✅ Phase 6.2 | ✅ |
+| OTLP traces (planned) | basic Python tracer | ✅ Phase 7.1 | ✅ |
+| Enterprise governance | ✅ guardrails + RBAC | (token auth only) | ✅ both layers |
+
+### Quickstart — Duxx Stack hello-agent
+
+```python
+# pip install duxx-ai duxxdb
+from duxx_ai import Agent
+from duxx_ai.memory import MemoryManager
+# When the DuxxBackend lands in duxx-ai (~this week):
+# from duxx_ai.memory.storage import DuxxBackend
+# memory = MemoryManager(backend=DuxxBackend(dim=1536,
+#                                            storage="dir:./.duxxdb"))
+
+# Today's path -- direct DuxxDB use from duxx-ai:
+import duxxdb
+store = duxxdb.MemoryStore(dim=1536)
+
+agent = Agent(
+    name="support_agent",
+    instructions="You are a refund-support agent.",
+    memory=store,                # <- DuxxDB is the memory backend
+)
+
+reply = agent.run("I want a refund for order #9910")
+print(reply)
+```
+
+After the `DuxxBackend` swap-in ships in duxx-ai, the line becomes
+one configuration call and you get persistence + hybrid recall + decay
++ eviction for free.
+
+### Operationally
+
+```bash
+# Run DuxxDB as the shared storage daemon for a fleet of agents:
+docker run -d --name duxxdb -p 6379:6379 \
+  -v duxxdb-data:/var/lib/duxxdb \
+  -e DUXX_STORAGE=dir:/var/lib/duxxdb \
+  -e DUXX_TOKEN="$(openssl rand -hex 32)" \
+  ghcr.io/bankyresearch/duxxdb:latest
+
+# All duxx-ai workers point at the same daemon:
+export DUXXDB_URL="redis://:<token>@duxxdb:6379"
+python my_agent_worker.py
+```
+
+Same setup scales: one daemon serves N agents, all with persistent
+shared memory, audit-traceable RBAC, and the standard ops surface.
+
+---
 
 ---
 
