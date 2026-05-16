@@ -53,6 +53,7 @@ use duxx_storage::{Backend, BatchOp, MemoryBackend, key};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -72,6 +73,12 @@ mod tables {
     /// delete + restart. The counter is monotonic across the
     /// lifetime of a registry, not the lifetime of a process.
     pub const NEXT_VERSION: &str = "next_version";
+    /// `internal_id_be8` -> JSON((name, version))
+    ///
+    /// Lets ``open(.., vector_index_dir=Some(...))`` load the HNSW
+    /// dump and resurrect the registry's id-to-key map without
+    /// re-embedding every prompt. New in v0.2.2.
+    pub const ID_TO_KEY: &str = "prompts.id_to_key";
 }
 
 /// Encode a u64 as 8 big-endian bytes. Keeps lexicographic order
@@ -231,24 +238,44 @@ impl PromptRegistry {
         Self::open(embedder, backend).expect("MemoryBackend cannot fail open")
     }
 
-    /// Build a registry backed by the given persistence layer.
+    /// Build a registry backed by the given persistence layer. The
+    /// HNSW vector index is rebuilt by re-embedding every persisted
+    /// prompt — fine for prompt-catalog scale (~100s of rows).
     ///
-    /// On open, the registry scans the backend's `prompts`, `tags`,
-    /// and `next_version` tables to rebuild in-memory state. The
-    /// HNSW vector index is rebuilt from scratch by re-embedding
-    /// every persisted prompt's content. For prompts this is fine
-    /// (typically <1000 rows); larger primitives like datasets and
-    /// evals will use a different rebuild strategy that persists
-    /// the embeddings themselves.
+    /// For million-row workloads or when restart latency matters,
+    /// use [`PromptRegistry::open_with_index_dir`] to plug in a
+    /// directory that holds the persisted HNSW dump.
     pub fn open(embedder: Arc<dyn Embedder>, backend: Arc<dyn Backend>) -> Result<Self> {
+        Self::open_with_index_dir(embedder, backend, None)
+    }
+
+    /// Like [`PromptRegistry::open`] but also persists the HNSW
+    /// vector index under ``vector_index_dir``. The directory is
+    /// created if it doesn't exist. On graceful drop the HNSW is
+    /// dumped back; on the next ``open_with_index_dir`` the dump is
+    /// loaded directly and the re-embedding rebuild is skipped
+    /// (sub-second cold start on ~1M rows).
+    ///
+    /// Hard kills fall back to the re-embedding rebuild path because
+    /// ``Drop`` doesn't run. New in v0.2.2.
+    pub fn open_with_index_dir(
+        embedder: Arc<dyn Embedder>,
+        backend: Arc<dyn Backend>,
+        vector_index_dir: Option<&Path>,
+    ) -> Result<Self> {
         let dim = embedder.dim();
+        let vector_index = match vector_index_dir {
+            Some(dir) => VectorIndex::open(dim, 10_000, dir)
+                .map_err(|e| PromptError::Embed(format!("vector index open: {e}")))?,
+            None => VectorIndex::with_capacity(dim, 10_000),
+        };
         let inner = Inner {
             by_id: RwLock::new(HashMap::new()),
             versions: RwLock::new(HashMap::new()),
             next_version: RwLock::new(HashMap::new()),
             tags: RwLock::new(HashMap::new()),
             embedder,
-            vector_index: RwLock::new(VectorIndex::with_capacity(dim, 10_000)),
+            vector_index: RwLock::new(vector_index),
             id_to_key: RwLock::new(HashMap::new()),
             next_internal_id: RwLock::new(1),
             bus: ChangeBus::default(),
@@ -261,9 +288,29 @@ impl PromptRegistry {
         Ok(me)
     }
 
+    /// Flush the HNSW vector index to disk if a persist directory
+    /// was configured. No-op otherwise. Called automatically on
+    /// graceful drop via ``Drop``; callers can also invoke it
+    /// explicitly to checkpoint mid-run.
+    pub fn flush_indices(&self) -> Result<()> {
+        self.inner
+            .vector_index
+            .read()
+            .dump()
+            .map(|_| ())
+            .map_err(|e| PromptError::Embed(format!("vector index dump: {e}")))
+    }
+
     /// Walk the backend tables and rebuild every in-memory map +
     /// the HNSW vector index. Called once from `open`.
     fn rehydrate(&self) -> Result<()> {
+        // Fast path: HNSW was loaded from disk by `VectorIndex::open`.
+        // Skip the per-prompt embed + insert step; the index is
+        // already populated. We still need to scan the prompts /
+        // id_to_key tables to rebuild the in-memory by_id / versions
+        // / id_to_key maps.
+        let skip_reembed = self.inner.vector_index.read().was_loaded_from_disk();
+
         // ---- prompts table ----
         let prompts = self
             .inner
@@ -290,25 +337,64 @@ impl PromptRegistry {
                 .entry(prompt.name.clone())
                 .or_default()
                 .push(prompt.version);
-            // Re-embed and re-insert into the HNSW. Re-embedding is
-            // deterministic for any reasonable Embedder, so the
-            // index rebuilds identically across restarts.
-            let emb = self
-                .inner
-                .embedder
-                .embed(&prompt.content)
-                .map_err(|e| PromptError::Embed(e.to_string()))?;
-            let internal_id = self.bump_internal_id();
-            self.inner
-                .vector_index
-                .write()
-                .insert(internal_id, emb)
-                .map_err(|e| PromptError::Embed(format!("vector index: {e}")))?;
-            self.inner.id_to_key.write().insert(internal_id, key);
+            // SLOW PATH ONLY: re-embed and re-insert. Re-embedding
+            // is deterministic for any reasonable Embedder, so the
+            // index rebuilds identically across restarts. When the
+            // HNSW dump was loaded from disk we skip this entirely.
+            if !skip_reembed {
+                let emb = self
+                    .inner
+                    .embedder
+                    .embed(&prompt.content)
+                    .map_err(|e| PromptError::Embed(e.to_string()))?;
+                let internal_id = self.bump_internal_id();
+                self.inner
+                    .vector_index
+                    .write()
+                    .insert(internal_id, emb)
+                    .map_err(|e| PromptError::Embed(format!("vector index: {e}")))?;
+                self.inner.id_to_key.write().insert(internal_id, key);
+                // Persist the id-to-key mapping so a future load-from-disk
+                // can resurrect this table even after a hard kill.
+                self.persist_id_to_key(internal_id, &prompt.name, prompt.version)
+                    .ok(); // best-effort
+            }
         }
         // Sort each name's version list now that every row is in.
         for list in self.inner.versions.write().values_mut() {
             list.sort_unstable();
+        }
+
+        // FAST PATH: load id_to_key from the dedicated backend table
+        // so the registry can resolve HNSW search hits back to
+        // (name, version) without having re-embedded anything.
+        if skip_reembed {
+            let id_rows = self
+                .inner
+                .backend
+                .scan(tables::ID_TO_KEY)
+                .map_err(|e| PromptError::Embed(format!("backend scan id_to_key: {e}")))?;
+            let mut max_internal = 0u64;
+            for (key_bytes, value_bytes) in id_rows {
+                let internal_id = match be_to_u64(&key_bytes) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let parsed: (String, u64) =
+                    match serde_json::from_slice(&value_bytes) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                if internal_id > max_internal {
+                    max_internal = internal_id;
+                }
+                self.inner.id_to_key.write().insert(internal_id, parsed);
+            }
+            // Resume the internal-id counter above the highest restored id.
+            if max_internal > 0 {
+                let mut n = self.inner.next_internal_id.write();
+                *n = max_internal + 1;
+            }
         }
         // ---- tags table ----
         let tags = self
@@ -358,6 +444,18 @@ impl PromptRegistry {
         let v = *n;
         *n += 1;
         v
+    }
+
+    /// Persist one ``(internal_id, (name, version))`` row so future
+    /// ``open_with_index_dir`` calls can rebuild ``id_to_key``
+    /// without re-embedding every prompt.
+    fn persist_id_to_key(&self, internal_id: u64, name: &str, version: u64) -> Result<()> {
+        let payload = serde_json::to_vec(&(name, version))
+            .map_err(|e| PromptError::Embed(format!("id_to_key encode: {e}")))?;
+        self.inner
+            .backend
+            .put(tables::ID_TO_KEY, &internal_id.to_be_bytes(), &payload)
+            .map_err(|e| PromptError::Embed(format!("backend put id_to_key: {e}")))
     }
 
     /// Subscribe to change events. Each `put` / `tag` / `untag` /
@@ -442,6 +540,10 @@ impl PromptRegistry {
             .insert(internal_id, emb)
             .map_err(|e| PromptError::Embed(format!("vector index: {e}")))?;
         self.inner.id_to_key.write().insert(internal_id, key.clone());
+        // Persist the id-to-key row so a future graceful-reopen can
+        // resurrect this entry from the HNSW dump without touching
+        // the embedder.
+        self.persist_id_to_key(internal_id, &key.0, key.1).ok();
 
         self.inner.by_id.write().insert(key, prompt);
         self.inner.bus.publish(ChangeEvent {
@@ -609,11 +711,31 @@ impl PromptRegistry {
                 });
                 victims
             };
-            // Drop the row + every tag pointing at it in one
-            // backend batch. We intentionally leave the
-            // next_version counter alone — version numbers must
-            // not be reused.
-            let mut ops: Vec<BatchOp> = Vec::with_capacity(1 + dropped_tags.len());
+            // Also strip any (internal_id -> this key) rows. Done
+            // in-memory; the disk equivalent is swept further below.
+            let dropped_internal_ids: Vec<u64> = {
+                let mut m = self.inner.id_to_key.write();
+                let victims: Vec<u64> = m
+                    .iter()
+                    .filter_map(|(iid, (n, v))| {
+                        if n == name && *v == version {
+                            Some(*iid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for iid in &victims {
+                    m.remove(iid);
+                }
+                victims
+            };
+            // Drop the row + every tag pointing at it + the
+            // id_to_key rows in one backend batch. We intentionally
+            // leave the next_version counter alone — version numbers
+            // must not be reused.
+            let mut ops: Vec<BatchOp> =
+                Vec::with_capacity(1 + dropped_tags.len() + dropped_internal_ids.len());
             ops.push(BatchOp::Delete {
                 table: tables::PROMPTS.into(),
                 key: key::two(name.as_bytes(), &u64_to_be(version)),
@@ -622,6 +744,12 @@ impl PromptRegistry {
                 ops.push(BatchOp::Delete {
                     table: tables::TAGS.into(),
                     key: key::two(name.as_bytes(), t.as_bytes()),
+                });
+            }
+            for iid in dropped_internal_ids {
+                ops.push(BatchOp::Delete {
+                    table: tables::ID_TO_KEY.into(),
+                    key: iid.to_be_bytes().to_vec(),
                 });
             }
             if let Err(e) = self.inner.backend.batch(&ops) {
@@ -1037,5 +1165,113 @@ mod tests {
         }
         let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();
         assert!(r.get_by_tag("g", "prod").is_none());
+    }
+
+    /// Counts how many times its inner embedder is called.
+    ///
+    /// Used to assert that the HNSW fast-load path on reopen does NOT
+    /// re-embed every persisted prompt.
+    struct CountingEmbedder {
+        inner: HashEmbedder,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingEmbedder {
+        fn new(dim: usize) -> Self {
+            Self {
+                inner: HashEmbedder::new(dim),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl duxx_embed::Embedder for CountingEmbedder {
+        fn embed(&self, text: &str) -> duxx_core::Result<Vec<f32>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.embed(text)
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+    }
+
+    #[test]
+    fn persistent_hnsw_dump_skips_reembed_on_reopen() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let tmp = tempdir("prompts-hnsw");
+
+        // First lifetime: write 5 prompts. Drop the registry to
+        // trigger VectorIndex::Drop → file_dump.
+        let embedder1 = Arc::new(CountingEmbedder::new(16));
+        {
+            let r = PromptRegistry::open_with_index_dir(
+                embedder1.clone(),
+                backend.clone(),
+                Some(tmp.as_path()),
+            )
+            .unwrap();
+            for i in 0..5 {
+                r.put("g", format!("v{i}"), serde_json::json!({})).unwrap();
+            }
+            // The put path embeds N=5 prompts; the query embed in
+            // search() is the +1 we measure below.
+            let _ = r.search("v0", 1).unwrap();
+        }
+        assert_eq!(
+            embedder1.count(),
+            6,
+            "first lifetime should embed N puts + 1 search query"
+        );
+
+        // Second lifetime: reopen against the SAME backend AND the
+        // SAME dump dir. The fast-load path should kick in:
+        // re-embedding count stays at exactly 1 (just the query).
+        let embedder2 = Arc::new(CountingEmbedder::new(16));
+        let r = PromptRegistry::open_with_index_dir(
+            embedder2.clone(),
+            backend.clone(),
+            Some(tmp.as_path()),
+        )
+        .unwrap();
+        let hits = r.search("v3", 5).unwrap();
+        assert!(!hits.is_empty(), "search returned nothing after reopen");
+        assert_eq!(
+            embedder2.count(),
+            1,
+            "fast-load path should embed ONLY the query, not the 5 persisted prompts"
+        );
+
+        // The whole 5-version history must still resolve through
+        // id_to_key, including the search hits.
+        for i in 0..5 {
+            let p = r.get("g", i + 1).unwrap();
+            assert_eq!(p.content, format!("v{i}"));
+        }
+    }
+
+    /// Cross-platform tempdir helper that auto-cleans on drop. We
+    /// avoid the `tempfile` crate to keep dev-deps minimal.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn as_path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tempdir(tag: &str) -> TempDir {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("duxx-prompts-{tag}-{nanos}"));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
     }
 }
