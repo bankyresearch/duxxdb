@@ -16,7 +16,7 @@ Postgres / Redis / vector DB.
 - [The 30-second mental model](#the-30-second-mental-model)
 - **Wiring recipes**
   - [1. Hello, agent (Python, no framework)](#1-hello-agent-python-no-framework)
-  - [2. Chatbot with LangChain](#2-chatbot-with-langchain)
+  - [2. Chatbot with a framework that speaks Redis](#2-chatbot-with-a-framework-that-speaks-redis)
   - [3. Chatbot with Vercel AI SDK (Node)](#3-chatbot-with-vercel-ai-sdk-node)
   - [4. Voice bot with Pipecat / LiveKit](#4-voice-bot-with-pipecat--livekit)
   - [5. MCP — Claude Desktop / Cline / Cursor](#5-mcp--claude-desktop--cline--cursor)
@@ -223,23 +223,28 @@ gymnastics.
 
 ---
 
-### 2. Chatbot with LangChain
+### 2. Chatbot with a framework that speaks Redis
 
-LangChain is library-level; DuxxDB is the **store underneath**.
-Two adapter points cover most use cases:
+Any agent framework whose memory adapters accept a Redis URL can use
+DuxxDB as the backing store with **no code changes** — DuxxDB is
+RESP2/3 wire-compatible. The same recipe works for LangChain,
+LlamaIndex, Mastra, and any other framework that ships a Redis
+backend. Two adapter points cover most chatbots:
 
 ```mermaid
 flowchart LR
-    A[LangChain agent] -->|"add_user_message<br/>add_ai_message"| H[ChatMessageHistory]
+    A[Your agent] -->|"add_user_message<br/>add_ai_message"| H[ChatMessageHistory]
     A -->|"similarity_search"| V[VectorStore]
     H -.-> R[(DuxxDB / RESP)]
     V -.-> R
 ```
 
-- **`ChatMessageHistory`** → use the built-in `RedisChatMessageHistory`
+- **`ChatMessageHistory`** → use your framework's `RedisChatMessageHistory`
   pointing at DuxxDB (it speaks RESP, so no code change needed).
-- **`VectorStore`** → use the LangChain `Redis` vector store the same
-  way (RESP-compatible).
+- **`VectorStore`** → use the framework's Redis-backed vector store
+  the same way (RESP-compatible).
+
+Worked example with one popular framework:
 
 ```python
 # pip install langchain langchain-community langchain-openai redis
@@ -249,23 +254,24 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
 DUXX_URL = "redis://:" + os.environ["DUXX_TOKEN"] + "@localhost:6379"
 
-# Chat history (sessions): drop-in.
+# Chat history (sessions): use the existing Redis adapter, point at DuxxDB.
 history = RedisChatMessageHistory(session_id="alice", url=DUXX_URL)
 
-# Vector store (long-term memory): also drop-in.
+# Vector store (long-term memory): same idea — the existing Redis
+# adapter, pointed at DuxxDB.
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 vec_store  = Redis(redis_url=DUXX_URL, index_name="memory",
                    embedding=embeddings)
 
-# Use them in any LangChain chain / agent like you normally would.
+# Use them in any chain / agent the same way you normally would.
 ```
 
-You get LangChain's ecosystem (RetrievalQA, agents, tools) on top of
-a single DuxxDB binary instead of Redis-stack + a separate vector
-DB.
+Your framework's ecosystem (retrieval chains, agents, tools) keeps
+working — the difference is that chat history and the vector store
+both live in a single DuxxDB binary with hybrid recall built in.
 
-> **Why this works:** DuxxDB is RESP2/3 wire-compatible. Anywhere the
-> docs say "Redis URL", paste a DuxxDB URL.
+> **Why this works:** DuxxDB is RESP2/3 wire-compatible. Anywhere a
+> framework's docs say "Redis URL", paste a DuxxDB URL.
 
 ---
 

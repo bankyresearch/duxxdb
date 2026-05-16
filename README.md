@@ -71,11 +71,9 @@ governing AI agents:
 
 **Why one stack, two projects?** Rust gets you sub-ms hybrid recall +
 TLS + multi-platform binaries. Python gets you the agent-developer
-ecosystem (LangChain integrations, LLM SDKs, ML libraries). Each side
+ergonomics — typed primitives, LLM SDKs, tools, governance — without
+dragging C++ deployment headaches into the storage tier. Each side
 plays to its strengths; they ship independently with semver.
-
-LangChain ↔ LangSmith is the closest analogy in the proprietary world.
-Duxx is the Apache 2.0 counterpart.
 
 ---
 
