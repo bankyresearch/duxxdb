@@ -35,6 +35,7 @@
 use duxx_embed::Embedder;
 use duxx_index::vector::VectorIndex;
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
+use duxx_storage::{Backend, BatchOp, MemoryBackend, key};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,33 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+/// Backend table names.
+mod tables {
+    /// `(name, version_be)` -> JSON(Dataset)
+    pub const DATASETS: &str = "dataset.versions";
+    /// `(name, tag)` -> version_be
+    pub const TAGS: &str = "dataset.tags";
+    /// `name` -> next_version_be
+    pub const NEXT_VERSION: &str = "dataset.next_version";
+    /// `name` -> JSON(schema)
+    pub const SCHEMAS: &str = "dataset.schemas";
+}
+
+#[inline]
+fn u64_to_be(v: u64) -> [u8; 8] {
+    v.to_be_bytes()
+}
+
+#[inline]
+fn be_to_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Some(u64::from_be_bytes(arr))
+}
 
 /// Errors surfaced by the dataset registry.
 #[derive(Debug, Error)]
@@ -208,6 +236,9 @@ struct Inner {
     id_to_key: RwLock<HashMap<u64, (DatasetName, DatasetVersion, String)>>,
     next_internal_id: RwLock<u64>,
     bus: ChangeBus,
+    /// Durable backend. Always present; v0.1.x semantics preserved
+    /// by plugging in a fresh ``MemoryBackend`` from ``new``.
+    backend: Arc<dyn Backend>,
 }
 
 impl std::fmt::Debug for DatasetRegistry {
@@ -223,10 +254,20 @@ impl std::fmt::Debug for DatasetRegistry {
 }
 
 impl DatasetRegistry {
-    /// Build a registry that uses `embedder` for semantic row search.
+    /// Build a non-persistent registry. Equivalent to
+    /// ``open(embedder, MemoryBackend::new())``.
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        Self::open(embedder, backend).expect("MemoryBackend cannot fail open")
+    }
+
+    /// Build a registry backed by the given persistence layer. On
+    /// open, scans the four backend tables (datasets / tags /
+    /// next_version / schemas) and re-embeds every row across every
+    /// version to rebuild the catalog-wide HNSW.
+    pub fn open(embedder: Arc<dyn Embedder>, backend: Arc<dyn Backend>) -> Result<Self> {
         let dim = embedder.dim();
-        Self {
+        let me = Self {
             inner: Arc::new(Inner {
                 by_id: RwLock::new(HashMap::new()),
                 versions: RwLock::new(HashMap::new()),
@@ -238,8 +279,121 @@ impl DatasetRegistry {
                 id_to_key: RwLock::new(HashMap::new()),
                 next_internal_id: RwLock::new(1),
                 bus: ChangeBus::default(),
+                backend,
             }),
+        };
+        me.rehydrate()?;
+        Ok(me)
+    }
+
+    fn rehydrate(&self) -> Result<()> {
+        // datasets
+        let rows = self
+            .inner
+            .backend
+            .scan(tables::DATASETS)
+            .map_err(|e| DatasetError::Embed(format!("backend scan datasets: {e}")))?;
+        for (_k, value_bytes) in rows {
+            let dataset: Dataset = serde_json::from_slice(&value_bytes)
+                .map_err(|e| DatasetError::Embed(format!("dataset decode: {e}")))?;
+            let key_tuple = (dataset.name.clone(), dataset.version);
+            // Re-embed every row to rebuild the HNSW.
+            for row in &dataset.rows {
+                let emb = self
+                    .inner
+                    .embedder
+                    .embed(&row.text)
+                    .map_err(|e| DatasetError::Embed(e.to_string()))?;
+                let internal_id = self.next_internal_id_bump();
+                self.inner
+                    .vector_index
+                    .write()
+                    .insert(internal_id, emb)
+                    .map_err(|e| DatasetError::Embed(format!("vector index: {e}")))?;
+                self.inner.id_to_key.write().insert(
+                    internal_id,
+                    (dataset.name.clone(), dataset.version, row.id.clone()),
+                );
+            }
+            self.inner.by_id.write().insert(
+                key_tuple.clone(),
+                Dataset {
+                    tags: Vec::new(),
+                    ..dataset.clone()
+                },
+            );
+            self.inner
+                .versions
+                .write()
+                .entry(dataset.name.clone())
+                .or_default()
+                .push(dataset.version);
         }
+        for list in self.inner.versions.write().values_mut() {
+            list.sort_unstable();
+        }
+        // tags
+        let tags = self
+            .inner
+            .backend
+            .scan(tables::TAGS)
+            .map_err(|e| DatasetError::Embed(format!("backend scan tags: {e}")))?;
+        for (key_bytes, value_bytes) in tags {
+            let mut parts = key_bytes.splitn(2, |b| *b == 0);
+            let name = match parts.next().map(|b| std::str::from_utf8(b).ok()) {
+                Some(Some(s)) => s.to_string(),
+                _ => continue,
+            };
+            let tag = match parts.next().map(|b| std::str::from_utf8(b).ok()) {
+                Some(Some(s)) => s.to_string(),
+                _ => continue,
+            };
+            let version = match be_to_u64(&value_bytes) {
+                Some(v) => v,
+                None => continue,
+            };
+            self.inner.tags.write().insert((name, tag), version);
+        }
+        // next_version
+        let counters = self
+            .inner
+            .backend
+            .scan(tables::NEXT_VERSION)
+            .map_err(|e| DatasetError::Embed(format!("backend scan counters: {e}")))?;
+        for (key_bytes, value_bytes) in counters {
+            let name = match std::str::from_utf8(&key_bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            };
+            let next = match be_to_u64(&value_bytes) {
+                Some(v) => v,
+                None => continue,
+            };
+            self.inner.next_version.write().insert(name, next);
+        }
+        // schemas
+        let schemas = self
+            .inner
+            .backend
+            .scan(tables::SCHEMAS)
+            .map_err(|e| DatasetError::Embed(format!("backend scan schemas: {e}")))?;
+        for (key_bytes, value_bytes) in schemas {
+            let name = match std::str::from_utf8(&key_bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            };
+            let schema: serde_json::Value = serde_json::from_slice(&value_bytes)
+                .unwrap_or(serde_json::Value::Null);
+            self.inner.schemas.write().insert(name, schema);
+        }
+        Ok(())
+    }
+
+    fn next_internal_id_bump(&self) -> u64 {
+        let mut n = self.inner.next_internal_id.write();
+        let v = *n;
+        *n += 1;
+        v
     }
 
     /// Subscribe to change events. Each `create` / `add` / `tag` /
@@ -255,6 +409,12 @@ impl DatasetRegistry {
     /// every existing version.
     pub fn create(&self, name: impl Into<String>, schema: serde_json::Value) -> Result<()> {
         let name = name.into();
+        let schema_bytes = serde_json::to_vec(&schema)
+            .map_err(|e| DatasetError::Embed(format!("schema encode: {e}")))?;
+        self.inner
+            .backend
+            .put(tables::SCHEMAS, name.as_bytes(), &schema_bytes)
+            .map_err(|e| DatasetError::Embed(format!("backend put schema: {e}")))?;
         self.inner.schemas.write().insert(name.clone(), schema);
         // Make sure the version list at least exists (empty for now).
         self.inner.versions.write().entry(name.clone()).or_default();
@@ -317,6 +477,24 @@ impl DatasetRegistry {
             metadata,
             created_at_unix_ns: now_unix_ns(),
         };
+        // Persist the dataset row + bumped counter atomically.
+        let bytes = serde_json::to_vec(&dataset)
+            .map_err(|e| DatasetError::Embed(format!("dataset encode: {e}")))?;
+        self.inner
+            .backend
+            .batch(&[
+                BatchOp::Put {
+                    table: tables::DATASETS.into(),
+                    key: key::two(name.as_bytes(), &u64_to_be(version)),
+                    value: bytes,
+                },
+                BatchOp::Put {
+                    table: tables::NEXT_VERSION.into(),
+                    key: name.as_bytes().to_vec(),
+                    value: u64_to_be(version).to_vec(),
+                },
+            ])
+            .map_err(|e| DatasetError::Embed(format!("backend add batch: {e}")))?;
         self.inner
             .by_id
             .write()
@@ -430,6 +608,13 @@ impl DatasetRegistry {
                 version,
             });
         }
+        if let Err(e) = self.inner.backend.put(
+            tables::TAGS,
+            &key::two(name.as_bytes(), tag.as_bytes()),
+            &u64_to_be(version),
+        ) {
+            return Err(DatasetError::Embed(format!("backend put tag: {e}")));
+        }
         self.inner
             .tags
             .write()
@@ -452,6 +637,13 @@ impl DatasetRegistry {
             .remove(&(name.to_string(), tag.to_string()))
             .is_some();
         if removed {
+            if let Err(e) = self
+                .inner
+                .backend
+                .delete(tables::TAGS, &key::two(name.as_bytes(), tag.as_bytes()))
+            {
+                tracing::warn!(error = %e, "backend untag delete failed");
+            }
             self.inner.bus.publish(ChangeEvent {
                 table: "dataset".to_string(),
                 key: Some(name.to_string()),
@@ -464,21 +656,44 @@ impl DatasetRegistry {
 
     /// Delete one version. The version number is NOT reused.
     pub fn delete(&self, name: &str, version: DatasetVersion) -> bool {
-        let key = (name.to_string(), version);
-        let removed = self.inner.by_id.write().remove(&key).is_some();
+        let key_tuple = (name.to_string(), version);
+        let removed = self.inner.by_id.write().remove(&key_tuple).is_some();
         if removed {
             if let Some(list) = self.inner.versions.write().get_mut(name) {
                 list.retain(|v| *v != version);
             }
-            self.inner
-                .tags
-                .write()
-                .retain(|(n, _t), v| !(n == name && *v == version));
+            let dropped_tags: Vec<String> = {
+                let mut tags = self.inner.tags.write();
+                let mut victims = Vec::new();
+                tags.retain(|(n, t), v| {
+                    let drop = n == name && *v == version;
+                    if drop {
+                        victims.push(t.clone());
+                    }
+                    !drop
+                });
+                victims
+            };
             // Drop catalog index entries for this version.
             self.inner
                 .id_to_key
                 .write()
                 .retain(|_id, (n, v, _r)| !(n == name && *v == version));
+            // Mirror to backend in one batch.
+            let mut ops: Vec<BatchOp> = Vec::with_capacity(1 + dropped_tags.len());
+            ops.push(BatchOp::Delete {
+                table: tables::DATASETS.into(),
+                key: key::two(name.as_bytes(), &u64_to_be(version)),
+            });
+            for t in dropped_tags {
+                ops.push(BatchOp::Delete {
+                    table: tables::TAGS.into(),
+                    key: key::two(name.as_bytes(), t.as_bytes()),
+                });
+            }
+            if let Err(e) = self.inner.backend.batch(&ops) {
+                tracing::warn!(error = %e, "backend delete batch failed");
+            }
             self.inner.bus.publish(ChangeEvent {
                 table: "dataset".to_string(),
                 key: Some(name.to_string()),
@@ -843,5 +1058,57 @@ mod tests {
         assert_eq!(s.versions, 3);
         assert_eq!(s.rows, 4);
         assert_eq!(s.tags, 1);
+    }
+
+    // ---------------------------------------------------------------- persistence
+
+    #[test]
+    fn open_rehydrates_versions_rows_tags_counter() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let embedder = Arc::new(HashEmbedder::new(16));
+        {
+            let r = DatasetRegistry::open(embedder.clone(), backend.clone()).unwrap();
+            r.create("refunds", serde_json::json!({"version": 1})).unwrap();
+            r.add(
+                "refunds",
+                vec![row("r1", "train"), row("r2", "eval")],
+                serde_json::json!({"author": "alice"}),
+            )
+            .unwrap();
+            let v2 = r
+                .add("refunds", vec![row("r3", "train")], serde_json::Value::Null)
+                .unwrap();
+            r.tag("refunds", v2, "golden").unwrap();
+            assert!(r.delete("refunds", 1));
+        }
+        let r = DatasetRegistry::open(embedder.clone(), backend.clone()).unwrap();
+        // v1 was deleted; v2 survives.
+        assert!(r.get("refunds", 1).is_none());
+        let v2 = r.get("refunds", 2).unwrap();
+        assert_eq!(v2.rows.len(), 1);
+        assert_eq!(v2.tags, vec!["golden"]);
+        // Counter must NOT reuse 1.
+        let v3 = r.add("refunds", vec![row("r4", "train")], serde_json::Value::Null).unwrap();
+        assert_eq!(v3, 3);
+        // Schema survives.
+        assert_eq!(r.names(), vec!["refunds".to_string()]);
+    }
+
+    #[test]
+    fn open_rehydrates_search_index() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let embedder = Arc::new(HashEmbedder::new(16));
+        {
+            let r = DatasetRegistry::open(embedder.clone(), backend.clone()).unwrap();
+            r.add(
+                "qa",
+                vec![row("hello world how are you", "train"), row("goodbye see you soon", "train")],
+                serde_json::Value::Null,
+            )
+            .unwrap();
+        }
+        let r = DatasetRegistry::open(embedder.clone(), backend.clone()).unwrap();
+        let hits = r.search("hello", 2, None).unwrap();
+        assert!(!hits.is_empty(), "search returned nothing after reopen");
     }
 }
