@@ -70,8 +70,46 @@ Output:
 | `ToolCache` | `threshold=0.95` | `put(tool, args_hash, args_embedding, result, ttl_secs=3600)`, `get(tool, args_hash, args_embedding) -> ToolCacheHit \| None`, `purge_expired()`, `len()` |
 | `ToolCacheHit` | (returned by `get`) | `kind` (`"exact"` or `"semantic_near_hit"`), `similarity`, `result` |
 | `SessionStore` | `ttl_secs=1800` | `put(session_id, data)`, `get(session_id) -> bytes \| None`, `delete(session_id) -> bool`, `purge_expired()`, `len()` |
+| `PromptRegistry` | `dim=32`, `storage=None` | `put(name, content, metadata=None) -> version`, `get(name, version_or_tag=None) -> Prompt \| None`, `list(name) -> [Prompt]`, `names() -> [str]`, `tag(name, version, tag)`, `untag(name, tag) -> bool`, `delete(name, version) -> bool`, `search(query, k=10) -> [PromptHit]`, `diff(name, v_a, v_b) -> str` |
+| `Prompt` | (returned by `get` / `list`) | `name`, `version`, `content`, `tags`, `metadata` (decoded JSON), `created_at_unix_ns` |
+| `PromptHit` | (returned by `search`) | `prompt`, `score` |
 
 Module-level: `duxxdb.__version__`.
+
+## PromptRegistry: versioned prompts with semantic search
+
+`PromptRegistry` is the first Phase 7 primitive shipped with native
+Python bindings + durable storage (v0.2.0). Use the in-memory mode
+for tests/notebooks and the redb mode for production.
+
+```python
+import duxxdb
+
+# In-memory (default; matches v0.1.x behavior).
+r = duxxdb.PromptRegistry(dim=16)
+v1 = r.put("classifier", "You are a refund agent.", metadata={"author": "alice"})
+v2 = r.put("classifier", "You are a friendly refund agent.")
+r.tag("classifier", v2, "prod")
+
+p = r.get("classifier", "prod")     # resolves the tag
+print(p.version, p.content, p.metadata)
+
+# Durable (rows + tags + monotonic counter survive process exit).
+r = duxxdb.PromptRegistry(dim=16, storage="redb:./prompts.redb")
+r.put("greeting", "Hello! How can I help today?")
+# ... process dies ...
+r = duxxdb.PromptRegistry(dim=16, storage="redb:./prompts.redb")
+assert r.get("greeting").content == "Hello! How can I help today?"
+
+# Semantic search across the catalog.
+for hit in r.search("hello", k=3):
+    print(hit.score, hit.prompt.name, hit.prompt.content)
+```
+
+The HNSW vector index is rebuilt on `open` by re-embedding every
+persisted prompt — fine for the typical prompt-catalog scale
+(<1000 rows). Larger Phase 7 primitives (datasets, evals) will get
+a persistent-embeddings strategy instead.
 
 ## ToolCache: semantic-near-hit demo
 
@@ -96,6 +134,11 @@ if hit and hit.kind == "semantic_near_hit":
 
 ## What's missing today
 
+- The other five Phase 7 primitives (`TraceStore`, `DatasetRegistry`,
+  `EvalRegistry`, `ReplayRegistry`, `CostLedger`) — sequenced in
+  [`docs/V0_2_0_PLAN.md`](../../docs/V0_2_0_PLAN.md). Today they're
+  reachable via the RESP facade (`duxxdb.server.ServerClient`); native
+  bindings land progressively through v0.2.x.
 - Subscriptions (`MemoryStore.subscribe()`) — Phase 4.5; the Rust /
   RESP servers already support this, the Python wrapper just needs to
   bridge `tokio::broadcast::Receiver` into a Python iterator.

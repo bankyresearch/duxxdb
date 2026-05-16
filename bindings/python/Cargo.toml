@@ -18,6 +18,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 duxx-core.workspace = true
+duxx-embed.workspace = true
 duxx-memory.workspace = true
+duxx-prompts.workspace = true
 duxx-reactive.workspace = true
+duxx-storage.workspace = true
 pyo3.workspace = true
+serde_json.workspace = true
