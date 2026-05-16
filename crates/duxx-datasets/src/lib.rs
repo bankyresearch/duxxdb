@@ -39,6 +39,7 @@ use duxx_storage::{Backend, BatchOp, MemoryBackend, key};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -54,6 +55,11 @@ mod tables {
     pub const NEXT_VERSION: &str = "dataset.next_version";
     /// `name` -> JSON(schema)
     pub const SCHEMAS: &str = "dataset.schemas";
+    /// `internal_id_be8` -> JSON((name, version, row_id))
+    ///
+    /// Lets ``open_with_index_dir`` resurrect the catalog-wide
+    /// id-to-key map without re-embedding every row. New in v0.2.2.
+    pub const ID_TO_KEY: &str = "dataset.id_to_key";
 }
 
 #[inline]
@@ -261,12 +267,32 @@ impl DatasetRegistry {
         Self::open(embedder, backend).expect("MemoryBackend cannot fail open")
     }
 
-    /// Build a registry backed by the given persistence layer. On
-    /// open, scans the four backend tables (datasets / tags /
-    /// next_version / schemas) and re-embeds every row across every
-    /// version to rebuild the catalog-wide HNSW.
+    /// Build a registry backed by the given persistence layer.
+    /// Re-embeds every row across every version to rebuild the
+    /// catalog-wide HNSW on open.
+    ///
+    /// For million-row workloads or when restart latency matters,
+    /// use [`DatasetRegistry::open_with_index_dir`] to plug in a
+    /// directory that holds the persisted HNSW dump.
     pub fn open(embedder: Arc<dyn Embedder>, backend: Arc<dyn Backend>) -> Result<Self> {
+        Self::open_with_index_dir(embedder, backend, None)
+    }
+
+    /// Like [`DatasetRegistry::open`] but persists the HNSW dump
+    /// under ``vector_index_dir``. On graceful drop the dump is
+    /// written back; on the next open it's loaded directly and the
+    /// re-embedding rebuild is skipped. New in v0.2.2.
+    pub fn open_with_index_dir(
+        embedder: Arc<dyn Embedder>,
+        backend: Arc<dyn Backend>,
+        vector_index_dir: Option<&Path>,
+    ) -> Result<Self> {
         let dim = embedder.dim();
+        let vector_index = match vector_index_dir {
+            Some(dir) => VectorIndex::open(dim, 100_000, dir)
+                .map_err(|e| DatasetError::Embed(format!("vector index open: {e}")))?,
+            None => VectorIndex::with_capacity(dim, 100_000),
+        };
         let me = Self {
             inner: Arc::new(Inner {
                 by_id: RwLock::new(HashMap::new()),
@@ -275,7 +301,7 @@ impl DatasetRegistry {
                 tags: RwLock::new(HashMap::new()),
                 schemas: RwLock::new(HashMap::new()),
                 embedder,
-                vector_index: RwLock::new(VectorIndex::with_capacity(dim, 100_000)),
+                vector_index: RwLock::new(vector_index),
                 id_to_key: RwLock::new(HashMap::new()),
                 next_internal_id: RwLock::new(1),
                 bus: ChangeBus::default(),
@@ -286,7 +312,36 @@ impl DatasetRegistry {
         Ok(me)
     }
 
+    /// Flush the HNSW vector index to disk if a persist directory
+    /// was configured. No-op otherwise.
+    pub fn flush_indices(&self) -> Result<()> {
+        self.inner
+            .vector_index
+            .read()
+            .dump()
+            .map(|_| ())
+            .map_err(|e| DatasetError::Embed(format!("vector index dump: {e}")))
+    }
+
+    fn persist_id_to_key(
+        &self,
+        internal_id: u64,
+        name: &str,
+        version: u64,
+        row_id: &str,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(&(name, version, row_id))
+            .map_err(|e| DatasetError::Embed(format!("id_to_key encode: {e}")))?;
+        self.inner
+            .backend
+            .put(tables::ID_TO_KEY, &internal_id.to_be_bytes(), &payload)
+            .map_err(|e| DatasetError::Embed(format!("backend put id_to_key: {e}")))
+    }
+
     fn rehydrate(&self) -> Result<()> {
+        // Fast path: HNSW dump was loaded from disk by VectorIndex::open.
+        let skip_reembed = self.inner.vector_index.read().was_loaded_from_disk();
+
         // datasets
         let rows = self
             .inner
@@ -297,23 +352,29 @@ impl DatasetRegistry {
             let dataset: Dataset = serde_json::from_slice(&value_bytes)
                 .map_err(|e| DatasetError::Embed(format!("dataset decode: {e}")))?;
             let key_tuple = (dataset.name.clone(), dataset.version);
-            // Re-embed every row to rebuild the HNSW.
-            for row in &dataset.rows {
-                let emb = self
-                    .inner
-                    .embedder
-                    .embed(&row.text)
-                    .map_err(|e| DatasetError::Embed(e.to_string()))?;
-                let internal_id = self.next_internal_id_bump();
-                self.inner
-                    .vector_index
-                    .write()
-                    .insert(internal_id, emb)
-                    .map_err(|e| DatasetError::Embed(format!("vector index: {e}")))?;
-                self.inner.id_to_key.write().insert(
-                    internal_id,
-                    (dataset.name.clone(), dataset.version, row.id.clone()),
-                );
+            // SLOW PATH ONLY: re-embed every row to rebuild the HNSW.
+            // The fast-load path restores id_to_key directly from the
+            // backend below.
+            if !skip_reembed {
+                for row in &dataset.rows {
+                    let emb = self
+                        .inner
+                        .embedder
+                        .embed(&row.text)
+                        .map_err(|e| DatasetError::Embed(e.to_string()))?;
+                    let internal_id = self.next_internal_id_bump();
+                    self.inner
+                        .vector_index
+                        .write()
+                        .insert(internal_id, emb)
+                        .map_err(|e| DatasetError::Embed(format!("vector index: {e}")))?;
+                    self.inner.id_to_key.write().insert(
+                        internal_id,
+                        (dataset.name.clone(), dataset.version, row.id.clone()),
+                    );
+                    self.persist_id_to_key(internal_id, &dataset.name, dataset.version, &row.id)
+                        .ok();
+                }
             }
             self.inner.by_id.write().insert(
                 key_tuple.clone(),
@@ -331,6 +392,35 @@ impl DatasetRegistry {
         }
         for list in self.inner.versions.write().values_mut() {
             list.sort_unstable();
+        }
+
+        // FAST PATH: rebuild id_to_key from its dedicated table.
+        if skip_reembed {
+            let id_rows = self
+                .inner
+                .backend
+                .scan(tables::ID_TO_KEY)
+                .map_err(|e| DatasetError::Embed(format!("backend scan id_to_key: {e}")))?;
+            let mut max_internal = 0u64;
+            for (key_bytes, value_bytes) in id_rows {
+                let internal_id = match be_to_u64(&key_bytes) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let parsed: (String, u64, String) =
+                    match serde_json::from_slice(&value_bytes) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                if internal_id > max_internal {
+                    max_internal = internal_id;
+                }
+                self.inner.id_to_key.write().insert(internal_id, parsed);
+            }
+            if max_internal > 0 {
+                let mut n = self.inner.next_internal_id.write();
+                *n = max_internal + 1;
+            }
         }
         // tags
         let tags = self
@@ -460,6 +550,7 @@ impl DatasetRegistry {
                 .id_to_key
                 .write()
                 .insert(internal_id, (name.clone(), version, row.id.clone()));
+            self.persist_id_to_key(internal_id, &name, version, &row.id).ok();
         }
         let schema = self
             .inner
@@ -674,13 +765,29 @@ impl DatasetRegistry {
                 });
                 victims
             };
-            // Drop catalog index entries for this version.
-            self.inner
-                .id_to_key
-                .write()
-                .retain(|_id, (n, v, _r)| !(n == name && *v == version));
+            // Drop catalog index entries for this version, and
+            // collect their internal ids so we can sweep the on-disk
+            // id_to_key rows too.
+            let dropped_internal_ids: Vec<u64> = {
+                let mut m = self.inner.id_to_key.write();
+                let victims: Vec<u64> = m
+                    .iter()
+                    .filter_map(|(iid, (n, v, _r))| {
+                        if n == name && *v == version {
+                            Some(*iid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for iid in &victims {
+                    m.remove(iid);
+                }
+                victims
+            };
             // Mirror to backend in one batch.
-            let mut ops: Vec<BatchOp> = Vec::with_capacity(1 + dropped_tags.len());
+            let mut ops: Vec<BatchOp> =
+                Vec::with_capacity(1 + dropped_tags.len() + dropped_internal_ids.len());
             ops.push(BatchOp::Delete {
                 table: tables::DATASETS.into(),
                 key: key::two(name.as_bytes(), &u64_to_be(version)),
@@ -689,6 +796,12 @@ impl DatasetRegistry {
                 ops.push(BatchOp::Delete {
                     table: tables::TAGS.into(),
                     key: key::two(name.as_bytes(), t.as_bytes()),
+                });
+            }
+            for iid in dropped_internal_ids {
+                ops.push(BatchOp::Delete {
+                    table: tables::ID_TO_KEY.into(),
+                    key: iid.to_be_bytes().to_vec(),
                 });
             }
             if let Err(e) = self.inner.backend.batch(&ops) {

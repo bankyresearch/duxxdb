@@ -136,17 +136,42 @@ exception is the failure-clustering HNSW (used by
 `EVAL.CLUSTER_FAILURES` and `COST.CLUSTER_EXPENSIVE`) — it stays in
 RAM and is rebuilt on `open` by re-embedding every stored row.
 
-### Vector indices rebuild on open
+### Vector indices
 
-The HNSW that backs `PROMPT.SEARCH`, `DATASET.SEARCH`,
-`EVAL.CLUSTER_FAILURES`, and `COST.CLUSTER_EXPENSIVE` is **not**
-persisted in v0.2.0 — it's rebuilt by re-embedding every persisted
-row on `open`. That keeps the storage layout small and avoids the
-complexity of persisting a stable HNSW dump for six different
-schemas at once. For prompt-catalog volumes (~hundreds of rows) the
-rebuild is essentially instant; for million-row dataset registries
-plan for a few seconds of startup latency in v0.2.0. Persistent
-indices land in v0.2.1.
+**v0.2.2:** The HNSW vector indices that back `PROMPT.SEARCH`,
+`DATASET.SEARCH`, `EVAL.CLUSTER_FAILURES`, and
+`COST.CLUSTER_EXPENSIVE` are now **persisted** under per-primitive
+dump dirs alongside each redb file:
+
+```
+phase7-data/
+├── prompts.redb        prompts.hnsw/      # new in v0.2.2
+├── datasets.redb       datasets.hnsw/     # new in v0.2.2
+├── evals.redb          evals.hnsw/        # new in v0.2.2
+├── costs.redb          costs.hnsw/        # new in v0.2.2
+├── replays.redb        (no vector index)
+├── traces.redb         (no vector index)
+└── version.json
+```
+
+On graceful shutdown (`Ctrl+C` / `SIGTERM` with drain time) each
+HNSW dumps to its dir. On the next open the dump loads directly —
+re-embedding is **skipped entirely**. Sub-second cold start at
+million-row scale. The previous v0.2.0/v0.2.1 behavior (rebuild by
+re-embedding every row) is the fallback for hard kills that skipped
+`Drop`, so correctness is preserved either way.
+
+Each registry also adds an `<prefix>.id_to_key` backend table that
+maps HNSW internal ids back to the registry-level key tuple. Tiny
+storage cost (one row per vector), but the table is what makes the
+fast-load path possible.
+
+**v0.2.0/v0.2.1 behavior — fallback only:** if the dump dir is
+missing (e.g. hard kill before `Drop` ran), the registry falls back
+to the legacy path: scan every row, re-embed, re-insert into a
+fresh HNSW. Prompt-scale: instant. Million-row scale: minutes for
+production embedders. **You only pay this cost once** after a hard
+kill, then the dump is re-established on the next graceful exit.
 
 ### Performance posture
 

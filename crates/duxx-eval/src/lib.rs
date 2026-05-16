@@ -46,6 +46,7 @@ use duxx_storage::{Backend, MemoryBackend, key};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -56,6 +57,22 @@ mod tables {
     pub const RUNS: &str = "eval.runs";
     /// `(run_id, row_id)` -> JSON(EvalScore)
     pub const SCORES: &str = "eval.scores";
+    /// `internal_id_be8` -> JSON((run_id, row_id))
+    ///
+    /// Lets ``open_with_index_dir`` resurrect the failure-clustering
+    /// HNSW dump without re-embedding every persisted failure.
+    /// New in v0.2.2.
+    pub const ID_TO_KEY: &str = "eval.id_to_key";
+}
+
+#[inline]
+fn be_to_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Some(u64::from_be_bytes(arr))
 }
 
 /// Errors surfaced by the eval registry.
@@ -270,19 +287,39 @@ impl EvalRegistry {
         Self::open(embedder, backend).expect("MemoryBackend cannot fail open")
     }
 
-    /// Build a registry backed by the given persistence layer. On
-    /// open, scans both backend tables and re-embeds every failure
-    /// (`score < 0.8` and non-empty ``output_text``) to rebuild the
+    /// Build a registry backed by the given persistence layer.
+    /// Re-embeds every persisted failure (`score < 0.8` and
+    /// non-empty ``output_text``) on open to rebuild the
     /// failure-clustering HNSW.
+    ///
+    /// For million-row workloads, use
+    /// [`EvalRegistry::open_with_index_dir`].
     pub fn open(embedder: Arc<dyn Embedder>, backend: Arc<dyn Backend>) -> Result<Self> {
+        Self::open_with_index_dir(embedder, backend, None)
+    }
+
+    /// Like [`EvalRegistry::open`] but persists the failure-clustering
+    /// HNSW under ``vector_index_dir``. On graceful drop the dump is
+    /// written back; on the next open it's loaded directly and the
+    /// re-embedding rebuild is skipped. New in v0.2.2.
+    pub fn open_with_index_dir(
+        embedder: Arc<dyn Embedder>,
+        backend: Arc<dyn Backend>,
+        vector_index_dir: Option<&Path>,
+    ) -> Result<Self> {
         let dim = embedder.dim();
+        let failure_index = match vector_index_dir {
+            Some(dir) => VectorIndex::open(dim, 100_000, dir)
+                .map_err(|e| EvalError::Embed(format!("vector index open: {e}")))?,
+            None => VectorIndex::with_capacity(dim, 100_000),
+        };
         let me = Self {
             inner: Arc::new(Inner {
                 runs: RwLock::new(HashMap::new()),
                 scores: RwLock::new(HashMap::new()),
                 failure_index_ids: RwLock::new(HashMap::new()),
                 embedder,
-                failure_index: RwLock::new(VectorIndex::with_capacity(dim, 100_000)),
+                failure_index: RwLock::new(failure_index),
                 id_to_key: RwLock::new(HashMap::new()),
                 next_internal_id: RwLock::new(1),
                 bus: ChangeBus::default(),
@@ -293,7 +330,29 @@ impl EvalRegistry {
         Ok(me)
     }
 
+    /// Flush the failure-clustering HNSW to disk if a persist
+    /// directory was configured.
+    pub fn flush_indices(&self) -> Result<()> {
+        self.inner
+            .failure_index
+            .read()
+            .dump()
+            .map(|_| ())
+            .map_err(|e| EvalError::Embed(format!("vector index dump: {e}")))
+    }
+
+    fn persist_id_to_key(&self, internal_id: u64, run_id: &str, row_id: &str) -> Result<()> {
+        let payload = serde_json::to_vec(&(run_id, row_id))
+            .map_err(|e| EvalError::Embed(format!("id_to_key encode: {e}")))?;
+        self.inner
+            .backend
+            .put(tables::ID_TO_KEY, &internal_id.to_be_bytes(), &payload)
+            .map_err(|e| EvalError::Embed(format!("backend put id_to_key: {e}")))
+    }
+
     fn rehydrate(&self) -> Result<()> {
+        let skip_reembed = self.inner.failure_index.read().was_loaded_from_disk();
+
         // runs
         let runs = self
             .inner
@@ -315,8 +374,11 @@ impl EvalRegistry {
             let score: EvalScore = serde_json::from_slice(&value_bytes)
                 .map_err(|e| EvalError::Embed(format!("score decode: {e}")))?;
             let map_key = (score.run_id.clone(), score.row_id.clone());
-            // Rebuild the failure index if this was a failure case.
-            if score.score < 0.8 && !score.output_text.is_empty() {
+            // SLOW PATH ONLY: rebuild the failure index by re-embedding.
+            // Skipped when the HNSW dump was loaded from disk; the
+            // FAST PATH below restores id_to_key + failure_index_ids
+            // from the backend directly.
+            if !skip_reembed && score.score < 0.8 && !score.output_text.is_empty() {
                 let emb = self
                     .inner
                     .embedder
@@ -333,8 +395,46 @@ impl EvalRegistry {
                     .failure_index_ids
                     .write()
                     .insert(map_key.clone(), internal_id);
+                self.persist_id_to_key(internal_id, &score.run_id, &score.row_id).ok();
             }
             self.inner.scores.write().insert(map_key, score);
+        }
+
+        // FAST PATH: rebuild id_to_key + failure_index_ids from the
+        // id_to_key backend table.
+        if skip_reembed {
+            let id_rows = self
+                .inner
+                .backend
+                .scan(tables::ID_TO_KEY)
+                .map_err(|e| EvalError::Embed(format!("backend scan id_to_key: {e}")))?;
+            let mut max_internal = 0u64;
+            for (key_bytes, value_bytes) in id_rows {
+                let internal_id = match be_to_u64(&key_bytes) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let parsed: (String, String) =
+                    match serde_json::from_slice(&value_bytes) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                if internal_id > max_internal {
+                    max_internal = internal_id;
+                }
+                self.inner
+                    .id_to_key
+                    .write()
+                    .insert(internal_id, parsed.clone());
+                self.inner
+                    .failure_index_ids
+                    .write()
+                    .insert(parsed, internal_id);
+            }
+            if max_internal > 0 {
+                let mut n = self.inner.next_internal_id.write();
+                *n = max_internal + 1;
+            }
         }
         Ok(())
     }
@@ -502,7 +602,11 @@ impl EvalRegistry {
             self.inner
                 .failure_index_ids
                 .write()
-                .insert((run_id.to_string(), row_id), internal_id);
+                .insert((run_id.to_string(), row_id.clone()), internal_id);
+            // Persist the id-to-key row so a future graceful-reopen
+            // can resurrect this entry from the HNSW dump without
+            // re-embedding.
+            self.persist_id_to_key(internal_id, run_id, &row_id).ok();
         }
 
         self.inner.bus.publish(ChangeEvent {

@@ -266,11 +266,10 @@ if hit and hit.kind == "semantic_near_hit":
 
 ## What's missing today
 
-- **Persistent vector indices.** v0.2.x rebuilds the HNSW by
-  re-embedding every persisted row on `open`. For prompt-scale
-  catalogues (~100s rows) this is instant; for million-row dataset
-  registries plan for a few seconds of startup latency. Persistent
-  HNSW dumps land in a future v0.2.x.
+- **Single-file `redb:` mode** for `--phase7-storage`. Today only
+  `dir:<directory>` is supported (one redb file per primitive).
+  Single-file mode requires sharing one `Arc<Database>` across all
+  six backends — queued for a future v0.2.x.
 - Subscriptions (`MemoryStore.subscribe()`) — Phase 4.5; the Rust /
   RESP servers already support this, the Python wrapper just needs to
   bridge `tokio::broadcast::Receiver` into a Python iterator.
