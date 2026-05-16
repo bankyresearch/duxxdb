@@ -22,7 +22,7 @@ pub mod backend;
 pub mod storage;
 pub mod table;
 
-pub use backend::{open_backend, Backend, BatchOp, MemoryBackend};
+pub use backend::{key, open_backend, Backend, BatchOp, MemoryBackend};
 pub use storage::{MemoryStorage, Storage};
 pub use table::{Row, RowId, Table};
 

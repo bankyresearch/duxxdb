@@ -43,6 +43,7 @@
 //!   landing in 7.1b.
 
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
+use duxx_storage::{Backend, MemoryBackend};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,6 +51,11 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
+
+mod tables {
+    /// `span_id` -> JSON(Span)
+    pub const SPANS: &str = "trace.spans";
+}
 
 // Brought in transitively; expose it so callers don't need a separate
 // dep on the `tokio` crate just to use the broadcast receiver.
@@ -224,6 +230,7 @@ struct Inner {
     /// ChangeBus shared with the rest of DuxxDB so RESP/gRPC clients
     /// `PSUBSCRIBE trace.*` see span events live.
     bus: ChangeBus,
+    backend: Arc<dyn Backend>,
 }
 
 impl std::fmt::Debug for TraceStore {
@@ -246,14 +253,69 @@ impl Default for TraceStore {
 }
 
 impl TraceStore {
+    /// Build a non-persistent trace store. Equivalent to
+    /// ``open(MemoryBackend::new())``.
     pub fn new() -> Self {
-        Self {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        Self::open(backend).expect("MemoryBackend cannot fail open")
+    }
+
+    /// Build a trace store backed by the given persistence layer. On
+    /// open, scans the ``trace.spans`` table and rebuilds the
+    /// in-memory ``by_trace`` and ``by_thread`` indices.
+    pub fn open(backend: Arc<dyn Backend>) -> Result<Self> {
+        let me = Self {
             inner: Arc::new(Inner {
                 by_span: RwLock::new(HashMap::new()),
                 by_trace: RwLock::new(HashMap::new()),
                 by_thread: RwLock::new(HashMap::new()),
                 bus: ChangeBus::default(),
+                backend,
             }),
+        };
+        me.rehydrate()?;
+        Ok(me)
+    }
+
+    fn rehydrate(&self) -> Result<()> {
+        let rows = self
+            .inner
+            .backend
+            .scan(tables::SPANS)
+            .map_err(|e| TraceError::SpanNotFound(format!("backend scan spans: {e}")))?;
+        // Sort by start_unix_ns so the per-trace ordering is stable
+        // across restarts.
+        let mut spans: Vec<Span> = Vec::with_capacity(rows.len());
+        for (_k, value_bytes) in rows {
+            let span: Span = serde_json::from_slice(&value_bytes)
+                .map_err(|e| TraceError::SpanNotFound(format!("span decode: {e}")))?;
+            spans.push(span);
+        }
+        spans.sort_by_key(|s| s.start_unix_ns);
+        for span in spans {
+            self.inner
+                .by_trace
+                .write()
+                .entry(span.trace_id.clone())
+                .or_default()
+                .push(span.span_id.clone());
+            if let Some(th) = &span.thread_id {
+                let mut th_map = self.inner.by_thread.write();
+                let traces = th_map.entry(th.clone()).or_default();
+                if !traces.contains(&span.trace_id) {
+                    traces.push(span.trace_id.clone());
+                }
+            }
+            self.inner.by_span.write().insert(span.span_id.clone(), span);
+        }
+        Ok(())
+    }
+
+    fn persist_span(&self, span: &Span) {
+        if let Ok(bytes) = serde_json::to_vec(span) {
+            if let Err(e) = self.inner.backend.put(tables::SPANS, span.span_id.as_bytes(), &bytes) {
+                tracing::warn!(error = %e, "backend persist span failed");
+            }
         }
     }
 
@@ -285,6 +347,10 @@ impl TraceStore {
         let span_id = span.span_id.clone();
         let trace_id = span.trace_id.clone();
         let thread_id = span.thread_id.clone();
+        // Persist before any in-memory mutation. A crash here leaves
+        // the in-memory state unchanged; rehydrate will pick up the
+        // on-disk row.
+        self.persist_span(&span);
         let is_new = self.inner.by_span.write().insert(span_id.clone(), span).is_none();
 
         if is_new {
@@ -326,14 +392,19 @@ impl TraceStore {
         end_unix_ns: u128,
         status: SpanStatus,
     ) -> Result<()> {
-        let mut by_span = self.inner.by_span.write();
-        let span = by_span
-            .get_mut(span_id)
-            .ok_or_else(|| TraceError::SpanNotFound(span_id.to_string()))?;
-        span.end_unix_ns = Some(end_unix_ns);
-        span.status = status;
-        let trace_id = span.trace_id.clone();
-        drop(by_span);
+        let snapshot;
+        let trace_id;
+        {
+            let mut by_span = self.inner.by_span.write();
+            let span = by_span
+                .get_mut(span_id)
+                .ok_or_else(|| TraceError::SpanNotFound(span_id.to_string()))?;
+            span.end_unix_ns = Some(end_unix_ns);
+            span.status = status;
+            trace_id = span.trace_id.clone();
+            snapshot = span.clone();
+        }
+        self.persist_span(&snapshot);
 
         self.inner.bus.publish(ChangeEvent {
             table: "trace".to_string(),
@@ -665,5 +736,55 @@ mod tests {
         let s2 = new_span_id();
         assert_ne!(s1, s2);
         assert_eq!(s1.len(), 16);
+    }
+
+    // ---------------------------------------------------------------- persistence
+
+    #[test]
+    fn open_rehydrates_spans_and_indices() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        {
+            let t = TraceStore::open(backend.clone()).unwrap();
+            t.record_span(Span {
+                trace_id: "tr-1".into(),
+                span_id: "s-root".into(),
+                parent_span_id: None,
+                thread_id: Some("user-42".into()),
+                name: "agent.turn".into(),
+                kind: SpanKind::Server,
+                start_unix_ns: 1_000_000_000,
+                end_unix_ns: None,
+                status: SpanStatus::Ok,
+                attributes: serde_json::json!({"user": "alice"}),
+            })
+            .unwrap();
+            t.record_span(Span {
+                trace_id: "tr-1".into(),
+                span_id: "s-child".into(),
+                parent_span_id: Some("s-root".into()),
+                thread_id: Some("user-42".into()),
+                name: "llm.call".into(),
+                kind: SpanKind::Client,
+                start_unix_ns: 1_500_000_000,
+                end_unix_ns: None,
+                status: SpanStatus::Unset,
+                attributes: serde_json::Value::Null,
+            })
+            .unwrap();
+            t.close_span("s-child", 2_000_000_000, SpanStatus::Ok).unwrap();
+        }
+        let t = TraceStore::open(backend.clone()).unwrap();
+        let trace = t.get_trace("tr-1");
+        assert_eq!(trace.len(), 2);
+        let names: Vec<&str> = trace.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"agent.turn"));
+        assert!(names.contains(&"llm.call"));
+        // close_span persisted: child end_unix_ns + status survived.
+        let child = trace.iter().find(|s| s.span_id == "s-child").unwrap();
+        assert_eq!(child.end_unix_ns, Some(2_000_000_000));
+        assert!(matches!(child.status, SpanStatus::Ok));
+        // Thread index rebuilt.
+        let by_thread = t.thread("user-42");
+        assert_eq!(by_thread.len(), 2);
     }
 }

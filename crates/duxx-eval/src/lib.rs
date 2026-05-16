@@ -42,6 +42,7 @@
 use duxx_embed::Embedder;
 use duxx_index::vector::VectorIndex;
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
+use duxx_storage::{Backend, MemoryBackend, key};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,6 +50,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+mod tables {
+    /// `run_id` -> JSON(EvalRun)
+    pub const RUNS: &str = "eval.runs";
+    /// `(run_id, row_id)` -> JSON(EvalScore)
+    pub const SCORES: &str = "eval.scores";
+}
 
 /// Errors surfaced by the eval registry.
 #[derive(Debug, Error)]
@@ -238,6 +246,7 @@ struct Inner {
     id_to_key: RwLock<HashMap<u64, (EvalRunId, String)>>,
     next_internal_id: RwLock<u64>,
     bus: ChangeBus,
+    backend: Arc<dyn Backend>,
 }
 
 impl std::fmt::Debug for EvalRegistry {
@@ -254,10 +263,20 @@ impl std::fmt::Debug for EvalRegistry {
 }
 
 impl EvalRegistry {
-    /// Build a registry that uses `embedder` for failure clustering.
+    /// Build a non-persistent registry. Equivalent to
+    /// ``open(embedder, MemoryBackend::new())``.
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        Self::open(embedder, backend).expect("MemoryBackend cannot fail open")
+    }
+
+    /// Build a registry backed by the given persistence layer. On
+    /// open, scans both backend tables and re-embeds every failure
+    /// (`score < 0.8` and non-empty ``output_text``) to rebuild the
+    /// failure-clustering HNSW.
+    pub fn open(embedder: Arc<dyn Embedder>, backend: Arc<dyn Backend>) -> Result<Self> {
         let dim = embedder.dim();
-        Self {
+        let me = Self {
             inner: Arc::new(Inner {
                 runs: RwLock::new(HashMap::new()),
                 scores: RwLock::new(HashMap::new()),
@@ -267,8 +286,76 @@ impl EvalRegistry {
                 id_to_key: RwLock::new(HashMap::new()),
                 next_internal_id: RwLock::new(1),
                 bus: ChangeBus::default(),
+                backend,
             }),
+        };
+        me.rehydrate()?;
+        Ok(me)
+    }
+
+    fn rehydrate(&self) -> Result<()> {
+        // runs
+        let runs = self
+            .inner
+            .backend
+            .scan(tables::RUNS)
+            .map_err(|e| EvalError::Embed(format!("backend scan runs: {e}")))?;
+        for (_k, value_bytes) in runs {
+            let run: EvalRun = serde_json::from_slice(&value_bytes)
+                .map_err(|e| EvalError::Embed(format!("run decode: {e}")))?;
+            self.inner.runs.write().insert(run.id.clone(), run);
         }
+        // scores
+        let scores = self
+            .inner
+            .backend
+            .scan(tables::SCORES)
+            .map_err(|e| EvalError::Embed(format!("backend scan scores: {e}")))?;
+        for (_k, value_bytes) in scores {
+            let score: EvalScore = serde_json::from_slice(&value_bytes)
+                .map_err(|e| EvalError::Embed(format!("score decode: {e}")))?;
+            let map_key = (score.run_id.clone(), score.row_id.clone());
+            // Rebuild the failure index if this was a failure case.
+            if score.score < 0.8 && !score.output_text.is_empty() {
+                let emb = self
+                    .inner
+                    .embedder
+                    .embed(&score.output_text)
+                    .map_err(|e| EvalError::Embed(e.to_string()))?;
+                let internal_id = self.next_internal_id_bump();
+                self.inner
+                    .failure_index
+                    .write()
+                    .insert(internal_id, emb)
+                    .map_err(|e| EvalError::Embed(format!("vector index: {e}")))?;
+                self.inner.id_to_key.write().insert(internal_id, map_key.clone());
+                self.inner
+                    .failure_index_ids
+                    .write()
+                    .insert(map_key.clone(), internal_id);
+            }
+            self.inner.scores.write().insert(map_key, score);
+        }
+        Ok(())
+    }
+
+    fn next_internal_id_bump(&self) -> u64 {
+        let mut n = self.inner.next_internal_id.write();
+        let v = *n;
+        *n += 1;
+        v
+    }
+
+    /// Helper: persist one run to the backend. Used by every
+    /// state-transitioning method (``start``, ``score``, ``complete``,
+    /// ``fail``) so the on-disk row is always in sync with memory.
+    fn persist_run(&self, run: &EvalRun) -> Result<()> {
+        let bytes = serde_json::to_vec(run)
+            .map_err(|e| EvalError::Embed(format!("run encode: {e}")))?;
+        self.inner
+            .backend
+            .put(tables::RUNS, run.id.as_bytes(), &bytes)
+            .map_err(|e| EvalError::Embed(format!("backend put run: {e}")))
     }
 
     /// Subscribe to change events. Each `start` / `score` / `complete`
@@ -313,6 +400,13 @@ impl EvalRegistry {
             completed_at_unix_ns: None,
             summary: None,
         };
+        // Persist before exposing the run in memory. Errors here
+        // would abort `start`; in v0.1.x `start` is infallible. We
+        // log the error and continue — the in-memory state is still
+        // consistent.
+        if let Err(e) = self.persist_run(&run) {
+            tracing::warn!(error = %e, "backend persist eval run failed");
+        }
         self.inner.runs.write().insert(id.clone(), run);
         self.inner.bus.publish(ChangeEvent {
             table: "eval".to_string(),
@@ -340,7 +434,9 @@ impl EvalRegistry {
         let row_id = row_id.into();
         let output_text = output_text.into();
 
-        {
+        // Transition Pending→Running on first score, capturing a
+        // snapshot so we can persist the new run state.
+        let run_snapshot = {
             let mut runs = self.inner.runs.write();
             let run = runs
                 .get_mut(run_id)
@@ -348,8 +444,15 @@ impl EvalRegistry {
             if run.status.is_terminal() {
                 return Err(EvalError::WrongState(run_id.to_string(), run.status));
             }
-            if matches!(run.status, EvalStatus::Pending) {
+            let was_pending = matches!(run.status, EvalStatus::Pending);
+            if was_pending {
                 run.status = EvalStatus::Running;
+            }
+            if was_pending { Some(run.clone()) } else { None }
+        };
+        if let Some(run) = run_snapshot {
+            if let Err(e) = self.persist_run(&run) {
+                tracing::warn!(error = %e, "backend persist eval run failed");
             }
         }
 
@@ -361,6 +464,17 @@ impl EvalRegistry {
             output_text: output_text.clone(),
             recorded_at_unix_ns: now_unix_ns(),
         };
+        // Persist score before any in-memory mutation.
+        let bytes = serde_json::to_vec(&entry)
+            .map_err(|e| EvalError::Embed(format!("score encode: {e}")))?;
+        self.inner
+            .backend
+            .put(
+                tables::SCORES,
+                &key::two(run_id.as_bytes(), row_id.as_bytes()),
+                &bytes,
+            )
+            .map_err(|e| EvalError::Embed(format!("backend put score: {e}")))?;
         self.inner
             .scores
             .write()
@@ -375,12 +489,7 @@ impl EvalRegistry {
                 .embedder
                 .embed(&output_text)
                 .map_err(|e| EvalError::Embed(e.to_string()))?;
-            let internal_id = {
-                let mut n = self.inner.next_internal_id.write();
-                let v = *n;
-                *n += 1;
-                v
-            };
+            let internal_id = self.next_internal_id_bump();
             self.inner
                 .failure_index
                 .write()
@@ -408,17 +517,23 @@ impl EvalRegistry {
     /// Mark a run as completed and freeze its summary stats.
     pub fn complete(&self, run_id: &str) -> Result<EvalSummary> {
         let summary = self.compute_summary(run_id);
-        let mut runs = self.inner.runs.write();
-        let run = runs
-            .get_mut(run_id)
-            .ok_or_else(|| EvalError::RunNotFound(run_id.to_string()))?;
-        if run.status.is_terminal() {
-            return Err(EvalError::WrongState(run_id.to_string(), run.status));
+        let snapshot;
+        {
+            let mut runs = self.inner.runs.write();
+            let run = runs
+                .get_mut(run_id)
+                .ok_or_else(|| EvalError::RunNotFound(run_id.to_string()))?;
+            if run.status.is_terminal() {
+                return Err(EvalError::WrongState(run_id.to_string(), run.status));
+            }
+            run.status = EvalStatus::Completed;
+            run.completed_at_unix_ns = Some(now_unix_ns());
+            run.summary = Some(summary);
+            snapshot = run.clone();
         }
-        run.status = EvalStatus::Completed;
-        run.completed_at_unix_ns = Some(now_unix_ns());
-        run.summary = Some(summary);
-        drop(runs);
+        if let Err(e) = self.persist_run(&snapshot) {
+            tracing::warn!(error = %e, "backend persist eval run failed");
+        }
         self.inner.bus.publish(ChangeEvent {
             table: "eval".to_string(),
             key: Some(run_id.to_string()),
@@ -432,26 +547,32 @@ impl EvalRegistry {
     /// scores recorded so far.
     pub fn fail(&self, run_id: &str, reason: impl Into<String>) -> Result<()> {
         let summary = self.compute_summary(run_id);
-        let mut runs = self.inner.runs.write();
-        let run = runs
-            .get_mut(run_id)
-            .ok_or_else(|| EvalError::RunNotFound(run_id.to_string()))?;
-        if run.status.is_terminal() {
-            return Err(EvalError::WrongState(run_id.to_string(), run.status));
+        let snapshot;
+        {
+            let mut runs = self.inner.runs.write();
+            let run = runs
+                .get_mut(run_id)
+                .ok_or_else(|| EvalError::RunNotFound(run_id.to_string()))?;
+            if run.status.is_terminal() {
+                return Err(EvalError::WrongState(run_id.to_string(), run.status));
+            }
+            run.status = EvalStatus::Failed;
+            run.completed_at_unix_ns = Some(now_unix_ns());
+            run.summary = Some(summary);
+            // Stash the failure reason in metadata.
+            if let serde_json::Value::Object(ref mut map) = run.metadata {
+                map.insert(
+                    "failure_reason".to_string(),
+                    serde_json::Value::String(reason.into()),
+                );
+            } else {
+                run.metadata = serde_json::json!({"failure_reason": reason.into()});
+            }
+            snapshot = run.clone();
         }
-        run.status = EvalStatus::Failed;
-        run.completed_at_unix_ns = Some(now_unix_ns());
-        run.summary = Some(summary);
-        // Stash the failure reason in metadata.
-        if let serde_json::Value::Object(ref mut map) = run.metadata {
-            map.insert(
-                "failure_reason".to_string(),
-                serde_json::Value::String(reason.into()),
-            );
-        } else {
-            run.metadata = serde_json::json!({"failure_reason": reason.into()});
+        if let Err(e) = self.persist_run(&snapshot) {
+            tracing::warn!(error = %e, "backend persist eval run failed");
         }
-        drop(runs);
         self.inner.bus.publish(ChangeEvent {
             table: "eval".to_string(),
             key: Some(run_id.to_string()),
@@ -928,5 +1049,42 @@ mod tests {
         }
         let scores = r.scores(&id);
         assert_eq!(scores.len(), 3);
+    }
+
+    // ---------------------------------------------------------------- persistence
+
+    #[test]
+    fn open_rehydrates_runs_and_scores() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let embedder = Arc::new(HashEmbedder::new(16));
+        let run_id;
+        {
+            let r = EvalRegistry::open(embedder.clone(), backend.clone()).unwrap();
+            run_id = r.start(
+                "ds",
+                1,
+                Some("classifier".into()),
+                Some(1),
+                "gpt-4o",
+                "llm_judge",
+                serde_json::Value::Null,
+            );
+            r.score(&run_id, "row1", 0.9, "REFUND", serde_json::Value::Null).unwrap();
+            r.score(&run_id, "row2", 0.2, "wrong answer here", serde_json::Value::Null)
+                .unwrap();
+            r.complete(&run_id).unwrap();
+        }
+        let r = EvalRegistry::open(embedder.clone(), backend.clone()).unwrap();
+        let run = r.get(&run_id).unwrap();
+        assert!(matches!(run.status, EvalStatus::Completed));
+        assert!(run.summary.is_some());
+        let scores = r.scores(&run_id);
+        assert_eq!(scores.len(), 2);
+        // The failure index should rebuild — row2 was a failure
+        // (score < 0.8) with non-empty output.
+        let clusters = r
+            .cluster_failures(&run_id, 0.5, 0.0, 5)
+            .unwrap_or_default();
+        assert!(!clusters.is_empty(), "failure index did not rehydrate");
     }
 }

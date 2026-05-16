@@ -44,6 +44,7 @@
 use duxx_embed::Embedder;
 use duxx_index::vector::VectorIndex;
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
+use duxx_storage::{Backend, BatchOp, MemoryBackend};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -51,6 +52,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+/// Backend table names for the persistent path.
+mod tables {
+    /// `entry.id` -> JSON(CostEntry)
+    pub const ENTRIES: &str = "cost.entries";
+    /// `tenant` -> JSON(Budget)
+    pub const BUDGETS: &str = "cost.budgets";
+}
 
 /// Errors surfaced by the cost ledger.
 #[derive(Debug, Error)]
@@ -252,6 +261,10 @@ struct Inner {
     id_to_entry: RwLock<HashMap<u64, String>>,
     next_internal_id: RwLock<u64>,
     bus: ChangeBus,
+    /// Durable backend. Always present — ``new`` plugs in a fresh
+    /// ``MemoryBackend`` so every mutation goes through one write-
+    /// through code path.
+    backend: Arc<dyn Backend>,
 }
 
 impl std::fmt::Debug for CostLedger {
@@ -266,9 +279,20 @@ impl std::fmt::Debug for CostLedger {
 }
 
 impl CostLedger {
+    /// Build a non-persistent ledger. Equivalent to
+    /// ``open(embedder, MemoryBackend::new())``.
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        Self::open(embedder, backend).expect("MemoryBackend cannot fail open")
+    }
+
+    /// Build a ledger backed by the given persistence layer. On open,
+    /// scans the ``cost.entries`` and ``cost.budgets`` tables to
+    /// rebuild in-memory state, and re-embeds every entry's
+    /// ``input_text`` to rebuild the failure-clustering HNSW.
+    pub fn open(embedder: Arc<dyn Embedder>, backend: Arc<dyn Backend>) -> Result<Self> {
         let dim = embedder.dim();
-        Self {
+        let me = Self {
             inner: Arc::new(Inner {
                 entries: RwLock::new(Vec::new()),
                 budgets: RwLock::new(HashMap::new()),
@@ -277,8 +301,69 @@ impl CostLedger {
                 id_to_entry: RwLock::new(HashMap::new()),
                 next_internal_id: RwLock::new(1),
                 bus: ChangeBus::default(),
+                backend,
             }),
+        };
+        me.rehydrate()?;
+        Ok(me)
+    }
+
+    fn rehydrate(&self) -> Result<()> {
+        // ---- entries ----
+        let entries = self
+            .inner
+            .backend
+            .scan(tables::ENTRIES)
+            .map_err(|e| CostError::Embed(format!("backend scan entries: {e}")))?;
+        let mut decoded: Vec<CostEntry> = Vec::with_capacity(entries.len());
+        for (_k, value_bytes) in entries {
+            let entry: CostEntry = serde_json::from_slice(&value_bytes)
+                .map_err(|e| CostError::Embed(format!("entry decode: {e}")))?;
+            decoded.push(entry);
         }
+        // Sort by timestamp so the in-memory order matches new
+        // inserts after rehydrate.
+        decoded.sort_by_key(|e| e.recorded_at_unix_ns);
+        for entry in &decoded {
+            if !entry.input_text.is_empty() {
+                let emb = self
+                    .inner
+                    .embedder
+                    .embed(&entry.input_text)
+                    .map_err(|e| CostError::Embed(e.to_string()))?;
+                let internal_id = self.bump_internal_id();
+                self.inner
+                    .vector_index
+                    .write()
+                    .insert(internal_id, emb)
+                    .map_err(|e| CostError::Embed(format!("vector index: {e}")))?;
+                self.inner
+                    .id_to_entry
+                    .write()
+                    .insert(internal_id, entry.id.clone());
+            }
+        }
+        *self.inner.entries.write() = decoded;
+
+        // ---- budgets ----
+        let budgets = self
+            .inner
+            .backend
+            .scan(tables::BUDGETS)
+            .map_err(|e| CostError::Embed(format!("backend scan budgets: {e}")))?;
+        for (_k, value_bytes) in budgets {
+            let budget: Budget = serde_json::from_slice(&value_bytes)
+                .map_err(|e| CostError::Embed(format!("budget decode: {e}")))?;
+            self.inner.budgets.write().insert(budget.tenant.clone(), budget);
+        }
+        Ok(())
+    }
+
+    fn bump_internal_id(&self) -> u64 {
+        let mut n = self.inner.next_internal_id.write();
+        let v = *n;
+        *n += 1;
+        v
     }
 
     /// Subscribe to change events. `table = "cost"`, `key =
@@ -303,6 +388,16 @@ impl CostLedger {
         let entry_id = entry.id.clone();
         let tenant = entry.tenant.clone();
 
+        // Persist before any in-memory mutation. A crash here leaves
+        // the in-memory state untouched but the row on disk, which
+        // is the right side to err on: rehydrate will pick it up.
+        let bytes = serde_json::to_vec(&entry)
+            .map_err(|e| CostError::Embed(format!("entry encode: {e}")))?;
+        self.inner
+            .backend
+            .put(tables::ENTRIES, entry.id.as_bytes(), &bytes)
+            .map_err(|e| CostError::Embed(format!("backend put entry: {e}")))?;
+
         // Index for clustering if we have input text.
         if !entry.input_text.is_empty() {
             let emb = self
@@ -310,12 +405,7 @@ impl CostLedger {
                 .embedder
                 .embed(&entry.input_text)
                 .map_err(|e| CostError::Embed(e.to_string()))?;
-            let internal_id = {
-                let mut n = self.inner.next_internal_id.write();
-                let v = *n;
-                *n += 1;
-                v
-            };
+            let internal_id = self.bump_internal_id();
             self.inner
                 .vector_index
                 .write()
@@ -471,6 +561,12 @@ impl CostLedger {
             metadata,
             created_at_unix_ns: now_unix_ns(),
         };
+        let bytes = serde_json::to_vec(&budget)
+            .map_err(|e| CostError::Embed(format!("budget encode: {e}")))?;
+        self.inner
+            .backend
+            .put(tables::BUDGETS, tenant.as_bytes(), &bytes)
+            .map_err(|e| CostError::Embed(format!("backend put budget: {e}")))?;
         self.inner.budgets.write().insert(tenant.clone(), budget);
         self.inner.bus.publish(ChangeEvent {
             table: "cost".to_string(),
@@ -490,6 +586,9 @@ impl CostLedger {
     pub fn delete_budget(&self, tenant: &str) -> bool {
         let removed = self.inner.budgets.write().remove(tenant).is_some();
         if removed {
+            if let Err(e) = self.inner.backend.delete(tables::BUDGETS, tenant.as_bytes()) {
+                tracing::warn!(error = %e, "backend delete_budget failed");
+            }
             self.inner.bus.publish(ChangeEvent {
                 table: "cost".to_string(),
                 key: Some(tenant.into()),
@@ -962,5 +1061,41 @@ mod tests {
         });
         assert_eq!(just_old.len(), 1);
         assert!((just_old[0].cost_usd - 1.0).abs() < 0.001);
+    }
+
+    // ---------------------------------------------------------------- persistence
+
+    #[test]
+    fn open_rehydrates_entries_and_budgets() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let embedder = Arc::new(HashEmbedder::new(16));
+        {
+            let l = CostLedger::open(embedder.clone(), backend.clone()).unwrap();
+            l.record(entry("acme", "gpt-4o", 0.0042, "first call")).unwrap();
+            l.record(entry("acme", "gpt-4o-mini", 0.0011, "second")).unwrap();
+            l.set_budget("acme", BudgetPeriod::Monthly, 100.0, 0.8, serde_json::Value::Null)
+                .unwrap();
+        }
+        let l = CostLedger::open(embedder.clone(), backend.clone()).unwrap();
+        let entries = l.query(&CostFilter::default());
+        assert_eq!(entries.len(), 2);
+        let total = l.total_for("acme", None, None);
+        assert!((total - 0.0053).abs() < 1e-9, "got {total}");
+        let budget = l.get_budget("acme").unwrap();
+        assert!((budget.amount_usd - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn delete_budget_persists_across_reopen() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let embedder = Arc::new(HashEmbedder::new(16));
+        {
+            let l = CostLedger::open(embedder.clone(), backend.clone()).unwrap();
+            l.set_budget("acme", BudgetPeriod::Daily, 5.0, 0.8, serde_json::Value::Null)
+                .unwrap();
+            assert!(l.delete_budget("acme"));
+        }
+        let l = CostLedger::open(embedder.clone(), backend.clone()).unwrap();
+        assert!(l.get_budget("acme").is_none());
     }
 }

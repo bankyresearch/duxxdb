@@ -16,6 +16,7 @@ duxx-core.workspace = true
 duxx-embed.workspace = true
 duxx-index.workspace = true
 duxx-reactive.workspace = true
+duxx-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

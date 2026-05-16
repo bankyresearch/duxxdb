@@ -7,12 +7,16 @@
 //!
 //! [PyO3]: https://github.com/PyO3/pyo3
 
+use duxx_embed::{Embedder, HashEmbedder};
 use duxx_memory::{
     HitKind as RustHitKind, MemoryStore as RustMemoryStore, SessionStore as RustSessionStore,
     ToolCache as RustToolCache,
 };
+use duxx_prompts::{Prompt as RustPrompt, PromptRegistry as RustPromptRegistry};
+use duxx_storage::{open_backend, Backend, MemoryBackend};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use std::sync::Arc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -327,6 +331,268 @@ impl SessionStore {
 }
 
 // ---------------------------------------------------------------------------
+// PromptRegistry (Phase 7.2, v0.2.0)
+// ---------------------------------------------------------------------------
+
+/// One persisted prompt. Returned by every `PromptRegistry` lookup.
+#[pyclass(name = "Prompt", module = "duxxdb._native")]
+#[derive(Clone)]
+struct Prompt {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    version: u64,
+    #[pyo3(get)]
+    content: String,
+    #[pyo3(get)]
+    tags: Vec<String>,
+    /// Free-form metadata. Stored as JSON in Rust; surfaced here as
+    /// a Python `dict` / `list` / scalar via `json.loads`-style
+    /// conversion.
+    metadata_json: String,
+    #[pyo3(get)]
+    created_at_unix_ns: u128,
+}
+
+#[pymethods]
+impl Prompt {
+    /// Decoded `metadata`. Returned as the native Python value
+    /// (`dict`, `list`, `str`, …) that `json.loads(...)` would give
+    /// you. Always evaluated lazily on attribute access.
+    #[getter]
+    fn metadata(&self, py: Python<'_>) -> PyResult<PyObject> {
+        json_str_to_py(py, &self.metadata_json)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<Prompt name={:?} version={} content_len={} tags={:?}>",
+            self.name,
+            self.version,
+            self.content.len(),
+            self.tags,
+        )
+    }
+}
+
+impl Prompt {
+    fn from_rust(p: RustPrompt) -> Self {
+        let metadata_json = serde_json::to_string(&p.metadata).unwrap_or_else(|_| "null".into());
+        Self {
+            name: p.name,
+            version: p.version,
+            content: p.content,
+            tags: p.tags,
+            metadata_json,
+            created_at_unix_ns: p.created_at_unix_ns,
+        }
+    }
+}
+
+/// One hit from `PromptRegistry.search`. Wraps a `Prompt` with the
+/// cosine similarity score in `[0, 1]`.
+#[pyclass(name = "PromptHit", module = "duxxdb._native")]
+#[derive(Clone)]
+struct PromptHit {
+    #[pyo3(get)]
+    prompt: Prompt,
+    #[pyo3(get)]
+    score: f32,
+}
+
+#[pymethods]
+impl PromptHit {
+    fn __repr__(&self) -> String {
+        format!(
+            "<PromptHit name={:?} version={} score={:.4}>",
+            self.prompt.name, self.prompt.version, self.score
+        )
+    }
+}
+
+/// Versioned prompt registry with semantic search across the
+/// catalog.
+///
+/// >>> r = duxxdb.PromptRegistry(dim=16)
+/// >>> v1 = r.put("classifier", "You are a refund agent.")
+/// >>> v2 = r.put("classifier", "You are a friendly refund agent.")
+/// >>> r.tag("classifier", v2, "prod")
+/// >>> r.get("classifier", "prod").content
+/// 'You are a friendly refund agent.'
+///
+/// Pass ``storage=`` for persistence:
+///
+/// >>> r = duxxdb.PromptRegistry(dim=16, storage="redb:./prompts.redb")
+#[pyclass(name = "PromptRegistry", module = "duxxdb._native")]
+struct PromptRegistry {
+    inner: RustPromptRegistry,
+    dim: usize,
+}
+
+#[pymethods]
+impl PromptRegistry {
+    /// Build a new registry.
+    ///
+    /// * ``dim`` — embedding dimensionality. Must match the
+    ///   embedder you've configured (defaults to the built-in
+    ///   ``HashEmbedder`` for now; explicit embedder support lands
+    ///   alongside the other Phase 7 primitives).
+    /// * ``storage`` — optional persistence selector:
+    ///   * ``None`` or ``"memory"`` → in-memory (default; matches
+    ///     v0.1.x behavior).
+    ///   * ``"redb:/path/to/file.redb"`` → durable, ACID.
+    #[new]
+    #[pyo3(signature = (dim = 32, storage = None))]
+    fn new(dim: usize, storage: Option<&str>) -> PyResult<Self> {
+        let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(dim));
+        let backend: Arc<dyn Backend> = match storage {
+            None | Some("") | Some("memory") => Arc::new(MemoryBackend::new()),
+            Some(spec) => open_backend(Some(spec))
+                .map(Arc::from)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        };
+        let inner = RustPromptRegistry::open(embedder, backend)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner, dim })
+    }
+
+    /// Insert a new version of ``name``. Returns the assigned
+    /// monotonic version number (starting at 1).
+    #[pyo3(signature = (name, content, metadata = None))]
+    fn put(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        content: &str,
+        metadata: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<u64> {
+        let metadata_value = py_to_json(py, metadata)?;
+        self.inner
+            .put(name.to_string(), content.to_string(), metadata_value)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Look up a prompt.
+    ///
+    /// ``version_or_tag`` accepts:
+    ///   * ``None`` → latest version
+    ///   * an ``int`` → that exact version
+    ///   * a ``str`` → resolved as a tag
+    #[pyo3(signature = (name, version_or_tag = None))]
+    fn get(&self, name: &str, version_or_tag: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Prompt>> {
+        let prompt = match version_or_tag {
+            None => self.inner.get_latest(name),
+            Some(obj) => {
+                if let Ok(v) = obj.extract::<u64>() {
+                    self.inner.get(name, v)
+                } else {
+                    let tag: String = obj.extract().map_err(|_| {
+                        PyValueError::new_err(
+                            "version_or_tag must be an int (version) or str (tag)",
+                        )
+                    })?;
+                    self.inner.get_by_tag(name, &tag)
+                }
+            }
+        };
+        Ok(prompt.map(Prompt::from_rust))
+    }
+
+    /// Every version of ``name``, ascending.
+    fn list(&self, name: &str) -> Vec<Prompt> {
+        self.inner.list(name).into_iter().map(Prompt::from_rust).collect()
+    }
+
+    /// Every known prompt name, lex order.
+    fn names(&self) -> Vec<String> {
+        self.inner.names()
+    }
+
+    /// Point ``tag`` at ``version`` of ``name``. If the tag exists
+    /// it is moved.
+    fn tag(&self, name: &str, version: u64, tag: &str) -> PyResult<()> {
+        self.inner
+            .tag(name, version, tag)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Remove a tag. Returns True if the tag existed.
+    fn untag(&self, name: &str, tag: &str) -> bool {
+        self.inner.untag(name, tag)
+    }
+
+    /// Hard-delete one version of a prompt. Returns True if the
+    /// version existed. The version number is never reused.
+    fn delete(&self, name: &str, version: u64) -> bool {
+        self.inner.delete(name, version)
+    }
+
+    /// Semantic search across the catalog.
+    #[pyo3(signature = (query, k = 10))]
+    fn search(&self, query: &str, k: usize) -> PyResult<Vec<PromptHit>> {
+        let hits = self
+            .inner
+            .search(query, k)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(hits
+            .into_iter()
+            .map(|h| PromptHit {
+                prompt: Prompt::from_rust(h.prompt),
+                score: h.score,
+            })
+            .collect())
+    }
+
+    /// Line diff between two versions.
+    fn diff(&self, name: &str, version_a: u64, version_b: u64) -> PyResult<String> {
+        self.inner
+            .diff(name, version_a, version_b)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Embedding dimensionality this registry was built with.
+    #[getter]
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn __repr__(&self) -> String {
+        let stats = self.inner.stats();
+        format!(
+            "<PromptRegistry names={} versions={} tags={} dim={}>",
+            stats.names, stats.versions, stats.tags, self.dim
+        )
+    }
+}
+
+/// Convert a Python value (dict/list/str/number/bool/None) into a
+/// `serde_json::Value` by way of `json.dumps`. PyO3 doesn't offer
+/// a direct converter; routing through `json` keeps the encoding
+/// exactly the same as what the user expects.
+fn py_to_json(py: Python<'_>, obj: Option<&Bound<'_, PyAny>>) -> PyResult<serde_json::Value> {
+    let Some(obj) = obj else {
+        return Ok(serde_json::Value::Null);
+    };
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    let json_mod = py.import_bound("json")?;
+    let dumps = json_mod.getattr("dumps")?;
+    let s: String = dumps.call1((obj,))?.extract()?;
+    serde_json::from_str(&s)
+        .map_err(|e| PyValueError::new_err(format!("metadata JSON encode: {e}")))
+}
+
+/// Round-trip the other direction. We store the metadata JSON as
+/// a string in [`Prompt`] and only inflate it when the user
+/// touches the attribute.
+fn json_str_to_py(py: Python<'_>, json: &str) -> PyResult<PyObject> {
+    let json_mod = py.import_bound("json")?;
+    let loads = json_mod.getattr("loads")?;
+    Ok(loads.call1((json,))?.unbind())
+}
+
+// ---------------------------------------------------------------------------
 // Module init
 // ---------------------------------------------------------------------------
 
@@ -341,5 +607,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ToolCache>()?;
     m.add_class::<ToolCacheHit>()?;
     m.add_class::<SessionStore>()?;
+    m.add_class::<PromptRegistry>()?;
+    m.add_class::<Prompt>()?;
+    m.add_class::<PromptHit>()?;
     Ok(())
 }

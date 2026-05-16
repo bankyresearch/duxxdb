@@ -114,10 +114,8 @@ jobs:
 
   # -----------------------------------------------------------------
   # Pure-Python facade tests: unit tests (mock redis) on every Python
-  # version + an end-to-end smoke against a freshly-built duxx-server
-  # binary. The unit suite runs in milliseconds; the e2e suite spawns
-  # the daemon and exercises every Phase 7 RESP command through the
-  # facade.
+  # version. Runs in milliseconds, catches RESP-encoding regressions
+  # at the duxxdb.server.ServerClient layer.
   # -----------------------------------------------------------------
   python-facade:
     name: python facade (${{ matrix.python }})
@@ -137,6 +135,10 @@ jobs:
         working-directory: bindings/python
         run: pytest tests/test_server_facade.py -v
 
+  # -----------------------------------------------------------------
+  # End-to-end smoke: spawn a real duxx-server and exercise every
+  # Phase 7 RESP command through the Python facade.
+  # -----------------------------------------------------------------
   python-facade-e2e:
     name: python facade e2e (live duxx-server)
     runs-on: ubuntu-latest
@@ -161,3 +163,35 @@ jobs:
         env:
           DUXXDB_E2E: '1'
         run: pytest tests/test_server_e2e.py -v
+
+  # -----------------------------------------------------------------
+  # Build the maturin wheel and run the embedded-primitive Python
+  # tests against it. Catches PyO3-boundary issues (PyClass naming,
+  # signature mismatches, GIL handling) that `cargo check` misses.
+  # -----------------------------------------------------------------
+  python-wheel-tests:
+    name: python wheel tests (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wheel-ubuntu
+      - name: Install maturin + pytest
+        run: pip install maturin pytest
+      - name: Build + install the duxxdb wheel
+        working-directory: bindings/python
+        run: maturin build --release && pip install --force-reinstall ../../target/wheels/duxxdb-*.whl
+      - name: Run embedded-primitive tests
+        working-directory: bindings/python
+        run: pytest tests/test_prompt_registry.py -v

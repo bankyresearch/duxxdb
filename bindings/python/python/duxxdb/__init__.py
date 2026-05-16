@@ -38,6 +38,18 @@ cost) reach for :class:`duxxdb.server.ServerClient`. It wraps
         model="gpt-4o-mini",
         scorer="llm_judge_v1",
     )
+
+Quickstart (native PromptRegistry — embedded, no server)
+--------------------------------------------------------
+
+.. code-block:: python
+
+    import duxxdb
+
+    r = duxxdb.PromptRegistry(dim=16, storage="redb:./prompts.redb")
+    v1 = r.put("classifier", "You are a refund agent.")
+    r.tag("classifier", v1, "prod")
+    print(r.get("classifier", "prod").content)
 """
 
 from typing import TYPE_CHECKING
@@ -47,7 +59,8 @@ from typing import TYPE_CHECKING
 # ``import duxxdb``. We tolerate the import failing (e.g. when only
 # the pure-Python server facade is being used in a dev tree without a
 # built wheel) by falling back to a deferred error: anyone who
-# actually touches MemoryStore / ToolCache / SessionStore gets a
+# actually touches MemoryStore / ToolCache / SessionStore (or the
+# new PromptRegistry / Prompt / PromptHit shipped in v0.2.0) gets a
 # helpful message; anyone importing only ``duxxdb.server`` proceeds.
 try:
     from ._native import (  # type: ignore[import]
@@ -56,6 +69,9 @@ try:
         ToolCache,
         ToolCacheHit,
         SessionStore,
+        PromptRegistry,
+        Prompt,
+        PromptHit,
         __version__,
     )
 
@@ -79,6 +95,9 @@ except ImportError as _native_err:  # pragma: no cover
     ToolCache = _missing_native("ToolCache")  # type: ignore[assignment]
     ToolCacheHit = _missing_native("ToolCacheHit")  # type: ignore[assignment]
     SessionStore = _missing_native("SessionStore")  # type: ignore[assignment]
+    PromptRegistry = _missing_native("PromptRegistry")  # type: ignore[assignment]
+    Prompt = _missing_native("Prompt")  # type: ignore[assignment]
+    PromptHit = _missing_native("PromptHit")  # type: ignore[assignment]
 
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -90,6 +109,9 @@ __all__ = [
     "ToolCache",
     "ToolCacheHit",
     "SessionStore",
+    "PromptRegistry",
+    "Prompt",
+    "PromptHit",
     "ServerClient",
     "__version__",
 ]
