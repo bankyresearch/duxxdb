@@ -48,6 +48,7 @@ use duxx_storage::{Backend, BatchOp, MemoryBackend};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -59,6 +60,22 @@ mod tables {
     pub const ENTRIES: &str = "cost.entries";
     /// `tenant` -> JSON(Budget)
     pub const BUDGETS: &str = "cost.budgets";
+    /// `internal_id_be8` -> entry_id_string
+    ///
+    /// Lets ``open_with_index_dir`` resurrect the cluster-expensive
+    /// HNSW dump without re-embedding every persisted entry's
+    /// input_text. New in v0.2.2.
+    pub const ID_TO_KEY: &str = "cost.id_to_key";
+}
+
+#[inline]
+fn be_to_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Some(u64::from_be_bytes(arr))
 }
 
 /// Errors surfaced by the cost ledger.
@@ -286,18 +303,38 @@ impl CostLedger {
         Self::open(embedder, backend).expect("MemoryBackend cannot fail open")
     }
 
-    /// Build a ledger backed by the given persistence layer. On open,
-    /// scans the ``cost.entries`` and ``cost.budgets`` tables to
-    /// rebuild in-memory state, and re-embeds every entry's
-    /// ``input_text`` to rebuild the failure-clustering HNSW.
+    /// Build a ledger backed by the given persistence layer.
+    /// Re-embeds every entry's ``input_text`` on open to rebuild
+    /// the cluster-expensive HNSW.
+    ///
+    /// For million-row workloads, use
+    /// [`CostLedger::open_with_index_dir`].
     pub fn open(embedder: Arc<dyn Embedder>, backend: Arc<dyn Backend>) -> Result<Self> {
+        Self::open_with_index_dir(embedder, backend, None)
+    }
+
+    /// Like [`CostLedger::open`] but persists the
+    /// cluster-expensive HNSW under ``vector_index_dir``. On
+    /// graceful drop the dump is written back; on the next open
+    /// it's loaded directly and the re-embedding rebuild is
+    /// skipped. New in v0.2.2.
+    pub fn open_with_index_dir(
+        embedder: Arc<dyn Embedder>,
+        backend: Arc<dyn Backend>,
+        vector_index_dir: Option<&Path>,
+    ) -> Result<Self> {
         let dim = embedder.dim();
+        let vector_index = match vector_index_dir {
+            Some(dir) => VectorIndex::open(dim, 100_000, dir)
+                .map_err(|e| CostError::Embed(format!("vector index open: {e}")))?,
+            None => VectorIndex::with_capacity(dim, 100_000),
+        };
         let me = Self {
             inner: Arc::new(Inner {
                 entries: RwLock::new(Vec::new()),
                 budgets: RwLock::new(HashMap::new()),
                 embedder,
-                vector_index: RwLock::new(VectorIndex::with_capacity(dim, 100_000)),
+                vector_index: RwLock::new(vector_index),
                 id_to_entry: RwLock::new(HashMap::new()),
                 next_internal_id: RwLock::new(1),
                 bus: ChangeBus::default(),
@@ -308,7 +345,31 @@ impl CostLedger {
         Ok(me)
     }
 
+    /// Flush the cluster-expensive HNSW to disk if a persist
+    /// directory was configured.
+    pub fn flush_indices(&self) -> Result<()> {
+        self.inner
+            .vector_index
+            .read()
+            .dump()
+            .map(|_| ())
+            .map_err(|e| CostError::Embed(format!("vector index dump: {e}")))
+    }
+
+    fn persist_id_to_key(&self, internal_id: u64, entry_id: &str) -> Result<()> {
+        self.inner
+            .backend
+            .put(
+                tables::ID_TO_KEY,
+                &internal_id.to_be_bytes(),
+                entry_id.as_bytes(),
+            )
+            .map_err(|e| CostError::Embed(format!("backend put id_to_key: {e}")))
+    }
+
     fn rehydrate(&self) -> Result<()> {
+        let skip_reembed = self.inner.vector_index.read().was_loaded_from_disk();
+
         // ---- entries ----
         let entries = self
             .inner
@@ -324,26 +385,58 @@ impl CostLedger {
         // Sort by timestamp so the in-memory order matches new
         // inserts after rehydrate.
         decoded.sort_by_key(|e| e.recorded_at_unix_ns);
-        for entry in &decoded {
-            if !entry.input_text.is_empty() {
-                let emb = self
-                    .inner
-                    .embedder
-                    .embed(&entry.input_text)
-                    .map_err(|e| CostError::Embed(e.to_string()))?;
-                let internal_id = self.bump_internal_id();
-                self.inner
-                    .vector_index
-                    .write()
-                    .insert(internal_id, emb)
-                    .map_err(|e| CostError::Embed(format!("vector index: {e}")))?;
-                self.inner
-                    .id_to_entry
-                    .write()
-                    .insert(internal_id, entry.id.clone());
+        // SLOW PATH ONLY: re-embed every entry with input_text.
+        if !skip_reembed {
+            for entry in &decoded {
+                if !entry.input_text.is_empty() {
+                    let emb = self
+                        .inner
+                        .embedder
+                        .embed(&entry.input_text)
+                        .map_err(|e| CostError::Embed(e.to_string()))?;
+                    let internal_id = self.bump_internal_id();
+                    self.inner
+                        .vector_index
+                        .write()
+                        .insert(internal_id, emb)
+                        .map_err(|e| CostError::Embed(format!("vector index: {e}")))?;
+                    self.inner
+                        .id_to_entry
+                        .write()
+                        .insert(internal_id, entry.id.clone());
+                    self.persist_id_to_key(internal_id, &entry.id).ok();
+                }
             }
         }
         *self.inner.entries.write() = decoded;
+
+        // FAST PATH: rebuild id_to_entry from the dedicated table.
+        if skip_reembed {
+            let id_rows = self
+                .inner
+                .backend
+                .scan(tables::ID_TO_KEY)
+                .map_err(|e| CostError::Embed(format!("backend scan id_to_key: {e}")))?;
+            let mut max_internal = 0u64;
+            for (key_bytes, value_bytes) in id_rows {
+                let internal_id = match be_to_u64(&key_bytes) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let entry_id = match std::str::from_utf8(&value_bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+                if internal_id > max_internal {
+                    max_internal = internal_id;
+                }
+                self.inner.id_to_entry.write().insert(internal_id, entry_id);
+            }
+            if max_internal > 0 {
+                let mut n = self.inner.next_internal_id.write();
+                *n = max_internal + 1;
+            }
+        }
 
         // ---- budgets ----
         let budgets = self
@@ -415,6 +508,7 @@ impl CostLedger {
                 .id_to_entry
                 .write()
                 .insert(internal_id, entry_id.clone());
+            self.persist_id_to_key(internal_id, &entry_id).ok();
         }
 
         self.inner.entries.write().push(entry);

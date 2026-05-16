@@ -220,6 +220,14 @@ impl Server {
             Arc<dyn Backend>,
             Arc<dyn Backend>,
         );
+        // v0.2.2: HNSW dump subdirs for the four primitives with a
+        // vector index. Populated only when in `dir:` mode; otherwise
+        // each primitive keeps its index in memory and rebuilds on
+        // open.
+        let mut prompts_hnsw_dir: Option<std::path::PathBuf> = None;
+        let mut datasets_hnsw_dir: Option<std::path::PathBuf> = None;
+        let mut evals_hnsw_dir: Option<std::path::PathBuf> = None;
+        let mut costs_hnsw_dir: Option<std::path::PathBuf> = None;
 
         if let Some(dir_spec) = trimmed.strip_prefix("dir:") {
             let dir = std::path::PathBuf::from(dir_spec);
@@ -238,6 +246,13 @@ impl Server {
             replays_b = mk("replays.redb")?;
             traces_b = mk("traces.redb")?;
             costs_b = mk("costs.redb")?;
+            // v0.2.2: HNSW dump dirs sit alongside each primitive's
+            // redb file. ``VectorIndex::open`` is idempotent — it
+            // creates the dir if missing and loads any existing dump.
+            prompts_hnsw_dir = Some(dir.join("prompts.hnsw"));
+            datasets_hnsw_dir = Some(dir.join("datasets.hnsw"));
+            evals_hnsw_dir = Some(dir.join("evals.hnsw"));
+            costs_hnsw_dir = Some(dir.join("costs.hnsw"));
             // Drop the version-pin file under the dir so future
             // versions can refuse to load incompatible schemas.
             let version_path = dir.join("version.json");
@@ -269,19 +284,37 @@ impl Server {
         }
 
         // Reopen every primitive on top of the new backends. Each
-        // ``open`` rehydrates whatever is already on disk.
-        self.prompts = PromptRegistry::open(embedder.clone(), prompts_b)
-            .map_err(|e| anyhow::anyhow!("PromptRegistry::open: {e}"))?;
-        self.datasets = DatasetRegistry::open(embedder.clone(), datasets_b)
-            .map_err(|e| anyhow::anyhow!("DatasetRegistry::open: {e}"))?;
-        self.evals = EvalRegistry::open(embedder.clone(), evals_b)
-            .map_err(|e| anyhow::anyhow!("EvalRegistry::open: {e}"))?;
+        // ``open`` rehydrates whatever is already on disk. The four
+        // primitives with a vector index also get a HNSW dump dir
+        // (v0.2.2) so graceful reopen skips re-embedding.
+        self.prompts = PromptRegistry::open_with_index_dir(
+            embedder.clone(),
+            prompts_b,
+            prompts_hnsw_dir.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("PromptRegistry::open: {e}"))?;
+        self.datasets = DatasetRegistry::open_with_index_dir(
+            embedder.clone(),
+            datasets_b,
+            datasets_hnsw_dir.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("DatasetRegistry::open: {e}"))?;
+        self.evals = EvalRegistry::open_with_index_dir(
+            embedder.clone(),
+            evals_b,
+            evals_hnsw_dir.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("EvalRegistry::open: {e}"))?;
         self.replays = ReplayRegistry::open(replays_b)
             .map_err(|e| anyhow::anyhow!("ReplayRegistry::open: {e}"))?;
         self.traces = TraceStore::open(traces_b)
             .map_err(|e| anyhow::anyhow!("TraceStore::open: {e}"))?;
-        self.costs = CostLedger::open(embedder.clone(), costs_b)
-            .map_err(|e| anyhow::anyhow!("CostLedger::open: {e}"))?;
+        self.costs = CostLedger::open_with_index_dir(
+            embedder.clone(),
+            costs_b,
+            costs_hnsw_dir.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("CostLedger::open: {e}"))?;
         Ok(self)
     }
 
