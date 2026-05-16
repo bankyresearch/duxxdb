@@ -72,6 +72,23 @@ try:
         PromptRegistry,
         Prompt,
         PromptHit,
+        # v0.2.1: native bindings for the remaining Phase 7 primitives.
+        CostLedger,
+        CostEntry,
+        Budget,
+        DatasetRegistry,
+        Dataset,
+        DatasetRow,
+        EvalRegistry,
+        EvalRun,
+        EvalScore,
+        EvalSummary,
+        ReplayRegistry,
+        ReplayInvocation,
+        ReplaySession,
+        ReplayRun,
+        TraceStore,
+        Span,
         __version__,
     )
 
@@ -98,12 +115,29 @@ except ImportError as _native_err:  # pragma: no cover
     PromptRegistry = _missing_native("PromptRegistry")  # type: ignore[assignment]
     Prompt = _missing_native("Prompt")  # type: ignore[assignment]
     PromptHit = _missing_native("PromptHit")  # type: ignore[assignment]
+    CostLedger = _missing_native("CostLedger")  # type: ignore[assignment]
+    CostEntry = _missing_native("CostEntry")  # type: ignore[assignment]
+    Budget = _missing_native("Budget")  # type: ignore[assignment]
+    DatasetRegistry = _missing_native("DatasetRegistry")  # type: ignore[assignment]
+    Dataset = _missing_native("Dataset")  # type: ignore[assignment]
+    DatasetRow = _missing_native("DatasetRow")  # type: ignore[assignment]
+    EvalRegistry = _missing_native("EvalRegistry")  # type: ignore[assignment]
+    EvalRun = _missing_native("EvalRun")  # type: ignore[assignment]
+    EvalScore = _missing_native("EvalScore")  # type: ignore[assignment]
+    EvalSummary = _missing_native("EvalSummary")  # type: ignore[assignment]
+    ReplayRegistry = _missing_native("ReplayRegistry")  # type: ignore[assignment]
+    ReplayInvocation = _missing_native("ReplayInvocation")  # type: ignore[assignment]
+    ReplaySession = _missing_native("ReplaySession")  # type: ignore[assignment]
+    ReplayRun = _missing_native("ReplayRun")  # type: ignore[assignment]
+    TraceStore = _missing_native("TraceStore")  # type: ignore[assignment]
+    Span = _missing_native("Span")  # type: ignore[assignment]
 
 
 if TYPE_CHECKING:  # pragma: no cover
     from .server import ServerClient
 
 __all__ = [
+    # Phase 6 + early Phase 7 (v0.1.x / v0.2.0)
     "MemoryStore",
     "MemoryHit",
     "ToolCache",
@@ -112,6 +146,24 @@ __all__ = [
     "PromptRegistry",
     "Prompt",
     "PromptHit",
+    # v0.2.1: native bindings for the rest of Phase 7
+    "CostLedger",
+    "CostEntry",
+    "Budget",
+    "DatasetRegistry",
+    "Dataset",
+    "DatasetRow",
+    "EvalRegistry",
+    "EvalRun",
+    "EvalScore",
+    "EvalSummary",
+    "ReplayRegistry",
+    "ReplayInvocation",
+    "ReplaySession",
+    "ReplayRun",
+    "TraceStore",
+    "Span",
+    # Server facade (lazy)
     "ServerClient",
     "__version__",
 ]

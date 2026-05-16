@@ -194,4 +194,4 @@ jobs:
         run: maturin build --release && pip install --force-reinstall ../../target/wheels/duxxdb-*.whl
       - name: Run embedded-primitive tests
         working-directory: bindings/python
-        run: pytest tests/test_prompt_registry.py -v
+        run: pytest tests/test_prompt_registry.py tests/test_phase7_native.py -v
