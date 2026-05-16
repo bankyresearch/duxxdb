@@ -63,6 +63,8 @@ Output:
 
 ## API surface
 
+### Embedded (native, no server required)
+
 | Class | Constructor | Methods |
 |---|---|---|
 | `MemoryStore` | `dim`, `capacity=100_000` | `remember(key, text, embedding) -> id`, `recall(key, query, embedding, k=10) -> [MemoryHit]`, `len()`, `dim` |
@@ -72,6 +74,65 @@ Output:
 | `SessionStore` | `ttl_secs=1800` | `put(session_id, data)`, `get(session_id) -> bytes \| None`, `delete(session_id) -> bool`, `purge_expired()`, `len()` |
 
 Module-level: `duxxdb.__version__`.
+
+### Server (typed Python facade over RESP)
+
+When you're running `duxx-server` as a daemon and want a typed Python
+surface over the **Phase 7 agent-ops primitives** (traces, prompts,
+datasets, evals, replay, cost ledger), install the `server` extra:
+
+```bash
+pip install 'duxxdb[server]'
+```
+
+```python
+from duxxdb.server import ServerClient
+
+client = ServerClient(url="redis://:<token>@localhost:6379")
+
+# Phase 7.2 — prompt registry
+v1 = client.prompts.put("classifier", "you are a refund agent")
+prompt = client.prompts.get("classifier", v1)
+
+# Phase 7.3 — dataset registry
+client.datasets.create("refunds")
+ds_v = client.datasets.add("refunds", [
+    {"id": "r1", "text": "I want a refund", "split": "train"},
+    {"id": "r2", "text": "Where is my package?", "split": "test"},
+])
+
+# Phase 7.4 — evals with summary stats + failure clustering
+run_id = client.evals.start(
+    dataset_name="refunds",
+    dataset_version=ds_v,
+    model="gpt-4o-mini",
+    scorer="llm_judge",
+    prompt_name="classifier",
+    prompt_version=v1,
+)
+client.evals.score(run_id, row_id="r1", score=0.9, output_text="REFUND")
+client.evals.score(run_id, row_id="r2", score=0.1, output_text="REFUND")
+summary = client.evals.complete(run_id)
+print(summary.mean, summary.pass_rate_50)
+
+# Phase 7.6 — cost ledger
+client.cost.record(tenant="acme", model="gpt-4o-mini",
+                   tokens_in=120, tokens_out=80, cost_usd=0.0023)
+print(client.cost.total("acme"))
+```
+
+| Namespace | Wraps | Methods (highlights) |
+|---|---|---|
+| `client.trace` | `TRACE.*` (6 cmds) | `record`, `close`, `get`, `subtree`, `thread`, `search` |
+| `client.prompts` | `PROMPT.*` (9 cmds) | `put`, `get`, `list`, `names`, `tag`, `untag`, `delete`, `search`, `diff` |
+| `client.datasets` | `DATASET.*` (13 cmds) | `create`, `add`, `get`, `sample`, `size`, `splits`, `search`, `from_recall`, …  |
+| `client.evals` | `EVAL.*` (9 cmds) | `start`, `score`, `complete`, `get`, `scores`, `list`, `compare`, `cluster_failures` |
+| `client.replay` | `REPLAY.*` (12 cmds) | `capture`, `start`, `step`, `record`, `complete`, `diff`, `list_runs`, … |
+| `client.cost` | `COST.*` (10 cmds) | `record`, `query`, `aggregate`, `total`, `set_budget`, `status`, `alerts`, `cluster_expensive` |
+
+All return types are plain `dataclasses` decoded from the server's
+JSON responses. The raw `redis.Redis` client is exposed as
+`client.raw` for anything not yet wrapped.
 
 ## ToolCache: semantic-near-hit demo
 

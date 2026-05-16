@@ -45,6 +45,14 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+# Pulls in redis-py so ``from duxxdb.server import ServerClient`` works.
+# Required to talk to a running duxx-server over RESP. The embedded
+# MemoryStore / ToolCache / SessionStore do not need it.
+server = ["redis>=5.0,<7.0"]
+# Test dependencies for the pure-python server facade.
+test = ["pytest>=7.0", "redis>=5.0,<7.0"]
+
 [project.urls]
 Homepage = "https://github.com/bankyresearch/duxxdb"
 Documentation = "https://github.com/bankyresearch/duxxdb/tree/master/docs"
