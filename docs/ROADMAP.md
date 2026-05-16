@@ -315,8 +315,9 @@ EVAL.COMPARE           old-run new-run           -> "did v8 fix the cluster?"
 ```
 
 The crate captures LLM/tool invocations and plays them back; it does
-NOT execute LLM calls itself. Caller code drives execution. Same
-posture as Braintrust / LangSmith — keeps the engine pure Rust storage.
+NOT execute LLM calls itself. Caller code drives execution. This
+store-only posture keeps the engine pure Rust storage — no LLM SDKs,
+no Python in the hot path.
 
 Capabilities:
 - Three replay modes: `Cached` (pure playback), `Live` (re-execute),
@@ -345,11 +346,12 @@ Tests: 17 crate-level + 9 RESP-level. Workspace at 222 tests.
 Eval runs + per-row scores + regression detection + **semantic
 failure clustering** via the shared HNSW.
 
-The store-only posture matches Braintrust / LangSmith: callers run
-their own LLM-judge / exact_match / etc. and POST scores. DuxxDB
-records, summarizes, and **clusters semantically-similar failures**
-— the unique move because eval failures share the same vector
-space as memories, prompts, dataset rows, and traces.
+The store-only posture is deliberate: callers run their own
+LLM-judge / exact_match / etc. and POST scores. DuxxDB records,
+summarizes, and **clusters semantically-similar failures** — the
+unique move, because eval failures share the same vector space as
+memories, prompts, dataset rows, and traces. One query plan reaches
+across all five primitives.
 
 Capabilities:
 - `EvalRun` lifecycle: `start` → `score(many)` → `complete` / `fail`.
