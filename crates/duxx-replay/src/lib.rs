@@ -37,6 +37,7 @@
 //!   in-memory stores.
 
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
+use duxx_storage::{Backend, MemoryBackend};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -44,6 +45,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+mod tables {
+    /// `trace_id` -> JSON(ReplaySession)
+    pub const SESSIONS: &str = "replay.sessions";
+    /// `run_id` -> JSON(ReplayRun)
+    pub const RUNS: &str = "replay.runs";
+}
 
 /// Errors surfaced by the replay registry.
 #[derive(Debug, Error)]
@@ -58,6 +66,8 @@ pub enum ReplayError {
     OutOfRange(usize, usize),
     #[error("captured invocation has no recorded output for cached mode")]
     NoCachedOutput,
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 pub type Result<T> = std::result::Result<T, ReplayError>;
@@ -287,6 +297,7 @@ struct Inner {
     /// run_id -> run
     runs: RwLock<HashMap<String, ReplayRun>>,
     bus: ChangeBus,
+    backend: Arc<dyn Backend>,
 }
 
 impl std::fmt::Debug for ReplayRegistry {
@@ -307,13 +318,70 @@ impl Default for ReplayRegistry {
 }
 
 impl ReplayRegistry {
+    /// Build a non-persistent registry. Equivalent to
+    /// ``open(MemoryBackend::new())``.
     pub fn new() -> Self {
-        Self {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        Self::open(backend).expect("MemoryBackend cannot fail open")
+    }
+
+    /// Build a registry backed by the given persistence layer. On
+    /// open, scans the ``replay.sessions`` and ``replay.runs`` tables
+    /// to rebuild in-memory state.
+    pub fn open(backend: Arc<dyn Backend>) -> Result<Self> {
+        let me = Self {
             inner: Arc::new(Inner {
                 sessions: RwLock::new(HashMap::new()),
                 runs: RwLock::new(HashMap::new()),
                 bus: ChangeBus::default(),
+                backend,
             }),
+        };
+        me.rehydrate()?;
+        Ok(me)
+    }
+
+    fn rehydrate(&self) -> Result<()> {
+        let sessions = self
+            .inner
+            .backend
+            .scan(tables::SESSIONS)
+            .map_err(|e| ReplayError::Storage(format!("backend scan sessions: {e}")))?;
+        for (_k, value_bytes) in sessions {
+            let s: ReplaySession = serde_json::from_slice(&value_bytes)
+                .map_err(|e| ReplayError::Storage(format!("session decode: {e}")))?;
+            self.inner.sessions.write().insert(s.trace_id.clone(), s);
+        }
+        let runs = self
+            .inner
+            .backend
+            .scan(tables::RUNS)
+            .map_err(|e| ReplayError::Storage(format!("backend scan runs: {e}")))?;
+        for (_k, value_bytes) in runs {
+            let r: ReplayRun = serde_json::from_slice(&value_bytes)
+                .map_err(|e| ReplayError::Storage(format!("run decode: {e}")))?;
+            self.inner.runs.write().insert(r.id.clone(), r);
+        }
+        Ok(())
+    }
+
+    fn persist_session(&self, session: &ReplaySession) {
+        if let Ok(bytes) = serde_json::to_vec(session) {
+            if let Err(e) = self
+                .inner
+                .backend
+                .put(tables::SESSIONS, session.trace_id.as_bytes(), &bytes)
+            {
+                tracing::warn!(error = %e, "backend persist replay session failed");
+            }
+        }
+    }
+
+    fn persist_run(&self, run: &ReplayRun) {
+        if let Ok(bytes) = serde_json::to_vec(run) {
+            if let Err(e) = self.inner.backend.put(tables::RUNS, run.id.as_bytes(), &bytes) {
+                tracing::warn!(error = %e, "backend persist replay run failed");
+            }
         }
     }
 
@@ -347,7 +415,9 @@ impl ReplayRegistry {
         }
         session.invocations.push(invocation);
         session.fingerprint = fingerprint(&session.invocations);
+        let snapshot = session.clone();
         drop(sessions);
+        self.persist_session(&snapshot);
         self.inner.bus.publish(ChangeEvent {
             table: "replay".to_string(),
             key: Some(trace_id),
@@ -407,6 +477,7 @@ impl ReplayRegistry {
             completed_at_unix_ns: None,
             metadata,
         };
+        self.persist_run(&run);
         self.inner.runs.write().insert(id.clone(), run);
         self.inner.bus.publish(ChangeEvent {
             table: "replay".to_string(),
@@ -452,6 +523,9 @@ impl ReplayRegistry {
         }
         loop {
             if run.current_idx >= session.invocations.len() {
+                let snapshot = run.clone();
+                drop(runs);
+                self.persist_run(&snapshot);
                 return Ok(None);
             }
             let idx = run.current_idx;
@@ -521,7 +595,9 @@ impl ReplayRegistry {
             };
             let trace_id = run.source_trace_id.clone();
             let run_id_owned = run_id.to_string();
+            let snapshot = run.clone();
             drop(runs);
+            self.persist_run(&snapshot);
             self.inner.bus.publish(ChangeEvent {
                 table: "replay".to_string(),
                 key: Some(run_id_owned),
@@ -559,7 +635,9 @@ impl ReplayRegistry {
         if matches!(run.status, ReplayStatus::Pending) {
             run.status = ReplayStatus::Running;
         }
+        let snapshot = run.clone();
         drop(runs);
+        self.persist_run(&snapshot);
         self.inner.bus.publish(ChangeEvent {
             table: "replay".to_string(),
             key: Some(run_id.into()),
@@ -576,26 +654,35 @@ impl ReplayRegistry {
         run_id: &str,
         replay_trace_id: impl Into<String>,
     ) -> Result<()> {
-        let mut runs = self.inner.runs.write();
-        let run = runs
-            .get_mut(run_id)
-            .ok_or_else(|| ReplayError::RunNotFound(run_id.into()))?;
-        run.replay_trace_id = Some(replay_trace_id.into());
+        let snapshot;
+        {
+            let mut runs = self.inner.runs.write();
+            let run = runs
+                .get_mut(run_id)
+                .ok_or_else(|| ReplayError::RunNotFound(run_id.into()))?;
+            run.replay_trace_id = Some(replay_trace_id.into());
+            snapshot = run.clone();
+        }
+        self.persist_run(&snapshot);
         Ok(())
     }
 
     /// Finalize a replay run.
     pub fn complete(&self, run_id: &str) -> Result<()> {
-        let mut runs = self.inner.runs.write();
-        let run = runs
-            .get_mut(run_id)
-            .ok_or_else(|| ReplayError::RunNotFound(run_id.into()))?;
-        if run.status.is_terminal() {
-            return Err(ReplayError::WrongState(run_id.into(), run.status));
+        let snapshot;
+        {
+            let mut runs = self.inner.runs.write();
+            let run = runs
+                .get_mut(run_id)
+                .ok_or_else(|| ReplayError::RunNotFound(run_id.into()))?;
+            if run.status.is_terminal() {
+                return Err(ReplayError::WrongState(run_id.into(), run.status));
+            }
+            run.status = ReplayStatus::Completed;
+            run.completed_at_unix_ns = Some(now_unix_ns());
+            snapshot = run.clone();
         }
-        run.status = ReplayStatus::Completed;
-        run.completed_at_unix_ns = Some(now_unix_ns());
-        drop(runs);
+        self.persist_run(&snapshot);
         self.inner.bus.publish(ChangeEvent {
             table: "replay".to_string(),
             key: Some(run_id.into()),
@@ -607,24 +694,28 @@ impl ReplayRegistry {
 
     /// Mark a run as failed.
     pub fn fail(&self, run_id: &str, reason: impl Into<String>) -> Result<()> {
-        let mut runs = self.inner.runs.write();
-        let run = runs
-            .get_mut(run_id)
-            .ok_or_else(|| ReplayError::RunNotFound(run_id.into()))?;
-        if run.status.is_terminal() {
-            return Err(ReplayError::WrongState(run_id.into(), run.status));
+        let snapshot;
+        {
+            let mut runs = self.inner.runs.write();
+            let run = runs
+                .get_mut(run_id)
+                .ok_or_else(|| ReplayError::RunNotFound(run_id.into()))?;
+            if run.status.is_terminal() {
+                return Err(ReplayError::WrongState(run_id.into(), run.status));
+            }
+            run.status = ReplayStatus::Failed;
+            run.completed_at_unix_ns = Some(now_unix_ns());
+            if let serde_json::Value::Object(ref mut map) = run.metadata {
+                map.insert(
+                    "failure_reason".to_string(),
+                    serde_json::Value::String(reason.into()),
+                );
+            } else {
+                run.metadata = serde_json::json!({"failure_reason": reason.into()});
+            }
+            snapshot = run.clone();
         }
-        run.status = ReplayStatus::Failed;
-        run.completed_at_unix_ns = Some(now_unix_ns());
-        if let serde_json::Value::Object(ref mut map) = run.metadata {
-            map.insert(
-                "failure_reason".to_string(),
-                serde_json::Value::String(reason.into()),
-            );
-        } else {
-            run.metadata = serde_json::json!({"failure_reason": reason.into()});
-        }
-        drop(runs);
+        self.persist_run(&snapshot);
         self.inner.bus.publish(ChangeEvent {
             table: "replay".to_string(),
             key: Some(run_id.into()),
@@ -1046,5 +1137,31 @@ mod tests {
         assert_eq!(s.invocations, 3);
         assert_eq!(s.runs, 1);
         assert_eq!(s.completed, 1);
+    }
+
+    // ---------------------------------------------------------------- persistence
+
+    #[test]
+    fn open_rehydrates_sessions_and_runs() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let trace_id;
+        let run_id;
+        {
+            let r = ReplayRegistry::open(backend.clone()).unwrap();
+            trace_id = captured_session(&r);
+            run_id = r
+                .start(&trace_id, ReplayMode::Live, vec![], serde_json::Value::Null)
+                .unwrap();
+            r.record_output(&run_id, 0, serde_json::json!("y")).unwrap();
+            r.set_replay_trace_id(&run_id, "trace-out-123").unwrap();
+            r.complete(&run_id).unwrap();
+        }
+        let r = ReplayRegistry::open(backend.clone()).unwrap();
+        let session = r.get_session(&trace_id).unwrap();
+        assert_eq!(session.invocations.len(), 3);
+        let run = r.get_run(&run_id).unwrap();
+        assert!(matches!(run.status, ReplayStatus::Completed));
+        assert_eq!(run.replay_trace_id.as_deref(), Some("trace-out-123"));
+        assert_eq!(run.outputs.get(&0), Some(&serde_json::json!("y")));
     }
 }
