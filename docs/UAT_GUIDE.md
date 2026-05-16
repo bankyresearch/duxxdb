@@ -157,21 +157,27 @@ Add to your MCP server config:
 
 The agent now has `remember`, `recall`, and `stats` tools.
 
-### LangChain (Python)
+### Wiring DuxxDB into a Python agent framework
+
+Most Python agent frameworks let you supply a custom memory class.
+The shape is the same regardless of framework: hold a
+`duxxdb.MemoryStore`, embed text on save, hand back recall results
+on load.
 
 ```python
-from langchain.memory import BaseMemory
 import duxxdb
 
-class DuxxMemory(BaseMemory):
+class DuxxMemory:
     def __init__(self, key: str, dim: int = 1536):
         self.key = key
         self.store = duxxdb.MemoryStore(dim=dim)
         # ... wire up your embedder of choice ...
-    # implement load_memory_variables / save_context
+    # implement your framework's save / load hooks against self.store
 ```
 
-A first-class `langchain-duxxdb` package is on the post-UAT roadmap.
+The simpler route — when the framework already speaks Redis — is
+to point its built-in memory adapter at `duxx-server` over RESP.
+See INTEGRATION_GUIDE.md for the recipe.
 
 ### Reactive supervisor agent
 

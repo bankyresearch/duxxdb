@@ -2,10 +2,10 @@
 //!
 //! Agent debugging usually goes: **find a failure → reproduce it →
 //! tweak something → re-run → did it fix the cluster?** The middle
-//! steps are where most time disappears, because every agent stack
-//! reproduces failures by hand: copy the inputs out of LangSmith,
-//! paste into a Python REPL, hope you got the prompt / model / seed
-//! right.
+//! steps are where most time disappears, because most agent stacks
+//! reproduce failures by hand: copy the inputs out of whatever
+//! tracing tool captured them, paste into a Python REPL, hope you
+//! got the prompt / model / seed right.
 //!
 //! `duxx-replay` makes the loop a first-class primitive. The crate
 //! does **not** execute LLM calls — caller code still drives the

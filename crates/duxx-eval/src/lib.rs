@@ -7,9 +7,10 @@
 //! version, drill into individual failures.
 //!
 //! `duxx-eval` is the **storage + analysis** half of that loop. The
-//! actual inference + scoring is the caller's responsibility (same
-//! posture as Braintrust / LangSmith). Once scores are POSTed, this
-//! crate gives you:
+//! actual inference + scoring is the caller's responsibility — this
+//! crate is store-only on purpose, keeping the engine pure Rust with
+//! no LLM SDKs in the hot path. Once scores are POSTed, this crate
+//! gives you:
 //!
 //! - **EvalRun** records — one per "I scored dataset X v3 with prompt
 //!   refund-classifier v7 on gpt-4o using llm-judge".

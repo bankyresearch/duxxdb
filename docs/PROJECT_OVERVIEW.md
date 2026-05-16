@@ -148,25 +148,28 @@ RESP / gRPC / MCP servers wrap.
 
 ## 4. What makes it unique
 
-| Differentiator | Status | Who else has it? |
-|---|---|---|
-| Hybrid (vector + BM25 + structured) in **one query plan** with **RRF** | ✅ | Weaviate has hybrid but not RRF; pgvector has both but no RRF planner |
-| **Embedded *and* server** from one Rust codebase | ✅ | LanceDB has embedded; Qdrant is server-only |
-| Agent primitives (`MEMORY`, `TOOL_CACHE`, `SESSION`) as **first-class types** | ✅ | Nobody — agent frameworks (LangChain, LlamaIndex) bolt this on top of generic stores |
-| `TOOL_CACHE` with **semantic-near-hit** lookup (cosine ≥ 0.95 of args embedding) | ✅ | Nobody — saves real money on expensive tool calls |
-| **MCP-native** wire protocol (stdio JSON-RPC 2.0) | ✅ | Nobody (MCP is from late 2024; everyone else writes adapter code) |
-| **Reactive subscriptions** with glob pattern + per-key channels | ✅ | Redis/Valkey have it on KV (`PSUBSCRIBE`); nobody has reactive *on hybrid memory* |
-| **gRPC streaming Subscribe** for typed cross-language consumers | ✅ | Nobody |
-| **Importance decay** (cross-restart Unix-epoch timestamps) | ✅ | Nobody — agent frameworks decay client-side |
-| Pure Rust core — no GC pauses, no FFI bottlenecks | ✅ | Qdrant ✅, LanceDB ✅; Pinecone/Weaviate/Milvus all have GC |
-| Apache 2.0, no proprietary "open core" tax | ✅ | Pinecone is proprietary; Milvus has Zilliz cloud lock-in pressure |
-| **Apache Parquet cold-tier export** | ✅ | Nobody bundles it for agent memory |
-| **Auth + Prometheus /metrics + gRPC health + graceful shutdown** out of the box | ✅ | Most OSS vector DBs leave at least one of these to the operator |
+DuxxDB is built **for agents specifically**, not retrofitted from a
+general-purpose store. That shapes every design choice:
 
-**The single biggest differentiator:** every other tool forces you to
-*choose* between vector / KV / SQL, or to *compose* multiple stores
-yourself. DuxxDB collapses that decision and ships across six client
-surfaces from one binary.
+| Capability | What it gives you |
+|---|---|
+| Hybrid (vector + BM25 + structured) in **one query plan** with **RRF** | One recall call returns semantic + keyword + filtered results, fused. No second roundtrip, no client-side merging. |
+| **Embedded *and* server** from one Rust codebase | Same engine, same query plan in-process or behind RESP / gRPC / MCP. Move from notebook to production without changing schema. |
+| Agent primitives (`MEMORY`, `TOOL_CACHE`, `SESSION`) as **first-class types** | The data model knows what an agent stores. You do not assemble these out of a generic KV + a generic vector index. |
+| `TOOL_CACHE` with **semantic-near-hit** lookup (cosine ≥ 0.95 on the args embedding) | Skip the expensive tool call when the new args mean the same thing as a cached call. Real dollars saved on every near-duplicate. |
+| **MCP-native** wire protocol (stdio JSON-RPC 2.0) | Any MCP-aware client — Claude Desktop, Cline, Cursor — plugs in with zero adapter code. |
+| **Reactive subscriptions** on hybrid memory (glob patterns + per-key channels) | Push semantics on agent state, not just on plain keys. Build dashboards and live-updating crews against memory changes. |
+| **gRPC streaming Subscribe** for typed cross-language consumers | Strongly typed change feed without writing a protocol adapter. |
+| **Importance decay** with cross-restart Unix-epoch timestamps | Forgetting is part of the storage model, not application logic. |
+| Pure Rust core — no GC pauses, no FFI bottlenecks | p99 latency stays flat under load. |
+| Apache 2.0, no proprietary "open core" tier | Production features (auth, TLS, metrics, gRPC health) ship in the same binary. |
+| **Apache Parquet cold-tier export** | Move old memories to object storage with one command; query them later with DuckDB / Spark. |
+| **Auth + Prometheus /metrics + gRPC health + graceful shutdown** | Operationally complete on day one — not a Phase 4 chore. |
+
+**The single biggest differentiator:** you don't *compose* DuxxDB out
+of three databases. It ships agent-native primitives, six wire
+surfaces, and production hardening as a single binary you `cargo
+install` or `docker pull`.
 
 ---
 
@@ -379,39 +382,36 @@ Full spec: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ---
 
-## 8. Competitive landscape
+## 8. Where DuxxDB fits
 
-✅ = first-class • ⚠ = partial / extension • ✗ = not supported
+DuxxDB is purpose-built for **the storage tier of an AI agent** —
+the place that holds memories, tool-call results, sessions, traces,
+prompts, datasets, eval runs, replay sessions, and a cost ledger,
+and answers hybrid (vector + BM25 + structured) recall in
+sub-millisecond p99.
 
-|                       | Vector ANN | BM25 | Structured | Embedded | Server | Reactive | Agent prims | MCP | License | Lang |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|---|---|
-| **Redis** (post-2024) | ✗      | ✗    | ⚠         | ✗       | ✅      | ✅       | ✗          | ✗  | RSALv2/SSPL (non-OSS) | C |
-| **Valkey**            | ⚠ (module) | ⚠ (module) | ⚠ | ✗       | ✅      | ✅       | ✗          | ✗  | BSD-3 | C |
-| **DiceDB**            | ✗      | ✗    | ⚠         | ✗       | ✅      | ✅       | ✗          | ✗  | AGPL | Go |
-| **Qdrant**            | ✅      | ⚠    | ⚠         | ✗       | ✅      | ⚠       | ✗          | ✗  | Apache 2 | Rust |
-| **Pinecone**          | ✅      | ✗    | ⚠         | ✗       | ✅      | ✗       | ✗          | ✗  | Proprietary | (closed) |
-| **Milvus**            | ✅      | ⚠    | ✅         | ✗       | ✅      | ✗       | ✗          | ✗  | Apache 2 | Go / C++ |
-| **Weaviate**          | ✅      | ✅    | ✅         | ✗       | ✅      | ✗       | ✗          | ✗  | BSD-3 | Go |
-| **pgvector** (Postgres) | ✅    | ⚠    | ✅         | ✗       | ✅      | ⚠       | ✗          | ✗  | PostgreSQL | C |
-| **LanceDB**           | ✅      | ⚠    | ✅         | ✅       | ⚠       | ✗       | ✗          | ✗  | Apache 2 | Rust |
-| **ChromaDB**          | ✅      | ✗    | ⚠         | ✅       | ✅      | ✗       | ⚠          | ✗  | Apache 2 | Python |
-| **DuckDB**            | ⚠ (ext) | ⚠    | ✅         | ✅       | ✗      | ✗       | ✗          | ✗  | MIT | C++ |
-| **DuxxDB**            | ✅      | ✅    | ✅         | ✅       | ✅      | ✅       | ✅          | ✅  | Apache 2 | Rust |
+**Reach for DuxxDB when the workload is agent-shaped:**
 
-### When each one is the right choice
+- You need **hybrid recall** (vector + keyword + filters) in one
+  query plan, not three round trips.
+- You want **agent primitives as first-class types** —
+  `MemoryStore`, `ToolCache`, `SessionStore`, `TraceStore`,
+  `PromptRegistry`, `DatasetRegistry`, `EvalRegistry`,
+  `ReplayRegistry`, `CostLedger` — not generic KV + vector you
+  assemble yourself.
+- You want **one binary** that gives you embedded mode, RESP, gRPC,
+  MCP, REST, and Parquet export — same query plan everywhere.
+- You want **reactive subscriptions on hybrid memory**, not just on
+  plain keys.
+- You want **production hardening on day one**: auth, TLS,
+  Prometheus metrics, gRPC health, graceful shutdown.
 
-- **Pure KV with reactive (sessions only):** **Valkey** is the
-  default OSS answer (BSD-3, Linux Foundation, AWS/Google/Snap
-  backed). DiceDB if you want reactive-first design. We don't try to
-  replace either at the raw KV job; we coexist (see below).
-- **Pure vector search at scale:** Qdrant if you're already in Rust,
-  Pinecone if you want hosted, Milvus if you need distributed.
-- **You're already on Postgres:** pgvector. Don't add another store.
-- **Embedded analytics + occasional vector:** LanceDB or DuckDB +
-  vector extension.
-- **Pre-built RAG with batteries:** ChromaDB, LlamaIndex+Postgres.
-- **Building an agent and starting fresh:** **DuxxDB.** Single dep,
-  hybrid retrieval, no glue, agent primitives, six integration paths.
+**It is fine to coexist with what you already run.** DuxxDB does not
+try to be your OLTP database, your distributed cache, or your data
+warehouse. Postgres still owns users / billing / SQL analytics;
+Valkey or Redis still own raw KV and rate-limit counters; DuckDB or
+Spark still own offline analytics over Parquet exports. DuxxDB owns
+the **agent recall + agent-ops path**.
 
 ### Coexistence with Valkey / Redis
 

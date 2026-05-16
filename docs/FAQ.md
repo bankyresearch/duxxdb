@@ -146,31 +146,13 @@ lot. DuxxDB wins when:
 You can also **coexist** — Postgres for OLTP, DuxxDB for the agent
 path. See [INTEGRATION_GUIDE.md § 7](INTEGRATION_GUIDE.md#coexistence-keep-postgres--add-duxxdb).
 
-### vs. LangChain memory / Mem0 / Letta / agent-framework memory
+### Library-level memory abstractions in agent frameworks
 
-These are **library-level abstractions** that wrap whatever store you
-configure. DuxxDB is the **store underneath**. They compose: use
-LangChain's memory abstraction with DuxxDB as the backing
-`VectorStore` / `ChatMessageHistory`. See
-[INTEGRATION_GUIDE.md § 2](INTEGRATION_GUIDE.md#chatbot-with-langchain).
-
-### vs. LanceDB / ChromaDB
-
-LanceDB and DuxxDB are the closest cousins — both are
-embedded-first, Apache 2.0, hybrid-capable. The differences:
-
-| | LanceDB | ChromaDB | DuxxDB |
-|---|---|---|---|
-| Embedded | ✅ | ✅ | ✅ |
-| Server | partial | ✅ | ✅ (RESP + gRPC + MCP) |
-| BM25 in the same query plan | ⚠ | ✗ | ✅ |
-| Agent primitives | ✗ | ⚠ generic | ✅ |
-| MCP-native | ✗ | ✗ | ✅ |
-| Reactive subscribe | ✗ | ✗ | ✅ |
-| License | Apache 2 | Apache 2 | Apache 2 |
-
-LanceDB has a more mature columnar storage story (its Lance file
-format); DuxxDB has the agent + reactive + MCP story.
+In-framework memory layers are typically thin wrappers over whatever
+store you point them at. DuxxDB is designed to be that store: it
+exposes the primitives (vector + BM25 hybrid recall, importance
+decay, sessions, tool cache) those wrappers need, with sub-ms
+latency and a single binary deployment story.
 
 ---
 
@@ -201,15 +183,14 @@ framework uses — DuxxDB sits behind it.
 
 ## Does it work with my framework?
 
-| Framework | How |
+| Ecosystem | How |
 |---|---|
-| **LangChain / LangChain.js** | Use the RESP server. Drop-in replacement for `RedisChatMessageHistory`. Custom `VectorStore` for `recall`. See [INTEGRATION_GUIDE.md § 2](INTEGRATION_GUIDE.md#chatbot-with-langchain). |
-| **LlamaIndex** | Same pattern — RESP for chat history; gRPC or embedded Python wheel for the vector store. |
-| **Vercel AI SDK / Mastra** (Node) | Use the Node binding (`bindings/node`) or the RESP server with `node-redis`. |
-| **OpenAI Assistants API** | Doesn't expose memory primitives — keep memory in DuxxDB; pass relevant snippets in the prompt. |
+| **RESP-compatible clients (any language)** | Point any Redis client at `duxx-server`. Chat history via RESP lists; recall via the `RECALL` command. |
+| **Python agent frameworks** | Use the RESP server, the gRPC client, or the embedded `duxxdb` Python wheel. Memory and chat-history wrappers in popular frameworks plug straight into RESP. |
+| **Node agent toolkits** | Use the Node binding (`bindings/node`) or the RESP server with `node-redis`. |
+| **OpenAI Assistants API** | Doesn't expose memory primitives — keep memory in DuxxDB and pass relevant snippets in the prompt. |
 | **Claude Desktop / Cline / Cursor** (MCP) | Point at `duxx-mcp` in the MCP config. Zero glue code. See [INTEGRATION_GUIDE.md § 5](INTEGRATION_GUIDE.md#mcp--claude-desktop--cline--cursor). |
-| **CrewAI / AutoGen / smolagents** | Either wrap `recall` as a tool, or store every agent message via RESP and recall on each turn. |
-| **Pipecat / LiveKit / Vapi** (voice) | Drop-in for the memory layer. See [INTEGRATION_GUIDE.md § 4](INTEGRATION_GUIDE.md#voice-bot-with-pipecat--livekit). |
+| **Voice stacks (Pipecat / LiveKit / Vapi)** | Use as the memory layer. See [INTEGRATION_GUIDE.md § 4](INTEGRATION_GUIDE.md#voice-bot-with-pipecat--livekit). |
 | **Custom (no framework)** | Direct RESP, gRPC, or embedded crate. |
 
 Anything that talks **Redis** talks **DuxxDB** (RESP wire-compatible).
