@@ -49,6 +49,7 @@
 use duxx_embed::Embedder;
 use duxx_index::vector::VectorIndex;
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
+use duxx_storage::{Backend, BatchOp, MemoryBackend, key};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -56,6 +57,40 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+/// Backend table names. Kept in one place so the rebuild code on
+/// `open` and the write-through code on `put` / `tag` / `delete` can
+/// never disagree.
+mod tables {
+    /// `(name, version_be_bytes)` -> bincode(Prompt)
+    pub const PROMPTS: &str = "prompts";
+    /// `(name, tag)` -> version_be_bytes
+    pub const TAGS: &str = "tags";
+    /// `name` -> next_version (u64 big-endian)
+    ///
+    /// Persisted because we MUST NOT reuse version numbers after a
+    /// delete + restart. The counter is monotonic across the
+    /// lifetime of a registry, not the lifetime of a process.
+    pub const NEXT_VERSION: &str = "next_version";
+}
+
+/// Encode a u64 as 8 big-endian bytes. Keeps lexicographic order
+/// equal to numeric order, so scan_prefix on `(name,)` returns
+/// versions in ascending order.
+#[inline]
+fn u64_to_be(v: u64) -> [u8; 8] {
+    v.to_be_bytes()
+}
+
+#[inline]
+fn be_to_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Some(u64::from_be_bytes(arr))
+}
 
 /// Errors surfaced by the prompt registry.
 #[derive(Debug, Error)]
@@ -166,6 +201,10 @@ struct Inner {
     id_to_key: RwLock<HashMap<u64, (PromptName, PromptVersion)>>,
     next_internal_id: RwLock<u64>,
     bus: ChangeBus,
+    /// Durable backend. Always present — `new(embedder)` plugs in a
+    /// fresh `MemoryBackend` so all mutation paths go through the
+    /// same write-through code.
+    backend: Arc<dyn Backend>,
 }
 
 impl std::fmt::Debug for PromptRegistry {
@@ -182,23 +221,143 @@ impl std::fmt::Debug for PromptRegistry {
 }
 
 impl PromptRegistry {
-    /// Build a registry that uses `embedder` for semantic search.
-    /// Embedding dim must match the embedder's output.
+    /// Build a non-persistent registry. Equivalent to
+    /// `open(embedder, MemoryBackend::new())` — provided for
+    /// callers that don't care about durability.
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        // `open` only fails on a backend that errors during scan,
+        // which `MemoryBackend` never does — unwrap is safe.
+        Self::open(embedder, backend).expect("MemoryBackend cannot fail open")
+    }
+
+    /// Build a registry backed by the given persistence layer.
+    ///
+    /// On open, the registry scans the backend's `prompts`, `tags`,
+    /// and `next_version` tables to rebuild in-memory state. The
+    /// HNSW vector index is rebuilt from scratch by re-embedding
+    /// every persisted prompt's content. For prompts this is fine
+    /// (typically <1000 rows); larger primitives like datasets and
+    /// evals will use a different rebuild strategy that persists
+    /// the embeddings themselves.
+    pub fn open(embedder: Arc<dyn Embedder>, backend: Arc<dyn Backend>) -> Result<Self> {
         let dim = embedder.dim();
-        Self {
-            inner: Arc::new(Inner {
-                by_id: RwLock::new(HashMap::new()),
-                versions: RwLock::new(HashMap::new()),
-                next_version: RwLock::new(HashMap::new()),
-                tags: RwLock::new(HashMap::new()),
-                embedder,
-                vector_index: RwLock::new(VectorIndex::with_capacity(dim, 10_000)),
-                id_to_key: RwLock::new(HashMap::new()),
-                next_internal_id: RwLock::new(1),
-                bus: ChangeBus::default(),
-            }),
+        let inner = Inner {
+            by_id: RwLock::new(HashMap::new()),
+            versions: RwLock::new(HashMap::new()),
+            next_version: RwLock::new(HashMap::new()),
+            tags: RwLock::new(HashMap::new()),
+            embedder,
+            vector_index: RwLock::new(VectorIndex::with_capacity(dim, 10_000)),
+            id_to_key: RwLock::new(HashMap::new()),
+            next_internal_id: RwLock::new(1),
+            bus: ChangeBus::default(),
+            backend,
+        };
+        let me = Self {
+            inner: Arc::new(inner),
+        };
+        me.rehydrate()?;
+        Ok(me)
+    }
+
+    /// Walk the backend tables and rebuild every in-memory map +
+    /// the HNSW vector index. Called once from `open`.
+    fn rehydrate(&self) -> Result<()> {
+        // ---- prompts table ----
+        let prompts = self
+            .inner
+            .backend
+            .scan(tables::PROMPTS)
+            .map_err(|e| PromptError::Embed(format!("backend scan prompts: {e}")))?;
+        for (_key_bytes, value_bytes) in prompts {
+            let prompt: Prompt = serde_json::from_slice(&value_bytes)
+                .map_err(|e| PromptError::Embed(format!("prompt decode: {e}")))?;
+            let key = (prompt.name.clone(), prompt.version);
+            // Restore by_id without the tags field (tags are loaded
+            // from their own table below); we strip tags here and
+            // recompute them on `get`.
+            self.inner.by_id.write().insert(
+                key.clone(),
+                Prompt {
+                    tags: Vec::new(),
+                    ..prompt.clone()
+                },
+            );
+            self.inner
+                .versions
+                .write()
+                .entry(prompt.name.clone())
+                .or_default()
+                .push(prompt.version);
+            // Re-embed and re-insert into the HNSW. Re-embedding is
+            // deterministic for any reasonable Embedder, so the
+            // index rebuilds identically across restarts.
+            let emb = self
+                .inner
+                .embedder
+                .embed(&prompt.content)
+                .map_err(|e| PromptError::Embed(e.to_string()))?;
+            let internal_id = self.bump_internal_id();
+            self.inner
+                .vector_index
+                .write()
+                .insert(internal_id, emb)
+                .map_err(|e| PromptError::Embed(format!("vector index: {e}")))?;
+            self.inner.id_to_key.write().insert(internal_id, key);
         }
+        // Sort each name's version list now that every row is in.
+        for list in self.inner.versions.write().values_mut() {
+            list.sort_unstable();
+        }
+        // ---- tags table ----
+        let tags = self
+            .inner
+            .backend
+            .scan(tables::TAGS)
+            .map_err(|e| PromptError::Embed(format!("backend scan tags: {e}")))?;
+        for (key_bytes, value_bytes) in tags {
+            // key = name \0 tag
+            let mut parts = key_bytes.splitn(2, |b| *b == 0);
+            let name = match parts.next().map(|b| std::str::from_utf8(b).ok()) {
+                Some(Some(s)) => s.to_string(),
+                _ => continue,
+            };
+            let tag = match parts.next().map(|b| std::str::from_utf8(b).ok()) {
+                Some(Some(s)) => s.to_string(),
+                _ => continue,
+            };
+            let version = match be_to_u64(&value_bytes) {
+                Some(v) => v,
+                None => continue,
+            };
+            self.inner.tags.write().insert((name, tag), version);
+        }
+        // ---- next_version table ----
+        let counters = self
+            .inner
+            .backend
+            .scan(tables::NEXT_VERSION)
+            .map_err(|e| PromptError::Embed(format!("backend scan counters: {e}")))?;
+        for (key_bytes, value_bytes) in counters {
+            let name = match std::str::from_utf8(&key_bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            };
+            let next = match be_to_u64(&value_bytes) {
+                Some(v) => v,
+                None => continue,
+            };
+            self.inner.next_version.write().insert(name, next);
+        }
+        Ok(())
+    }
+
+    fn bump_internal_id(&self) -> u64 {
+        let mut n = self.inner.next_internal_id.write();
+        let v = *n;
+        *n += 1;
+        v
     }
 
     /// Subscribe to change events. Each `put` / `tag` / `untag` /
@@ -211,7 +370,8 @@ impl PromptRegistry {
 
     /// Insert a new version of `name`. Returns the assigned
     /// monotonic version (starting at 1). Embeds the content for
-    /// the catalog-wide semantic search index.
+    /// the catalog-wide semantic search index AND persists the row
+    /// + bumped counter atomically.
     pub fn put(
         &self,
         name: impl Into<String>,
@@ -241,18 +401,39 @@ impl PromptRegistry {
         let prompt = Prompt::new(name.clone(), next_version, content.clone(), metadata);
         let key = (name.clone(), next_version);
 
+        // Persist before touching the vector index, so a crash
+        // mid-put can be recovered cleanly on reopen. We use JSON
+        // rather than bincode because Prompt::metadata is a
+        // `serde_json::Value` and bincode 1.x can't round-trip
+        // self-describing types via `deserialize_any`. Prompt
+        // payloads are tiny — the throughput cost is negligible.
+        let prompt_bytes = serde_json::to_vec(&prompt)
+            .map_err(|e| PromptError::Embed(format!("prompt encode: {e}")))?;
+        let prompt_key = key::two(name.as_bytes(), &u64_to_be(next_version));
+        let counter_value = u64_to_be(next_version);
+        self.inner
+            .backend
+            .batch(&[
+                BatchOp::Put {
+                    table: tables::PROMPTS.into(),
+                    key: prompt_key,
+                    value: prompt_bytes,
+                },
+                BatchOp::Put {
+                    table: tables::NEXT_VERSION.into(),
+                    key: name.as_bytes().to_vec(),
+                    value: counter_value.to_vec(),
+                },
+            ])
+            .map_err(|e| PromptError::Embed(format!("backend write: {e}")))?;
+
         // Embed and insert into the vector index.
         let emb = self
             .inner
             .embedder
             .embed(&content)
             .map_err(|e| PromptError::Embed(e.to_string()))?;
-        let internal_id = {
-            let mut n = self.inner.next_internal_id.write();
-            let v = *n;
-            *n += 1;
-            v
-        };
+        let internal_id = self.bump_internal_id();
         // VectorIndex insert errors propagate as an Embed-class error to
         // keep the API surface narrow.
         self.inner
@@ -349,6 +530,17 @@ impl PromptRegistry {
                 version,
             });
         }
+        // Persist first; in-memory map updated only after the write
+        // succeeds, so a crash never produces an in-memory tag that
+        // disagrees with disk.
+        self.inner
+            .backend
+            .put(
+                tables::TAGS,
+                &key::two(name.as_bytes(), tag.as_bytes()),
+                &u64_to_be(version),
+            )
+            .map_err(|e| PromptError::Embed(format!("backend put tag: {e}")))?;
         self.inner
             .tags
             .write()
@@ -371,6 +563,16 @@ impl PromptRegistry {
             .remove(&(name.to_string(), tag.to_string()))
             .is_some();
         if removed {
+            // Best-effort backend delete; in-memory state is the
+            // source of truth for the return value. A backend error
+            // here would leave a stale tag row on disk, surfaced on
+            // next rehydrate — log it but don't fail the call.
+            if let Err(e) = self.inner.backend.delete(
+                tables::TAGS,
+                &key::two(name.as_bytes(), tag.as_bytes()),
+            ) {
+                tracing::warn!(error = %e, "backend untag delete failed");
+            }
             self.inner.bus.publish(ChangeEvent {
                 table: "prompt".to_string(),
                 key: Some(name.to_string()),
@@ -393,11 +595,38 @@ impl PromptRegistry {
             if let Some(list) = self.inner.versions.write().get_mut(name) {
                 list.retain(|v| *v != version);
             }
-            // Untag any tag pointing here.
-            self.inner
-                .tags
-                .write()
-                .retain(|(n, _t), v| !(n == name && *v == version));
+            // Untag any tag pointing here; collect first so we
+            // can mirror the same deletes to the backend.
+            let dropped_tags: Vec<String> = {
+                let mut tags = self.inner.tags.write();
+                let mut victims = Vec::new();
+                tags.retain(|(n, t), v| {
+                    let drop = n == name && *v == version;
+                    if drop {
+                        victims.push(t.clone());
+                    }
+                    !drop
+                });
+                victims
+            };
+            // Drop the row + every tag pointing at it in one
+            // backend batch. We intentionally leave the
+            // next_version counter alone — version numbers must
+            // not be reused.
+            let mut ops: Vec<BatchOp> = Vec::with_capacity(1 + dropped_tags.len());
+            ops.push(BatchOp::Delete {
+                table: tables::PROMPTS.into(),
+                key: key::two(name.as_bytes(), &u64_to_be(version)),
+            });
+            for t in dropped_tags {
+                ops.push(BatchOp::Delete {
+                    table: tables::TAGS.into(),
+                    key: key::two(name.as_bytes(), t.as_bytes()),
+                });
+            }
+            if let Err(e) = self.inner.backend.batch(&ops) {
+                tracing::warn!(error = %e, "backend delete batch failed");
+            }
             self.inner.bus.publish(ChangeEvent {
                 table: "prompt".to_string(),
                 key: Some(name.to_string()),
@@ -737,5 +966,76 @@ mod tests {
         assert_eq!(s.names, 2);
         assert_eq!(s.versions, 3);
         assert_eq!(s.tags, 2);
+    }
+
+    // ------------------------------------------------------------ persistence
+
+    /// Shared backend reopened twice — proves rows, tags, and the
+    /// monotonic `next_version` counter all survive a process
+    /// restart.
+    #[test]
+    fn open_rehydrates_prompts_tags_and_counters() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let embedder = Arc::new(HashEmbedder::new(16));
+
+        // First lifetime: insert two prompts, tag them, delete one,
+        // then add one more so the counter has advanced past the
+        // gap.
+        {
+            let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();
+            r.put("greet", "hello", serde_json::json!({})).unwrap();
+            r.put("greet", "hi", serde_json::json!({})).unwrap();
+            r.tag("greet", 2, "prod").unwrap();
+            assert!(r.delete("greet", 1));
+            r.put("greet", "hey", serde_json::json!({})).unwrap();
+            assert_eq!(r.get_latest("greet").unwrap().version, 3);
+        }
+
+        // Second lifetime: open the SAME backend, verify state.
+        {
+            let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();
+            // v1 was deleted; v2 and v3 survive.
+            assert!(r.get("greet", 1).is_none());
+            let p2 = r.get("greet", 2).unwrap();
+            assert_eq!(p2.content, "hi");
+            assert_eq!(p2.tags, vec!["prod"]);
+            let p3 = r.get("greet", 3).unwrap();
+            assert_eq!(p3.content, "hey");
+            // Counter must not reuse 1.
+            let next = r.put("greet", "nope", serde_json::json!({})).unwrap();
+            assert_eq!(next, 4);
+        }
+    }
+
+    #[test]
+    fn open_rehydrates_search_index() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let embedder = Arc::new(HashEmbedder::new(16));
+        {
+            let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();
+            r.put("greeting", "hello world how are you", serde_json::json!({})).unwrap();
+            r.put("farewell", "goodbye see you tomorrow", serde_json::json!({})).unwrap();
+            r.put("support", "i can help with your issue", serde_json::json!({}))
+                .unwrap();
+        }
+        // Reopen and search.
+        let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();
+        let hits = r.search("hello world", 2).unwrap();
+        assert!(!hits.is_empty(), "search returned nothing after reopen");
+        assert!(hits[0].prompt.content.contains("hello"));
+    }
+
+    #[test]
+    fn untag_persists_across_reopen() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let embedder = Arc::new(HashEmbedder::new(16));
+        {
+            let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();
+            r.put("g", "v1", serde_json::json!({})).unwrap();
+            r.tag("g", 1, "prod").unwrap();
+            assert!(r.untag("g", "prod"));
+        }
+        let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();
+        assert!(r.get_by_tag("g", "prod").is_none());
     }
 }

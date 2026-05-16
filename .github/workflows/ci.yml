@@ -111,3 +111,36 @@ jobs:
         with:
           shared-key: python-ubuntu
       - run: cargo check -p duxxdb-py
+
+  # -----------------------------------------------------------------
+  # Build the maturin wheel and run the embedded-primitive Python
+  # tests against it. This is what catches issues that surface only
+  # through the PyO3 boundary: PyClass naming, signature mismatches,
+  # GIL handling, etc.
+  # -----------------------------------------------------------------
+  python-wheel-tests:
+    name: python wheel tests (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wheel-ubuntu
+      - name: Install maturin + pytest
+        run: pip install maturin pytest
+      - name: Build + install the duxxdb wheel
+        working-directory: bindings/python
+        run: maturin build --release && pip install --force-reinstall ../../target/wheels/duxxdb-*.whl
+      - name: Run embedded-primitive tests
+        working-directory: bindings/python
+        run: pytest tests/ -v

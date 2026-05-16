@@ -24,6 +24,9 @@ from ._native import (  # type: ignore[import]
     ToolCache,
     ToolCacheHit,
     SessionStore,
+    PromptRegistry,
+    Prompt,
+    PromptHit,
     __version__,
 )
 
@@ -33,5 +36,8 @@ __all__ = [
     "ToolCache",
     "ToolCacheHit",
     "SessionStore",
+    "PromptRegistry",
+    "Prompt",
+    "PromptHit",
     "__version__",
 ]

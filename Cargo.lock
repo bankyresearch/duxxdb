@@ -790,7 +790,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "duxx-bench"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "criterion",
  "duxx-core",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "duxx-core",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-coldtier"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-cost"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "duxx-embed",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-datasets"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "duxx-embed",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-embed"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "reqwest",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-eval"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "duxx-embed",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-grpc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-index"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "hnsw_rs",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "duxx-core",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-memory"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bincode",
  "duxx-core",
@@ -968,12 +968,13 @@ dependencies = [
 
 [[package]]
 name = "duxx-prompts"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "duxx-embed",
  "duxx-index",
  "duxx-reactive",
+ "duxx-storage",
  "parking_lot",
  "serde",
  "serde_json",
@@ -984,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-query"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "duxx-index",
@@ -994,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-reactive"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "tokio",
@@ -1003,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-replay"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "duxx-reactive",
@@ -1018,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1053,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bincode",
  "duxx-core",
@@ -1068,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "duxx-trace"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
  "duxx-reactive",
@@ -1083,12 +1084,16 @@ dependencies = [
 
 [[package]]
 name = "duxxdb-py"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duxx-core",
+ "duxx-embed",
  "duxx-memory",
+ "duxx-prompts",
  "duxx-reactive",
+ "duxx-storage",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]
