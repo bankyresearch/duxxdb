@@ -184,6 +184,107 @@ impl Server {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Wire persistent storage under every Phase 7 primitive
+    /// (``traces``, ``prompts``, ``datasets``, ``evals``, ``replays``,
+    /// ``costs``). Defaults to in-memory when this is never called,
+    /// preserving v0.1.x behavior bit-identically.
+    ///
+    /// Accepted specs:
+    /// * ``"memory"`` (or empty) — no-op, in-memory (matches default).
+    /// * ``"redb:/path/to/phase7.redb"`` — one redb file holding
+    ///   every primitive's tables. The crates already namespace
+    ///   their tables (``prompts``, ``cost.entries``, ``trace.spans``,
+    ///   etc.) so a single file is safe.
+    /// * ``"dir:/path/to/dir"`` — one redb file per primitive under
+    ///   ``dir`` (``dir/prompts.redb``, ``dir/cost.redb``, …). Better
+    ///   isolation for ops; pick this for production.
+    ///
+    /// Returns an error for unknown specs or any backend open
+    /// failure. The previously-constructed Phase 7 primitives are
+    /// dropped — their in-memory state is empty before this call in
+    /// the normal CLI flow, so nothing is lost.
+    pub fn with_phase7_storage(mut self, spec: &str) -> anyhow::Result<Self> {
+        use duxx_storage::{open_backend, Backend};
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("memory") {
+            return Ok(self);
+        }
+
+        let embedder = self.embedder.clone();
+        let (prompts_b, datasets_b, evals_b, replays_b, traces_b, costs_b): (
+            Arc<dyn Backend>,
+            Arc<dyn Backend>,
+            Arc<dyn Backend>,
+            Arc<dyn Backend>,
+            Arc<dyn Backend>,
+            Arc<dyn Backend>,
+        );
+
+        if let Some(dir_spec) = trimmed.strip_prefix("dir:") {
+            let dir = std::path::PathBuf::from(dir_spec);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| anyhow::anyhow!("phase7-storage dir create: {e}"))?;
+            let mk = |name: &str| -> anyhow::Result<Arc<dyn Backend>> {
+                let path = dir.join(name);
+                let spec = format!("redb:{}", path.display());
+                let b = open_backend(Some(&spec))
+                    .map_err(|e| anyhow::anyhow!("phase7-storage {name}: {e}"))?;
+                Ok(Arc::from(b))
+            };
+            prompts_b = mk("prompts.redb")?;
+            datasets_b = mk("datasets.redb")?;
+            evals_b = mk("evals.redb")?;
+            replays_b = mk("replays.redb")?;
+            traces_b = mk("traces.redb")?;
+            costs_b = mk("costs.redb")?;
+            // Drop the version-pin file under the dir so future
+            // versions can refuse to load incompatible schemas.
+            let version_path = dir.join("version.json");
+            if !version_path.exists() {
+                let body = serde_json::json!({
+                    "schema": 1,
+                    "duxxdb": env!("CARGO_PKG_VERSION"),
+                });
+                let _ = std::fs::write(&version_path, body.to_string());
+            }
+        } else if trimmed.starts_with("redb:") {
+            // Single-file mode is reserved for a future v0.2.x point
+            // release. redb takes an exclusive file lock per
+            // ``Database`` handle, so opening six independent
+            // handles to one file fails with "Cannot acquire lock".
+            // The right fix is sharing one ``Arc<Database>`` across
+            // every backend — punted to v0.2.1 alongside the rest of
+            // the persistence-perf passes.
+            anyhow::bail!(
+                "single-file redb mode is not yet supported for --phase7-storage. \
+                 Use 'dir:<directory>' instead — DuxxDB will create one redb file \
+                 per primitive under the directory."
+            );
+        } else {
+            anyhow::bail!(
+                "unknown phase7-storage spec {spec:?}. Expected one of: \
+                 memory, redb:<file>, dir:<directory>"
+            );
+        }
+
+        // Reopen every primitive on top of the new backends. Each
+        // ``open`` rehydrates whatever is already on disk.
+        self.prompts = PromptRegistry::open(embedder.clone(), prompts_b)
+            .map_err(|e| anyhow::anyhow!("PromptRegistry::open: {e}"))?;
+        self.datasets = DatasetRegistry::open(embedder.clone(), datasets_b)
+            .map_err(|e| anyhow::anyhow!("DatasetRegistry::open: {e}"))?;
+        self.evals = EvalRegistry::open(embedder.clone(), evals_b)
+            .map_err(|e| anyhow::anyhow!("EvalRegistry::open: {e}"))?;
+        self.replays = ReplayRegistry::open(replays_b)
+            .map_err(|e| anyhow::anyhow!("ReplayRegistry::open: {e}"))?;
+        self.traces = TraceStore::open(traces_b)
+            .map_err(|e| anyhow::anyhow!("TraceStore::open: {e}"))?;
+        self.costs = CostLedger::open(embedder.clone(), costs_b)
+            .map_err(|e| anyhow::anyhow!("CostLedger::open: {e}"))?;
+        Ok(self)
+    }
+
     /// Build with an embedder AND a durable storage backend (redb,
     /// or any other `Storage` impl). Memories survive process restart;
     /// indices are kept in memory and rebuilt from the row store on open.
