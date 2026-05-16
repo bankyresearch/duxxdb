@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut max_memories: Option<usize> = None;
+    let mut phase7_storage: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -93,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--max-memories needs a value"))?;
                 max_memories = Some(v.parse()?);
             }
+            "--phase7-storage" => {
+                phase7_storage = Some(args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--phase7-storage needs SPEC (memory|redb:<file>|dir:<dir>)")
+                })?);
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -106,12 +112,15 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("DUXX_EMBEDDER").ok())
         .unwrap_or_else(|| "hash:32".to_string());
     let storage_spec = storage_spec.or_else(|| std::env::var("DUXX_STORAGE").ok());
+    let phase7_storage =
+        phase7_storage.or_else(|| std::env::var("DUXX_PHASE7_STORAGE").ok());
 
     tracing::info!(
         version = duxx_server::SERVER_VERSION,
         %addr,
         embedder = %embedder_spec,
         storage = ?storage_spec,
+        phase7_storage = ?phase7_storage,
         "starting duxx-server"
     );
 
@@ -137,6 +146,11 @@ async fn main() -> anyhow::Result<()> {
         }
         None => duxx_server::Server::with_provider(embedder),
     };
+
+    if let Some(p7) = phase7_storage.as_deref() {
+        server = server.with_phase7_storage(p7)?;
+        tracing::info!(spec = %p7, "Phase 7 primitives persisted");
+    }
 
     if let Some(t) = token {
         if t.is_empty() {
@@ -257,6 +271,9 @@ fn print_help() {
     println!("  --tls-key  PATH        PEM private key (must accompany --tls-cert)");
     println!("  --max-memories N       Cap memory rows; oldest decayed-importance");
     println!("                         is evicted on overflow (default: unlimited)");
+    println!("  --phase7-storage SPEC  Persist Phase 7 primitives (trace / prompts /");
+    println!("                         datasets / evals / replay / cost). New in v0.2.0.");
+    println!("                         Defaults to in-memory.");
     println!();
     println!("EMBEDDER SPECS:");
     println!("  hash:<dim>                          deterministic toy embedder");
@@ -270,7 +287,13 @@ fn print_help() {
     println!("  dir:./path/to/dir                   FULLY persistent: rows + tantivy + HNSW");
     println!("                                      (skips rebuild on graceful reopen)");
     println!();
-    println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_TOKEN, DUXX_METRICS_ADDR,");
-    println!("     DUXX_TLS_CERT, DUXX_TLS_KEY, DUXX_MAX_MEMORIES,");
+    println!("PHASE 7 STORAGE SPECS (--phase7-storage):");
+    println!("  memory                              in-memory (default; v0.1.x behavior)");
+    println!("  dir:./path/to/dir                   one redb file per primitive under the dir");
+    println!("                                      (recommended for production)");
+    println!("                                      Single-file redb mode arrives in v0.2.1.");
+    println!();
+    println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_PHASE7_STORAGE, DUXX_TOKEN,");
+    println!("     DUXX_METRICS_ADDR, DUXX_TLS_CERT, DUXX_TLS_KEY, DUXX_MAX_MEMORIES,");
     println!("     OPENAI_API_KEY, COHERE_API_KEY");
 }

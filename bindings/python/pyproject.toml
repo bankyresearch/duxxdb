@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "duxxdb"
 description = "DuxxDB — the database built for AI agents. Hybrid (vector + BM25 + structured) retrieval, agent-native primitives (MEMORY / TOOL_CACHE / SESSION), embedded-or-server, RESP / gRPC / MCP."
-version = "0.1.2"
+version = "0.2.0"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
 readme = "README.md"
