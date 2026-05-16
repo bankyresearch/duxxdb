@@ -29,7 +29,7 @@ members = [
 exclude = ["bindings/node"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["DuxxDB Contributors"]
@@ -107,19 +107,19 @@ arrow-schema = "53"
 parquet = { version = "53", default-features = false, features = ["arrow", "snap"] }
 
 # Internal crates (consumed by siblings)
-duxx-core = { path = "crates/duxx-core", version = "0.2.0" }
-duxx-storage = { path = "crates/duxx-storage", version = "0.2.0" }
-duxx-index = { path = "crates/duxx-index", version = "0.2.0" }
-duxx-query = { path = "crates/duxx-query", version = "0.2.0" }
-duxx-memory = { path = "crates/duxx-memory", version = "0.2.0" }
-duxx-reactive = { path = "crates/duxx-reactive", version = "0.2.0" }
-duxx-embed = { path = "crates/duxx-embed", version = "0.2.0" }
-duxx-trace = { path = "crates/duxx-trace", version = "0.2.0" }
-duxx-prompts = { path = "crates/duxx-prompts", version = "0.2.0" }
-duxx-datasets = { path = "crates/duxx-datasets", version = "0.2.0" }
-duxx-eval = { path = "crates/duxx-eval", version = "0.2.0" }
-duxx-replay = { path = "crates/duxx-replay", version = "0.2.0" }
-duxx-cost = { path = "crates/duxx-cost", version = "0.2.0" }
+duxx-core = { path = "crates/duxx-core", version = "0.2.1" }
+duxx-storage = { path = "crates/duxx-storage", version = "0.2.1" }
+duxx-index = { path = "crates/duxx-index", version = "0.2.1" }
+duxx-query = { path = "crates/duxx-query", version = "0.2.1" }
+duxx-memory = { path = "crates/duxx-memory", version = "0.2.1" }
+duxx-reactive = { path = "crates/duxx-reactive", version = "0.2.1" }
+duxx-embed = { path = "crates/duxx-embed", version = "0.2.1" }
+duxx-trace = { path = "crates/duxx-trace", version = "0.2.1" }
+duxx-prompts = { path = "crates/duxx-prompts", version = "0.2.1" }
+duxx-datasets = { path = "crates/duxx-datasets", version = "0.2.1" }
+duxx-eval = { path = "crates/duxx-eval", version = "0.2.1" }
+duxx-replay = { path = "crates/duxx-replay", version = "0.2.1" }
+duxx-cost = { path = "crates/duxx-cost", version = "0.2.1" }
 
 # HTTP client for OpenAI / Cohere embedders. rustls-tls = no OpenSSL native build,
 # blocking = sync API matches our embedder trait.
