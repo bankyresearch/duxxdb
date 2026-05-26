@@ -141,7 +141,7 @@ jobs:
           echo "archive_name=${ARCHIVE_NAME}"      >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           # Upload ONLY the packed archive, not the staging directory.
           # An earlier glob `dist/duxxdb-*` matched both the tar/zip
@@ -174,7 +174,7 @@ jobs:
       - name: Make .deb
         run: cargo deb -p duxx-server --no-build
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: archive-deb-amd64
           path: target/debian/*.deb
