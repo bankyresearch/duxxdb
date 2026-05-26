@@ -94,7 +94,7 @@ http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
-rcgen = "0.13"   # used in tests to generate self-signed certs at runtime
+rcgen = "0.14"   # used in tests to generate self-signed certs at runtime
 tempfile = "3"
 
 # Cold-tier export (Phase 5). Plain Parquet first -- pure Rust, ships
