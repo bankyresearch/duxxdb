@@ -1,6 +1,6 @@
 {
   "name": "duxxdb",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "description": "DuxxDB - the database built for AI agents (Node.js bindings)",
   "main": "index.js",
   "types": "index.d.ts",

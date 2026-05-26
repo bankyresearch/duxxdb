@@ -78,9 +78,7 @@ impl Metrics {
             "Per-command server-side latency",
             &["cmd"],
             // Buckets in seconds: 100us, 250us, 500us, 1ms, 2.5ms, 5ms, 10ms, 25ms, 100ms.
-            vec![
-                0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.1
-            ],
+            vec![0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.1],
             registry
         )
         .unwrap();

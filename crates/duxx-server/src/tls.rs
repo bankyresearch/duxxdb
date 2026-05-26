@@ -86,7 +86,8 @@ mod tests {
     /// Generate a self-signed cert + key in a tempdir and load them
     /// back. Tests downstream (the TLS handshake test in lib.rs) reuse
     /// this helper.
-    pub(crate) fn self_signed_pair() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    pub(crate) fn self_signed_pair() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf)
+    {
         use std::io::Write;
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let dir = tempfile::tempdir().unwrap();

@@ -29,17 +29,18 @@ pub mod metrics;
 pub mod resp;
 pub mod tls;
 
+use duxx_cost::{BudgetPeriod, CostEntry, CostFilter, CostLedger, GroupBy};
 use duxx_datasets::{DatasetRegistry, DatasetRow};
 use duxx_embed::{Embedder, HashEmbedder};
-use duxx_eval::EvalRegistry;
+use duxx_eval::{EvalRegistry, EvalStart};
+use duxx_memory::{MemoryStore, SessionStore};
+use duxx_prompts::PromptRegistry;
+use duxx_reactive::{ChangeEvent, ChangeKind};
 use duxx_replay::{
     InvocationKind as ReplayInvocationKind, OverrideKind as ReplayOverrideKind, ReplayInvocation,
     ReplayMode, ReplayOverride, ReplayRegistry,
 };
-use duxx_cost::{BudgetPeriod, CostEntry, CostFilter, CostLedger, GroupBy};
-use duxx_memory::{MemoryStore, SessionStore};
-use duxx_prompts::PromptRegistry;
-use duxx_reactive::{ChangeEvent, ChangeKind};
+use duxx_storage::Backend;
 use duxx_trace::{Span, SpanKind, SpanStatus, TraceSearch, TraceStore};
 use resp::RespValue;
 use std::sync::Arc;
@@ -51,6 +52,22 @@ pub const SERVER_NAME: &str = "duxxdb";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const DEFAULT_DIM: usize = 32;
+
+type SharedBackend = Arc<dyn Backend>;
+type Phase7Backends = (
+    SharedBackend,
+    SharedBackend,
+    SharedBackend,
+    SharedBackend,
+    SharedBackend,
+    SharedBackend,
+);
+type Phase7IndexDirs = (
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+);
 
 /// The server state — cheaply cloned (Arc internals).
 #[derive(Clone)]
@@ -180,8 +197,7 @@ impl Server {
 
     /// Number of currently-open client connections.
     pub fn active_connections(&self) -> usize {
-        self.active_conns
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.active_conns.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wire persistent storage under every Phase 7 primitive
@@ -204,7 +220,7 @@ impl Server {
     /// dropped — their in-memory state is empty before this call in
     /// the normal CLI flow, so nothing is lost.
     pub fn with_phase7_storage(mut self, spec: &str) -> anyhow::Result<Self> {
-        use duxx_storage::{open_backend, Backend};
+        use duxx_storage::open_backend;
 
         let trimmed = spec.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("memory") {
@@ -212,76 +228,67 @@ impl Server {
         }
 
         let embedder = self.embedder.clone();
-        let (prompts_b, datasets_b, evals_b, replays_b, traces_b, costs_b): (
-            Arc<dyn Backend>,
-            Arc<dyn Backend>,
-            Arc<dyn Backend>,
-            Arc<dyn Backend>,
-            Arc<dyn Backend>,
-            Arc<dyn Backend>,
-        );
-        // v0.2.2: HNSW dump subdirs for the four primitives with a
-        // vector index. Populated only when in `dir:` mode; otherwise
-        // each primitive keeps its index in memory and rebuilds on
-        // open.
-        let mut prompts_hnsw_dir: Option<std::path::PathBuf> = None;
-        let mut datasets_hnsw_dir: Option<std::path::PathBuf> = None;
-        let mut evals_hnsw_dir: Option<std::path::PathBuf> = None;
-        let mut costs_hnsw_dir: Option<std::path::PathBuf> = None;
-
-        if let Some(dir_spec) = trimmed.strip_prefix("dir:") {
-            let dir = std::path::PathBuf::from(dir_spec);
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| anyhow::anyhow!("phase7-storage dir create: {e}"))?;
-            let mk = |name: &str| -> anyhow::Result<Arc<dyn Backend>> {
-                let path = dir.join(name);
-                let spec = format!("redb:{}", path.display());
-                let b = open_backend(Some(&spec))
-                    .map_err(|e| anyhow::anyhow!("phase7-storage {name}: {e}"))?;
-                Ok(Arc::from(b))
-            };
-            prompts_b = mk("prompts.redb")?;
-            datasets_b = mk("datasets.redb")?;
-            evals_b = mk("evals.redb")?;
-            replays_b = mk("replays.redb")?;
-            traces_b = mk("traces.redb")?;
-            costs_b = mk("costs.redb")?;
-            // v0.2.2: HNSW dump dirs sit alongside each primitive's
-            // redb file. ``VectorIndex::open`` is idempotent — it
-            // creates the dir if missing and loads any existing dump.
-            prompts_hnsw_dir = Some(dir.join("prompts.hnsw"));
-            datasets_hnsw_dir = Some(dir.join("datasets.hnsw"));
-            evals_hnsw_dir = Some(dir.join("evals.hnsw"));
-            costs_hnsw_dir = Some(dir.join("costs.hnsw"));
-            // Drop the version-pin file under the dir so future
-            // versions can refuse to load incompatible schemas.
-            let version_path = dir.join("version.json");
-            if !version_path.exists() {
-                let body = serde_json::json!({
-                    "schema": 1,
-                    "duxxdb": env!("CARGO_PKG_VERSION"),
-                });
-                let _ = std::fs::write(&version_path, body.to_string());
-            }
-        } else if trimmed.starts_with("redb:") {
-            // Single-file mode is reserved for a future v0.2.x point
-            // release. redb takes an exclusive file lock per
-            // ``Database`` handle, so opening six independent
-            // handles to one file fails with "Cannot acquire lock".
-            // The right fix is sharing one ``Arc<Database>`` across
-            // every backend — punted to v0.2.1 alongside the rest of
-            // the persistence-perf passes.
-            anyhow::bail!(
-                "single-file redb mode is not yet supported for --phase7-storage. \
+        let (backends, index_dirs): (Phase7Backends, Phase7IndexDirs) =
+            if let Some(dir_spec) = trimmed.strip_prefix("dir:") {
+                let dir = std::path::PathBuf::from(dir_spec);
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| anyhow::anyhow!("phase7-storage dir create: {e}"))?;
+                let mk = |name: &str| -> anyhow::Result<Arc<dyn Backend>> {
+                    let path = dir.join(name);
+                    let spec = format!("redb:{}", path.display());
+                    let b = open_backend(Some(&spec))
+                        .map_err(|e| anyhow::anyhow!("phase7-storage {name}: {e}"))?;
+                    Ok(Arc::from(b))
+                };
+                let backends = (
+                    mk("prompts.redb")?,
+                    mk("datasets.redb")?,
+                    mk("evals.redb")?,
+                    mk("replays.redb")?,
+                    mk("traces.redb")?,
+                    mk("costs.redb")?,
+                );
+                // v0.2.2: HNSW dump dirs sit alongside each primitive's
+                // redb file. ``VectorIndex::open`` is idempotent — it
+                // creates the dir if missing and loads any existing dump.
+                let index_dirs = (
+                    Some(dir.join("prompts.hnsw")),
+                    Some(dir.join("datasets.hnsw")),
+                    Some(dir.join("evals.hnsw")),
+                    Some(dir.join("costs.hnsw")),
+                );
+                // Drop the version-pin file under the dir so future
+                // versions can refuse to load incompatible schemas.
+                let version_path = dir.join("version.json");
+                if !version_path.exists() {
+                    let body = serde_json::json!({
+                        "schema": 1,
+                        "duxxdb": env!("CARGO_PKG_VERSION"),
+                    });
+                    let _ = std::fs::write(&version_path, body.to_string());
+                }
+                (backends, index_dirs)
+            } else if trimmed.starts_with("redb:") {
+                // Single-file mode is reserved for a future v0.2.x point
+                // release. redb takes an exclusive file lock per
+                // ``Database`` handle, so opening six independent
+                // handles to one file fails with "Cannot acquire lock".
+                // The right fix is sharing one ``Arc<Database>`` across
+                // every backend — punted to v0.2.1 alongside the rest of
+                // the persistence-perf passes.
+                anyhow::bail!(
+                    "single-file redb mode is not yet supported for --phase7-storage. \
                  Use 'dir:<directory>' instead — DuxxDB will create one redb file \
                  per primitive under the directory."
-            );
-        } else {
-            anyhow::bail!(
-                "unknown phase7-storage spec {spec:?}. Expected one of: \
+                );
+            } else {
+                anyhow::bail!(
+                    "unknown phase7-storage spec {spec:?}. Expected one of: \
                  memory, redb:<file>, dir:<directory>"
-            );
-        }
+                );
+            };
+        let (prompts_b, datasets_b, evals_b, replays_b, traces_b, costs_b) = backends;
+        let (prompts_hnsw_dir, datasets_hnsw_dir, evals_hnsw_dir, costs_hnsw_dir) = index_dirs;
 
         // Reopen every primitive on top of the new backends. Each
         // ``open`` rehydrates whatever is already on disk. The four
@@ -299,22 +306,16 @@ impl Server {
             datasets_hnsw_dir.as_deref(),
         )
         .map_err(|e| anyhow::anyhow!("DatasetRegistry::open: {e}"))?;
-        self.evals = EvalRegistry::open_with_index_dir(
-            embedder.clone(),
-            evals_b,
-            evals_hnsw_dir.as_deref(),
-        )
-        .map_err(|e| anyhow::anyhow!("EvalRegistry::open: {e}"))?;
+        self.evals =
+            EvalRegistry::open_with_index_dir(embedder.clone(), evals_b, evals_hnsw_dir.as_deref())
+                .map_err(|e| anyhow::anyhow!("EvalRegistry::open: {e}"))?;
         self.replays = ReplayRegistry::open(replays_b)
             .map_err(|e| anyhow::anyhow!("ReplayRegistry::open: {e}"))?;
-        self.traces = TraceStore::open(traces_b)
-            .map_err(|e| anyhow::anyhow!("TraceStore::open: {e}"))?;
-        self.costs = CostLedger::open_with_index_dir(
-            embedder.clone(),
-            costs_b,
-            costs_hnsw_dir.as_deref(),
-        )
-        .map_err(|e| anyhow::anyhow!("CostLedger::open: {e}"))?;
+        self.traces =
+            TraceStore::open(traces_b).map_err(|e| anyhow::anyhow!("TraceStore::open: {e}"))?;
+        self.costs =
+            CostLedger::open_with_index_dir(embedder.clone(), costs_b, costs_hnsw_dir.as_deref())
+                .map_err(|e| anyhow::anyhow!("CostLedger::open: {e}"))?;
         Ok(self)
     }
 
@@ -421,10 +422,7 @@ impl Server {
             tls = self.tls_config.is_some(),
             "duxx-server listening"
         );
-        let acceptor = self
-            .tls_config
-            .clone()
-            .map(tokio_rustls::TlsAcceptor::from);
+        let acceptor = self.tls_config.clone().map(tokio_rustls::TlsAcceptor::from);
         loop {
             let (socket, peer) = listener.accept().await?;
             tracing::debug!(?peer, "accepted");
@@ -468,10 +466,7 @@ impl Server {
         );
         let server = self.clone();
         let counter = self.active_conns.clone();
-        let acceptor = self
-            .tls_config
-            .clone()
-            .map(tokio_rustls::TlsAcceptor::from);
+        let acceptor = self.tls_config.clone().map(tokio_rustls::TlsAcceptor::from);
         tokio::pin!(shutdown);
 
         loop {
@@ -526,10 +521,7 @@ impl Server {
                 return Ok(0);
             }
             if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    open = n,
-                    "drain deadline hit; {n} connections still open"
-                );
+                tracing::warn!(open = n, "drain deadline hit; {n} connections still open");
                 return Ok(n);
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -553,8 +545,7 @@ impl Server {
                 match resp::parse(&mut buf) {
                     Ok(Some(v)) => {
                         out.clear();
-                        let action =
-                            self.dispatch_with_auth(v, state.is_subscribed(), &mut authed);
+                        let action = self.dispatch_with_auth(v, state.is_subscribed(), &mut authed);
                         match action {
                             Response::Reply(value) => {
                                 value.write_to(&mut out);
@@ -625,6 +616,16 @@ impl Server {
                         read = socket.read_buf(&mut buf) => {
                             let n = read?;
                             if n == 0 { return Ok(()); }
+                            if buf.len() > resp::MAX_INPUT_BUFFER_BYTES {
+                                out.clear();
+                                RespValue::Error(format!(
+                                    "ERR request buffer too large (max {} bytes)",
+                                    resp::MAX_INPUT_BUFFER_BYTES
+                                ))
+                                .write_to(&mut out);
+                                socket.write_all(&out).await?;
+                                return Ok(());
+                            }
                         }
                         recv = rx.recv() => {
                             match recv {
@@ -661,7 +662,19 @@ impl Server {
                 }
                 None => {
                     let n = socket.read_buf(&mut buf).await?;
-                    if n == 0 { return Ok(()); }
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    if buf.len() > resp::MAX_INPUT_BUFFER_BYTES {
+                        out.clear();
+                        RespValue::Error(format!(
+                            "ERR request buffer too large (max {} bytes)",
+                            resp::MAX_INPUT_BUFFER_BYTES
+                        ))
+                        .write_to(&mut out);
+                        socket.write_all(&out).await?;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -692,22 +705,12 @@ impl Server {
                     .unwrap_or_default(),
                 _ => String::new(),
             };
-            let allowed_pre_auth =
-                matches!(cmd_upper.as_str(), "AUTH" | "PING" | "QUIT" | "HELLO");
+            let allowed_pre_auth = matches!(cmd_upper.as_str(), "AUTH" | "PING" | "QUIT" | "HELLO");
             if !allowed_pre_auth {
-                return Response::Reply(err(
-                    "NOAUTH Authentication required.",
-                ));
+                return Response::Reply(err("NOAUTH Authentication required."));
             }
         }
         self.dispatch_with_sub_inner(value, subscribed, authed)
-    }
-
-    /// Dispatch in connection context. `subscribed` is true if the
-    /// connection has any active SUBSCRIBE/PSUBSCRIBE.
-    fn dispatch_with_sub(&self, value: RespValue, subscribed: bool) -> Response {
-        let mut authed = true;
-        self.dispatch_with_sub_inner(value, subscribed, &mut authed)
     }
 
     fn dispatch_with_sub_inner(
@@ -838,9 +841,7 @@ impl Server {
             None => return Response::Reply(err("ERR AUTH token must be a string")),
         };
         match &self.auth_token {
-            None => Response::Reply(err(
-                "ERR Client sent AUTH, but no password is set",
-            )),
+            None => Response::Reply(err("ERR Client sent AUTH, but no password is set")),
             Some(expected) => {
                 if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
                     *authed = true;
@@ -882,23 +883,80 @@ impl Server {
     fn cmd_command(&self) -> Response {
         // Very minimal: just list our command names.
         let names = [
-            "PING", "HELLO", "AUTH", "COMMAND", "INFO", "QUIT", "SET", "GET", "DEL",
-            "REMEMBER", "RECALL", "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
-            "TRACE.RECORD", "TRACE.CLOSE", "TRACE.GET", "TRACE.SUBTREE", "TRACE.THREAD",
+            "PING",
+            "HELLO",
+            "AUTH",
+            "COMMAND",
+            "INFO",
+            "QUIT",
+            "SET",
+            "GET",
+            "DEL",
+            "REMEMBER",
+            "RECALL",
+            "SUBSCRIBE",
+            "UNSUBSCRIBE",
+            "PSUBSCRIBE",
+            "PUNSUBSCRIBE",
+            "TRACE.RECORD",
+            "TRACE.CLOSE",
+            "TRACE.GET",
+            "TRACE.SUBTREE",
+            "TRACE.THREAD",
             "TRACE.SEARCH",
-            "PROMPT.PUT", "PROMPT.GET", "PROMPT.LIST", "PROMPT.NAMES", "PROMPT.TAG",
-            "PROMPT.UNTAG", "PROMPT.DELETE", "PROMPT.SEARCH", "PROMPT.DIFF",
-            "DATASET.CREATE", "DATASET.ADD", "DATASET.GET", "DATASET.LIST", "DATASET.NAMES",
-            "DATASET.TAG", "DATASET.UNTAG", "DATASET.DELETE", "DATASET.SAMPLE",
-            "DATASET.SIZE", "DATASET.SPLITS", "DATASET.SEARCH", "DATASET.FROM_RECALL",
-            "EVAL.START", "EVAL.SCORE", "EVAL.COMPLETE", "EVAL.FAIL", "EVAL.GET",
-            "EVAL.SCORES", "EVAL.LIST", "EVAL.COMPARE", "EVAL.CLUSTER_FAILURES",
-            "REPLAY.CAPTURE", "REPLAY.START", "REPLAY.STEP", "REPLAY.RECORD",
-            "REPLAY.COMPLETE", "REPLAY.FAIL", "REPLAY.GET_SESSION", "REPLAY.GET_RUN",
-            "REPLAY.LIST_SESSIONS", "REPLAY.LIST_RUNS", "REPLAY.DIFF", "REPLAY.SET_TRACE",
-            "COST.RECORD", "COST.QUERY", "COST.AGGREGATE", "COST.TOTAL",
-            "COST.SET_BUDGET", "COST.GET_BUDGET", "COST.DELETE_BUDGET",
-            "COST.STATUS", "COST.ALERTS", "COST.CLUSTER_EXPENSIVE",
+            "PROMPT.PUT",
+            "PROMPT.GET",
+            "PROMPT.LIST",
+            "PROMPT.NAMES",
+            "PROMPT.TAG",
+            "PROMPT.UNTAG",
+            "PROMPT.DELETE",
+            "PROMPT.SEARCH",
+            "PROMPT.DIFF",
+            "DATASET.CREATE",
+            "DATASET.ADD",
+            "DATASET.GET",
+            "DATASET.LIST",
+            "DATASET.NAMES",
+            "DATASET.TAG",
+            "DATASET.UNTAG",
+            "DATASET.DELETE",
+            "DATASET.SAMPLE",
+            "DATASET.SIZE",
+            "DATASET.SPLITS",
+            "DATASET.SEARCH",
+            "DATASET.FROM_RECALL",
+            "EVAL.START",
+            "EVAL.SCORE",
+            "EVAL.COMPLETE",
+            "EVAL.FAIL",
+            "EVAL.GET",
+            "EVAL.SCORES",
+            "EVAL.LIST",
+            "EVAL.COMPARE",
+            "EVAL.CLUSTER_FAILURES",
+            "REPLAY.CAPTURE",
+            "REPLAY.START",
+            "REPLAY.STEP",
+            "REPLAY.RECORD",
+            "REPLAY.COMPLETE",
+            "REPLAY.FAIL",
+            "REPLAY.GET_SESSION",
+            "REPLAY.GET_RUN",
+            "REPLAY.LIST_SESSIONS",
+            "REPLAY.LIST_RUNS",
+            "REPLAY.DIFF",
+            "REPLAY.SET_TRACE",
+            "COST.RECORD",
+            "COST.QUERY",
+            "COST.AGGREGATE",
+            "COST.TOTAL",
+            "COST.SET_BUDGET",
+            "COST.GET_BUDGET",
+            "COST.DELETE_BUDGET",
+            "COST.STATUS",
+            "COST.ALERTS",
+            "COST.CLUSTER_EXPENSIVE",
         ];
         let arr: Vec<RespValue> = names.iter().map(|n| RespValue::bulk(*n)).collect();
         Response::Reply(RespValue::Array(arr))
@@ -1171,16 +1229,13 @@ impl Server {
             .and_then(arg_string)
             .and_then(|s| s.parse::<u128>().ok())
             .unwrap_or_else(now_ns);
-        let end_unix_ns = args
-            .get(7)
-            .and_then(arg_string)
-            .and_then(|s| {
-                if s == "-" || s.is_empty() {
-                    None
-                } else {
-                    s.parse::<u128>().ok()
-                }
-            });
+        let end_unix_ns = args.get(7).and_then(arg_string).and_then(|s| {
+            if s == "-" || s.is_empty() {
+                None
+            } else {
+                s.parse::<u128>().ok()
+            }
+        });
         let status = args
             .get(8)
             .and_then(arg_string)
@@ -1332,9 +1387,7 @@ impl Server {
     /// version as an integer reply.
     fn cmd_prompt_put(&self, args: &[RespValue]) -> Response {
         if args.len() < 3 {
-            return Response::Reply(err(
-                "ERR PROMPT.PUT expects: name content [metadata_json]",
-            ));
+            return Response::Reply(err("ERR PROMPT.PUT expects: name content [metadata_json]"));
         }
         let name = match arg_string(&args[1]) {
             Some(s) => s.to_string(),
@@ -1429,7 +1482,11 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR name must be a string")),
         };
-        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let version: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version must be a positive integer")),
         };
@@ -1472,7 +1529,11 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR name must be a string")),
         };
-        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let version: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version must be a positive integer")),
         };
@@ -1519,19 +1580,25 @@ impl Server {
     /// or "+".
     fn cmd_prompt_diff(&self, args: &[RespValue]) -> Response {
         if args.len() != 4 {
-            return Response::Reply(err(
-                "ERR PROMPT.DIFF expects: name version_a version_b",
-            ));
+            return Response::Reply(err("ERR PROMPT.DIFF expects: name version_a version_b"));
         }
         let name = match arg_string(&args[1]) {
             Some(s) => s,
             None => return Response::Reply(err("ERR name must be a string")),
         };
-        let va: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let va: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version_a must be a positive integer")),
         };
-        let vb: u64 = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let vb: u64 = match args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version_b must be a positive integer")),
         };
@@ -1673,7 +1740,11 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR name must be a string")),
         };
-        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let version: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version must be a positive integer")),
         };
@@ -1713,7 +1784,11 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR name must be a string")),
         };
-        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let version: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version must be a positive integer")),
         };
@@ -1730,15 +1805,26 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR name must be a string")),
         };
-        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let version: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version must be a positive integer")),
         };
-        let n: usize = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let n: usize = match args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR n must be a non-negative integer")),
         };
-        let split = args.get(4).and_then(arg_string).filter(|s| !s.is_empty() && *s != "-");
+        let split = args
+            .get(4)
+            .and_then(arg_string)
+            .filter(|s| !s.is_empty() && *s != "-");
         let rows = self.datasets.sample(name, version, n, split);
         let arr: Vec<RespValue> = rows
             .into_iter()
@@ -1756,12 +1842,21 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR name must be a string")),
         };
-        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let version: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version must be a positive integer")),
         };
-        let split = args.get(3).and_then(arg_string).filter(|s| !s.is_empty() && *s != "-");
-        Response::Reply(RespValue::Integer(self.datasets.size(name, version, split) as i64))
+        let split = args
+            .get(3)
+            .and_then(arg_string)
+            .filter(|s| !s.is_empty() && *s != "-");
+        Response::Reply(RespValue::Integer(
+            self.datasets.size(name, version, split) as i64
+        ))
     }
 
     /// `DATASET.SPLITS name version` — distinct split names in a version.
@@ -1773,7 +1868,11 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR name must be a string")),
         };
-        let version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let version: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR version must be a positive integer")),
         };
@@ -1840,7 +1939,11 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR query must be a string")),
         };
-        let k: usize = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let k: usize = match args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR k must be a positive integer")),
         };
@@ -1905,7 +2008,11 @@ impl Server {
             Some(s) => s.to_string(),
             None => return Response::Reply(err("ERR dataset_name must be a string")),
         };
-        let dataset_version: u64 = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let dataset_version: u64 = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR dataset_version must be a positive integer")),
         };
@@ -1934,7 +2041,7 @@ impl Server {
                 Err(e) => return Response::Reply(err(format!("ERR metadata_json: {e}"))),
             },
         };
-        let id = self.evals.start(
+        let id = self.evals.start(EvalStart {
             dataset_name,
             dataset_version,
             prompt_name,
@@ -1942,7 +2049,7 @@ impl Server {
             model,
             scorer,
             metadata,
-        );
+        });
         Response::Reply(RespValue::BulkString(id.into_bytes()))
     }
 
@@ -1961,7 +2068,11 @@ impl Server {
             Some(s) => s.to_string(),
             None => return Response::Reply(err("ERR row_id must be a string")),
         };
-        let score: f32 = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let score: f32 = match args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR score must be a float in [0, 1]")),
         };
@@ -2059,7 +2170,12 @@ impl Server {
     /// `EVAL.LIST [dataset_name] [dataset_version]` — all runs, or
     /// those for a specific dataset/version.
     fn cmd_eval_list(&self, args: &[RespValue]) -> Response {
-        let runs = match (args.get(1).and_then(arg_string), args.get(2).and_then(arg_string).and_then(|s| s.parse::<u64>().ok())) {
+        let runs = match (
+            args.get(1).and_then(arg_string),
+            args.get(2)
+                .and_then(arg_string)
+                .and_then(|s| s.parse::<u64>().ok()),
+        ) {
             (Some(name), Some(v)) => self.evals.list_runs_for(name, v),
             _ => self.evals.list_runs(),
         };
@@ -2150,9 +2266,7 @@ impl Server {
     /// provides is overwritten.
     fn cmd_replay_capture(&self, args: &[RespValue]) -> Response {
         if args.len() != 3 {
-            return Response::Reply(err(
-                "ERR REPLAY.CAPTURE expects: trace_id invocation_json",
-            ));
+            return Response::Reply(err("ERR REPLAY.CAPTURE expects: trace_id invocation_json"));
         }
         let trace_id = match arg_string(&args[1]) {
             Some(s) => s.to_string(),
@@ -2242,9 +2356,15 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR run_id must be a string")),
         };
-        let idx: usize = match args.get(2).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let idx: usize = match args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
-            None => return Response::Reply(err("ERR invocation_idx must be a non-negative integer")),
+            None => {
+                return Response::Reply(err("ERR invocation_idx must be a non-negative integer"))
+            }
         };
         let output_json = match arg_string(&args[3]) {
             Some(s) => s,
@@ -2383,9 +2503,7 @@ impl Server {
     /// replay of a source by joining on this id.
     fn cmd_replay_set_trace(&self, args: &[RespValue]) -> Response {
         if args.len() != 3 {
-            return Response::Reply(err(
-                "ERR REPLAY.SET_TRACE expects: run_id replay_trace_id",
-            ));
+            return Response::Reply(err("ERR REPLAY.SET_TRACE expects: run_id replay_trace_id"));
         }
         let run_id = match arg_string(&args[1]) {
             Some(s) => s,
@@ -2423,15 +2541,27 @@ impl Server {
             Some(s) => s.to_string(),
             None => return Response::Reply(err("ERR model must be a string")),
         };
-        let tokens_in: u64 = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let tokens_in: u64 = match args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR tokens_in must be a non-negative integer")),
         };
-        let tokens_out: u64 = match args.get(4).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let tokens_out: u64 = match args
+            .get(4)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR tokens_out must be a non-negative integer")),
         };
-        let cost_usd: f64 = match args.get(5).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let cost_usd: f64 = match args
+            .get(5)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR cost_usd must be a non-negative float")),
         };
@@ -2494,11 +2624,12 @@ impl Server {
     /// `group_by` ∈ tenant | model | prompt | day | none.
     fn cmd_cost_aggregate(&self, args: &[RespValue]) -> Response {
         if args.len() < 2 {
-            return Response::Reply(err(
-                "ERR COST.AGGREGATE expects: group_by [filter_json]",
-            ));
+            return Response::Reply(err("ERR COST.AGGREGATE expects: group_by [filter_json]"));
         }
-        let group_by = match arg_string(&args[1]).map(|s| s.to_ascii_lowercase()).as_deref() {
+        let group_by = match arg_string(&args[1])
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
             Some("tenant") => GroupBy::Tenant,
             Some("model") => GroupBy::Model,
             Some("prompt") => GroupBy::Prompt,
@@ -2535,8 +2666,14 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR tenant must be a string")),
         };
-        let since = args.get(2).and_then(arg_string).and_then(|s| s.parse::<u128>().ok());
-        let until = args.get(3).and_then(arg_string).and_then(|s| s.parse::<u128>().ok());
+        let since = args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse::<u128>().ok());
+        let until = args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse::<u128>().ok());
         let total = self.costs.total_for(tenant, since, until);
         Response::Reply(RespValue::BulkString(format!("{total:.6}").into_bytes()))
     }
@@ -2567,7 +2704,11 @@ impl Server {
             },
             None => return Response::Reply(err("ERR period must be a string")),
         };
-        let amount: f64 = match args.get(3).and_then(arg_string).and_then(|s| s.parse().ok()) {
+        let amount: f64 = match args
+            .get(3)
+            .and_then(arg_string)
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return Response::Reply(err("ERR amount_usd must be a non-negative float")),
         };
@@ -2583,7 +2724,10 @@ impl Server {
                 Err(e) => return Response::Reply(err(format!("ERR metadata_json: {e}"))),
             },
         };
-        match self.costs.set_budget(tenant, period, amount, warn_pct, metadata) {
+        match self
+            .costs
+            .set_budget(tenant, period, amount, warn_pct, metadata)
+        {
             Ok(_) => Response::Reply(simple("OK")),
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
@@ -2671,7 +2815,10 @@ impl Server {
             .and_then(arg_string)
             .and_then(|s| s.parse().ok())
             .unwrap_or(50);
-        match self.costs.cluster_expensive(&filter, sim_threshold, max_clusters, top_n) {
+        match self
+            .costs
+            .cluster_expensive(&filter, sim_threshold, max_clusters, top_n)
+        {
             Ok(clusters) => {
                 let arr: Vec<RespValue> = clusters
                     .into_iter()
@@ -2687,11 +2834,7 @@ impl Server {
 // Silence dead-code warnings for the imported types we don't reference
 // in this file but want to surface in the public API of duxx-server.
 #[allow(dead_code)]
-fn _replay_type_anchor(
-    _: ReplayInvocationKind,
-    _: ReplayOverrideKind,
-) {
-}
+fn _replay_type_anchor(_: ReplayInvocationKind, _: ReplayOverrideKind) {}
 
 /// Parse the rows_json payload of DATASET.ADD. Accepts either a JSON
 /// array of objects OR a JSON array of strings (treated as `text` only,
@@ -2708,21 +2851,20 @@ fn parse_rows(raw: serde_json::Value) -> std::result::Result<Vec<DatasetRow>, St
                 out.push(DatasetRow::new(s));
             }
             serde_json::Value::Object(_) => {
-                let row: DatasetRow = serde_json::from_value(v)
-                    .map_err(|e| format!("row decode: {e}"))?;
+                let row: DatasetRow =
+                    serde_json::from_value(v).map_err(|e| format!("row decode: {e}"))?;
                 // Fill in an id if the caller omitted one.
                 let row = if row.id.is_empty() {
-                    DatasetRow { id: uuid::Uuid::new_v4().simple().to_string(), ..row }
+                    DatasetRow {
+                        id: uuid::Uuid::new_v4().simple().to_string(),
+                        ..row
+                    }
                 } else {
                     row
                 };
                 out.push(row);
             }
-            other => {
-                return Err(format!(
-                    "expected string or object per row, got {other:?}"
-                ))
-            }
+            other => return Err(format!("expected string or object per row, got {other:?}")),
         }
     }
     Ok(out)
@@ -2759,25 +2901,28 @@ fn parse_trace_search(json: &str) -> Result<TraceSearch, String> {
         name_prefix: raw.name_prefix,
         since: raw.since,
         until: raw.until,
-        status: raw.status.and_then(|s| match s.to_ascii_lowercase().as_str() {
-            "ok" => Some(SpanStatus::Ok),
-            "error" | "err" => Some(SpanStatus::Error),
-            "unset" => Some(SpanStatus::Unset),
-            _ => None,
-        }),
+        status: raw
+            .status
+            .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "ok" => Some(SpanStatus::Ok),
+                "error" | "err" => Some(SpanStatus::Error),
+                "unset" => Some(SpanStatus::Unset),
+                _ => None,
+            }),
         trace_id: raw.trace_id,
-        kind: raw.kind.and_then(|s| match s.to_ascii_lowercase().as_str() {
-            "server" => Some(SpanKind::Server),
-            "client" => Some(SpanKind::Client),
-            "internal" => Some(SpanKind::Internal),
-            "producer" => Some(SpanKind::Producer),
-            "consumer" => Some(SpanKind::Consumer),
-            _ => None,
-        }),
+        kind: raw
+            .kind
+            .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "server" => Some(SpanKind::Server),
+                "client" => Some(SpanKind::Client),
+                "internal" => Some(SpanKind::Internal),
+                "producer" => Some(SpanKind::Producer),
+                "consumer" => Some(SpanKind::Consumer),
+                _ => None,
+            }),
         limit: raw.limit,
     })
 }
-
 
 impl Default for Server {
     fn default() -> Self {
@@ -2790,10 +2935,22 @@ impl Default for Server {
 pub enum Response {
     Reply(RespValue),
     CloseAfter(RespValue),
-    Subscribe { channel: String, ack: RespValue },
-    Unsubscribe { channels: Vec<String>, ack: RespValue },
-    PSubscribe { pattern: String, ack: RespValue },
-    PUnsubscribe { patterns: Vec<String>, ack: RespValue },
+    Subscribe {
+        channel: String,
+        ack: RespValue,
+    },
+    Unsubscribe {
+        channels: Vec<String>,
+        ack: RespValue,
+    },
+    PSubscribe {
+        pattern: String,
+        ack: RespValue,
+    },
+    PUnsubscribe {
+        patterns: Vec<String>,
+        ack: RespValue,
+    },
 }
 
 /// Per-connection subscription state.
@@ -2845,12 +3002,6 @@ fn push_pmessage(pattern: &str, channel: &str, event: &ChangeEvent) -> RespValue
         RespValue::bulk(channel.to_string()),
         RespValue::bulk(payload_json(event)),
     ])
-}
-
-/// Compatibility re-export: older tests still call this by its old name.
-#[doc(hidden)]
-fn push_event_message(channel: &str, event: &ChangeEvent) -> RespValue {
-    push_message(channel, event)
 }
 
 fn simple(s: &str) -> RespValue {
@@ -2909,10 +3060,7 @@ mod tests {
     #[test]
     fn ping_with_arg_echoes() {
         let s = Server::new();
-        let r = dispatch_array(
-            &s,
-            vec![RespValue::bulk("PING"), RespValue::bulk("hello")],
-        );
+        let r = dispatch_array(&s, vec![RespValue::bulk("PING"), RespValue::bulk("hello")]);
         assert_eq!(r, RespValue::bulk("hello"));
     }
 
@@ -3015,7 +3163,10 @@ mod tests {
                     panic!("ack is not array");
                 }
             }
-            other => panic!("expected Subscribe, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Subscribe, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -3386,7 +3537,13 @@ mod tests {
         let s = Server::new();
         s.dispatch(trace_record_args("t1", "root", "-", "agent.run", "-"));
         s.dispatch(trace_record_args("t1", "child1", "root", "llm.call", "-"));
-        s.dispatch(trace_record_args("t1", "child2", "root", "tool.search", "-"));
+        s.dispatch(trace_record_args(
+            "t1",
+            "child2",
+            "root",
+            "tool.search",
+            "-",
+        ));
         s.dispatch(trace_record_args("t1", "grand", "child1", "embed", "-"));
 
         let r = s.dispatch(RespValue::Array(vec![
@@ -3454,10 +3611,7 @@ mod tests {
         let v1 = s.dispatch(prompt_put_args("greet", "Hi", "-"));
         let v2 = s.dispatch(prompt_put_args("greet", "Hi!", "-"));
         match (v1, v2) {
-            (
-                Response::Reply(RespValue::Integer(a)),
-                Response::Reply(RespValue::Integer(b)),
-            ) => {
+            (Response::Reply(RespValue::Integer(a)), Response::Reply(RespValue::Integer(b))) => {
                 assert_eq!((a, b), (1, 2));
             }
             other => panic!("unexpected: {other:?}"),
@@ -3594,8 +3748,14 @@ mod tests {
         match r {
             Response::Reply(RespValue::BulkString(bytes)) => {
                 let body = std::str::from_utf8(&bytes).unwrap();
-                assert!(body.contains("-line c"), "missing removed line, got:\n{body}");
-                assert!(body.contains("+NEW line"), "missing added line, got:\n{body}");
+                assert!(
+                    body.contains("-line c"),
+                    "missing removed line, got:\n{body}"
+                );
+                assert!(
+                    body.contains("+NEW line"),
+                    "missing added line, got:\n{body}"
+                );
             }
             other => panic!("expected bulk diff, got {other:?}"),
         }
@@ -3623,10 +3783,7 @@ mod tests {
             r#"[{"text": "world", "split": "train"}]"#,
         ));
         match (v1, v2) {
-            (
-                Response::Reply(RespValue::Integer(a)),
-                Response::Reply(RespValue::Integer(b)),
-            ) => {
+            (Response::Reply(RespValue::Integer(a)), Response::Reply(RespValue::Integer(b))) => {
                 assert_eq!((a, b), (1, 2));
             }
             other => panic!("unexpected: {other:?}"),
@@ -3817,9 +3974,7 @@ mod tests {
             RespValue::bulk("llm_judge"),
         ]));
         match r {
-            Response::Reply(RespValue::BulkString(bytes)) => {
-                String::from_utf8(bytes).unwrap()
-            }
+            Response::Reply(RespValue::BulkString(bytes)) => String::from_utf8(bytes).unwrap(),
             other => panic!("expected bulk run_id, got {other:?}"),
         }
     }
@@ -3897,8 +4052,10 @@ mod tests {
         let a = eval_start_run(&s);
         let b = eval_start_run(&s);
         for (id, row, score) in [
-            (&a, "r1", "0.9"), (&a, "r2", "0.5"),
-            (&b, "r1", "0.6"), (&b, "r2", "0.9"),
+            (&a, "r1", "0.9"),
+            (&a, "r2", "0.5"),
+            (&b, "r1", "0.6"),
+            (&b, "r2", "0.9"),
         ] {
             s.dispatch(RespValue::Array(vec![
                 RespValue::bulk("EVAL.SCORE"),
@@ -4022,7 +4179,12 @@ mod tests {
 
     // ---------- Phase 7.5: REPLAY.* commands ----------
 
-    fn replay_capture_args(trace_id: &str, idx_seed: u64, input_text: &str, output_text: &str) -> RespValue {
+    fn replay_capture_args(
+        trace_id: &str,
+        idx_seed: u64,
+        input_text: &str,
+        output_text: &str,
+    ) -> RespValue {
         let inv = serde_json::json!({
             "idx": 0,
             "span_id": format!("span-{idx_seed}"),
@@ -4051,10 +4213,9 @@ mod tests {
         let r0 = s.dispatch(replay_capture_args("t1", 0, "hi", "ok"));
         let r1 = s.dispatch(replay_capture_args("t1", 1, "again", "ok"));
         match (r0, r1) {
-            (
-                Response::Reply(RespValue::Integer(a)),
-                Response::Reply(RespValue::Integer(b)),
-            ) => assert_eq!((a, b), (0, 1)),
+            (Response::Reply(RespValue::Integer(a)), Response::Reply(RespValue::Integer(b))) => {
+                assert_eq!((a, b), (0, 1))
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -4088,9 +4249,7 @@ mod tests {
             RespValue::bulk(overrides_json),
         ]));
         match r {
-            Response::Reply(RespValue::BulkString(bytes)) => {
-                String::from_utf8(bytes).unwrap()
-            }
+            Response::Reply(RespValue::BulkString(bytes)) => String::from_utf8(bytes).unwrap(),
             other => panic!("expected run_id, got {other:?}"),
         }
     }
@@ -4125,7 +4284,8 @@ mod tests {
     fn replay_start_with_swap_model_override() {
         let s = Server::new();
         capture_three(&s, "t1");
-        let overrides = r#"[{"at_idx": 1, "kind": {"kind": "swap_model", "model": "claude-4.5-sonnet"}}]"#;
+        let overrides =
+            r#"[{"at_idx": 1, "kind": {"kind": "swap_model", "model": "claude-4.5-sonnet"}}]"#;
         let run = replay_start(&s, "t1", "live", overrides);
         // Burn idx 0.
         s.dispatch(RespValue::Array(vec![
@@ -4242,7 +4402,14 @@ mod tests {
 
     // ---------- Phase 7.6: COST.* commands ----------
 
-    fn cost_record_args(tenant: &str, model: &str, tok_in: u64, tok_out: u64, usd: &str, input: &str) -> RespValue {
+    fn cost_record_args(
+        tenant: &str,
+        model: &str,
+        tok_in: u64,
+        tok_out: u64,
+        usd: &str,
+        input: &str,
+    ) -> RespValue {
         RespValue::Array(vec![
             RespValue::bulk("COST.RECORD"),
             RespValue::bulk(tenant),
@@ -4391,9 +4558,7 @@ mod tests {
         ]));
         s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "9.0", ""));
         s.dispatch(cost_record_args("globex", "gpt-4o", 1, 1, "1.0", ""));
-        let r = s.dispatch(RespValue::Array(vec![
-            RespValue::bulk("COST.ALERTS"),
-        ]));
+        let r = s.dispatch(RespValue::Array(vec![RespValue::bulk("COST.ALERTS")]));
         match r {
             Response::Reply(RespValue::Array(items)) => {
                 assert_eq!(items.len(), 1);
@@ -4409,9 +4574,30 @@ mod tests {
     #[test]
     fn cost_cluster_expensive_returns_clusters() {
         let s = Server::new();
-        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "5.0", "user asked phone number"));
-        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "4.0", "phone number lookup"));
-        s.dispatch(cost_record_args("acme", "gpt-4o", 1, 1, "0.01", "what's the weather"));
+        s.dispatch(cost_record_args(
+            "acme",
+            "gpt-4o",
+            1,
+            1,
+            "5.0",
+            "user asked phone number",
+        ));
+        s.dispatch(cost_record_args(
+            "acme",
+            "gpt-4o",
+            1,
+            1,
+            "4.0",
+            "phone number lookup",
+        ));
+        s.dispatch(cost_record_args(
+            "acme",
+            "gpt-4o",
+            1,
+            1,
+            "0.01",
+            "what's the weather",
+        ));
         let r = s.dispatch(RespValue::Array(vec![
             RespValue::bulk("COST.CLUSTER_EXPENSIVE"),
             RespValue::bulk("-"),
@@ -4477,11 +4663,7 @@ mod tests {
     fn replay_rejected_pre_auth() {
         let s = Server::new().with_auth("secret");
         let mut authed = false;
-        let r = s.dispatch_with_auth(
-            replay_capture_args("t1", 0, "hi", "ok"),
-            false,
-            &mut authed,
-        );
+        let r = s.dispatch_with_auth(replay_capture_args("t1", 0, "hi", "ok"), false, &mut authed);
         match r {
             Response::Reply(RespValue::Error(msg)) => {
                 assert!(msg.contains("NOAUTH"), "got: {msg}");
@@ -4536,11 +4718,7 @@ mod tests {
     fn prompt_rejected_pre_auth() {
         let s = Server::new().with_auth("secret");
         let mut authed = false;
-        let r = s.dispatch_with_auth(
-            prompt_put_args("g", "hi", "-"),
-            false,
-            &mut authed,
-        );
+        let r = s.dispatch_with_auth(prompt_put_args("g", "hi", "-"), false, &mut authed);
         match r {
             Response::Reply(RespValue::Error(msg)) => {
                 assert!(msg.contains("NOAUTH"), "got: {msg}");
@@ -4552,7 +4730,13 @@ mod tests {
     #[test]
     fn trace_search_filters_by_name_prefix() {
         let s = Server::new();
-        s.dispatch(trace_record_args("t1", "s1", "-", "llm.openai.completion", "-"));
+        s.dispatch(trace_record_args(
+            "t1",
+            "s1",
+            "-",
+            "llm.openai.completion",
+            "-",
+        ));
         s.dispatch(trace_record_args("t1", "s2", "-", "tool.web_search", "-"));
         let r = s.dispatch(RespValue::Array(vec![
             RespValue::bulk("TRACE.SEARCH"),

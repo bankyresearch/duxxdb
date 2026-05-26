@@ -49,7 +49,7 @@
 use duxx_embed::Embedder;
 use duxx_index::vector::VectorIndex;
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
-use duxx_storage::{Backend, BatchOp, MemoryBackend, key};
+use duxx_storage::{key, Backend, BatchOp, MemoryBackend};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -380,11 +380,10 @@ impl PromptRegistry {
                     Some(v) => v,
                     None => continue,
                 };
-                let parsed: (String, u64) =
-                    match serde_json::from_slice(&value_bytes) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+                let parsed: (String, u64) = match serde_json::from_slice(&value_bytes) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 if internal_id > max_internal {
                     max_internal = internal_id;
                 }
@@ -539,7 +538,10 @@ impl PromptRegistry {
             .write()
             .insert(internal_id, emb)
             .map_err(|e| PromptError::Embed(format!("vector index: {e}")))?;
-        self.inner.id_to_key.write().insert(internal_id, key.clone());
+        self.inner
+            .id_to_key
+            .write()
+            .insert(internal_id, key.clone());
         // Persist the id-to-key row so a future graceful-reopen can
         // resurrect this entry from the HNSW dump without touching
         // the embedder.
@@ -563,10 +565,7 @@ impl PromptRegistry {
             .get(&(name.to_string(), version))
             .map(|p| {
                 let tags = self.tags_for_version(name, version);
-                Prompt {
-                    tags,
-                    ..p.clone()
-                }
+                Prompt { tags, ..p.clone() }
             })
     }
 
@@ -669,10 +668,11 @@ impl PromptRegistry {
             // source of truth for the return value. A backend error
             // here would leave a stale tag row on disk, surfaced on
             // next rehydrate — log it but don't fail the call.
-            if let Err(e) = self.inner.backend.delete(
-                tables::TAGS,
-                &key::two(name.as_bytes(), tag.as_bytes()),
-            ) {
+            if let Err(e) = self
+                .inner
+                .backend
+                .delete(tables::TAGS, &key::two(name.as_bytes(), tag.as_bytes()))
+            {
                 tracing::warn!(error = %e, "backend untag delete failed");
             }
             self.inner.bus.publish(ChangeEvent {
@@ -786,10 +786,7 @@ impl PromptRegistry {
                 // Map back to similarity in [0, 1] (clamp the rare
                 // numerical drift outside that range).
                 let sim = (1.0 - dist).clamp(0.0, 1.0);
-                out.push(PromptHit {
-                    prompt,
-                    score: sim,
-                });
+                out.push(PromptHit { prompt, score: sim });
             }
         }
         Ok(out)
@@ -799,7 +796,12 @@ impl PromptRegistry {
     /// each line prefixed with `" "` (unchanged), `"-"` (only in
     /// `version_a`), or `"+"` (only in `version_b`). Hunks are
     /// concatenated.
-    pub fn diff(&self, name: &str, version_a: PromptVersion, version_b: PromptVersion) -> Result<String> {
+    pub fn diff(
+        &self,
+        name: &str,
+        version_a: PromptVersion,
+        version_b: PromptVersion,
+    ) -> Result<String> {
         let a = self
             .get(name, version_a)
             .ok_or(PromptError::VersionNotFound {
@@ -869,25 +871,25 @@ fn line_diff(a: &str, b: &str) -> String {
             let a_match = alines[i..].iter().position(|&x| x == blines[j]);
             match (a_match, b_match) {
                 (Some(da), Some(db)) if da < db => {
-                    for k in i..i + da {
+                    for line in alines.iter().skip(i).take(da) {
                         out.push('-');
-                        out.push_str(alines[k]);
+                        out.push_str(line);
                         out.push('\n');
                     }
                     i += da;
                 }
                 (_, Some(db)) => {
-                    for k in j..j + db {
+                    for line in blines.iter().skip(j).take(db) {
                         out.push('+');
-                        out.push_str(blines[k]);
+                        out.push_str(line);
                         out.push('\n');
                     }
                     j += db;
                 }
                 (Some(da), None) => {
-                    for k in i..i + da {
+                    for line in alines.iter().skip(i).take(da) {
                         out.push('-');
-                        out.push_str(alines[k]);
+                        out.push_str(line);
                         out.push('\n');
                     }
                     i += da;
@@ -1038,8 +1040,14 @@ mod tests {
     #[test]
     fn search_finds_semantically_close_prompts() {
         let r = reg();
-        r.put("greeting", "hello world how are you", serde_json::json!({})).unwrap();
-        r.put("farewell", "goodbye see you tomorrow", serde_json::json!({})).unwrap();
+        r.put("greeting", "hello world how are you", serde_json::json!({}))
+            .unwrap();
+        r.put(
+            "farewell",
+            "goodbye see you tomorrow",
+            serde_json::json!({}),
+        )
+        .unwrap();
         r.put(
             "support",
             "i can help you with your issue today",
@@ -1055,8 +1063,10 @@ mod tests {
     #[test]
     fn diff_marks_added_and_removed_lines() {
         let r = reg();
-        r.put("g", "line a\nshared\nline c", serde_json::json!({})).unwrap();
-        r.put("g", "line a\nshared\nNEW line", serde_json::json!({})).unwrap();
+        r.put("g", "line a\nshared\nline c", serde_json::json!({}))
+            .unwrap();
+        r.put("g", "line a\nshared\nNEW line", serde_json::json!({}))
+            .unwrap();
         let d = r.diff("g", 1, 2).unwrap();
         assert!(d.contains("-line c"));
         assert!(d.contains("+NEW line"));
@@ -1141,10 +1151,20 @@ mod tests {
         let embedder = Arc::new(HashEmbedder::new(16));
         {
             let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();
-            r.put("greeting", "hello world how are you", serde_json::json!({})).unwrap();
-            r.put("farewell", "goodbye see you tomorrow", serde_json::json!({})).unwrap();
-            r.put("support", "i can help with your issue", serde_json::json!({}))
+            r.put("greeting", "hello world how are you", serde_json::json!({}))
                 .unwrap();
+            r.put(
+                "farewell",
+                "goodbye see you tomorrow",
+                serde_json::json!({}),
+            )
+            .unwrap();
+            r.put(
+                "support",
+                "i can help with your issue",
+                serde_json::json!({}),
+            )
+            .unwrap();
         }
         // Reopen and search.
         let r = PromptRegistry::open(embedder.clone(), backend.clone()).unwrap();

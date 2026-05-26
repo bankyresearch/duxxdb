@@ -49,10 +49,10 @@ jobs:
           shared-key: test-${{ matrix.os }}
 
       - name: cargo build --workspace
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --exclude duxxdb-py
 
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude duxxdb-py
 
   # -----------------------------------------------------------------
   # Lint + format check, Linux only (fastest path to feedback).
@@ -77,18 +77,33 @@ jobs:
           shared-key: lint-ubuntu
 
       - name: cargo fmt --all -- --check
-        # Soft-warn for now: we have no enforced fmt history yet, so
-        # don't block PRs on it. Promote to a hard fail once the
-        # codebase is fully fmt-clean.
         run: cargo fmt --all -- --check
-        continue-on-error: true
 
       - name: cargo clippy --workspace
-        # Same posture as fmt: report findings without blocking, until
-        # the existing warnings are triaged. Tighten by removing
-        # continue-on-error once at -D warnings == 0.
-        run: cargo clippy --workspace --all-targets -- -W clippy::all
-        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # -----------------------------------------------------------------
+  # Supply-chain guard: fail builds on known RustSec advisories.
+  # -----------------------------------------------------------------
+  supply-chain:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: audit-ubuntu
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit
 
   # -----------------------------------------------------------------
   # Sanity: cargo check on bindings/python (PyO3 + maturin abi3).

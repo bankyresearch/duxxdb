@@ -63,10 +63,7 @@ impl TextIndex {
         Self::open_with_commit_every(dir, DEFAULT_COMMIT_EVERY)
     }
 
-    pub fn open_with_commit_every(
-        dir: impl AsRef<Path>,
-        commit_every: usize,
-    ) -> Result<Self> {
+    pub fn open_with_commit_every(dir: impl AsRef<Path>, commit_every: usize) -> Result<Self> {
         std::fs::create_dir_all(dir.as_ref())
             .map_err(|e| Error::Index(format!("create tantivy dir: {e}")))?;
         let (id_field, text_field, schema) = build_schema();
@@ -223,7 +220,8 @@ mod tests {
     #[test]
     fn bm25_ranks_higher_term_frequency_first() {
         let mut idx = TextIndex::new();
-        idx.insert(1, "refund refund refund my order".into()).unwrap();
+        idx.insert(1, "refund refund refund my order".into())
+            .unwrap();
         idx.insert(2, "refund please".into()).unwrap();
         idx.insert(3, "weather forecast".into()).unwrap();
         let hits = idx.search("refund", 10);

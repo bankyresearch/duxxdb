@@ -81,24 +81,30 @@ pub fn from_spec(spec: Option<&str>) -> Result<Option<Box<dyn Embedder>>> {
         }
         #[cfg(feature = "openai")]
         "openai" => {
-            let key = std::env::var("OPENAI_API_KEY").map_err(|_| {
-                duxx_core::Error::Internal("OPENAI_API_KEY not set".to_string())
-            })?;
+            let key = std::env::var("OPENAI_API_KEY")
+                .map_err(|_| duxx_core::Error::Internal("OPENAI_API_KEY not set".to_string()))?;
             let dim = openai::default_dim_for_model(rest);
             Ok(Some(Box::new(OpenAIEmbedder::new(key, rest, dim))))
         }
         #[cfg(feature = "cohere")]
         "cohere" => {
-            let key = std::env::var("COHERE_API_KEY").map_err(|_| {
-                duxx_core::Error::Internal("COHERE_API_KEY not set".to_string())
-            })?;
+            let key = std::env::var("COHERE_API_KEY")
+                .map_err(|_| duxx_core::Error::Internal("COHERE_API_KEY not set".to_string()))?;
             let dim = cohere::default_dim_for_model(rest);
             Ok(Some(Box::new(CohereEmbedder::new(key, rest, dim))))
         }
         other => Err(duxx_core::Error::Internal(format!(
             "unknown embedder kind: {other} (built-in features: hash{}{})",
-            if cfg!(feature = "openai") { ", openai" } else { "" },
-            if cfg!(feature = "cohere") { ", cohere" } else { "" },
+            if cfg!(feature = "openai") {
+                ", openai"
+            } else {
+                ""
+            },
+            if cfg!(feature = "cohere") {
+                ", cohere"
+            } else {
+                ""
+            },
         ))),
     }
 }

@@ -31,21 +31,26 @@ async fn main() -> anyhow::Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--addr" | "-a" => {
-                addr = args.next().ok_or_else(|| anyhow::anyhow!("--addr needs a value"))?;
+                addr = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--addr needs a value"))?;
             }
             "--embedder" | "-e" => {
                 embedder_spec = Some(
-                    args.next().ok_or_else(|| anyhow::anyhow!("--embedder needs a value"))?,
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--embedder needs a value"))?,
                 );
             }
             "--storage" | "-s" => {
                 storage_spec = Some(
-                    args.next().ok_or_else(|| anyhow::anyhow!("--storage needs a value"))?,
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--storage needs a value"))?,
                 );
             }
             "--token" | "-t" => {
                 token = Some(
-                    args.next().ok_or_else(|| anyhow::anyhow!("--token needs a value"))?,
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--token needs a value"))?,
                 );
             }
             "--tls-cert" => {
@@ -82,11 +87,11 @@ async fn main() -> anyhow::Result<()> {
         "starting duxx-grpc"
     );
 
-    let embedder: Arc<dyn duxx_embed::Embedder> =
-        match duxx_embed::from_spec(Some(&embedder_spec))? {
-            Some(provider) => Arc::from(provider),
-            None => Arc::new(duxx_embed::HashEmbedder::new(32)),
-        };
+    let embedder: Arc<dyn duxx_embed::Embedder> = match duxx_embed::from_spec(Some(&embedder_spec))?
+    {
+        Some(provider) => Arc::from(provider),
+        None => Arc::new(duxx_embed::HashEmbedder::new(32)),
+    };
 
     let mut svc = match storage_spec.as_deref() {
         Some(spec) if spec.starts_with("dir:") => {
@@ -95,9 +100,7 @@ async fn main() -> anyhow::Result<()> {
             DuxxService::open_at(embedder, dir)?
         }
         Some(spec) => {
-            anyhow::bail!(
-                "duxx-grpc currently supports only dir:./path or no storage; got {spec}"
-            )
+            anyhow::bail!("duxx-grpc currently supports only dir:./path or no storage; got {spec}")
         }
         None => DuxxService::with_provider(embedder),
     };
@@ -107,9 +110,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("--token / DUXX_TOKEN must not be empty");
         }
         if t.len() < 16 {
-            tracing::warn!(
-                "auth token shorter than 16 chars; use a stronger value in production"
-            );
+            tracing::warn!("auth token shorter than 16 chars; use a stronger value in production");
         }
         svc = svc.with_auth(t);
         tracing::info!("authentication ENABLED (Bearer token required)");

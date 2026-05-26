@@ -24,14 +24,21 @@ fn main() -> anyhow::Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--storage" | "-s" => {
-                storage_spec =
-                    Some(args.next().ok_or_else(|| anyhow::anyhow!("--storage needs a value"))?);
+                storage_spec = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--storage needs a value"))?,
+                );
             }
             "--out" | "-o" => {
-                out = Some(args.next().ok_or_else(|| anyhow::anyhow!("--out needs a value"))?);
+                out = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--out needs a value"))?,
+                );
             }
             "--dim" | "-d" => {
-                let v = args.next().ok_or_else(|| anyhow::anyhow!("--dim needs a value"))?;
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--dim needs a value"))?;
                 dim = v.parse()?;
             }
             "--help" | "-h" => {
@@ -53,9 +60,9 @@ fn main() -> anyhow::Result<()> {
             tracing::info!(path, dim, "opening MemoryStore::open_at");
             MemoryStore::open_at(dim, 100_000, path)?
         }
-        other => anyhow::bail!(
-            "duxx-export currently supports only 'dir:./path' storage; got {other}"
-        ),
+        other => {
+            anyhow::bail!("duxx-export currently supports only 'dir:./path' storage; got {other}")
+        }
     };
 
     tracing::info!(

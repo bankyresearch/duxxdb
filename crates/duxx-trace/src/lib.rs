@@ -306,14 +306,21 @@ impl TraceStore {
                     traces.push(span.trace_id.clone());
                 }
             }
-            self.inner.by_span.write().insert(span.span_id.clone(), span);
+            self.inner
+                .by_span
+                .write()
+                .insert(span.span_id.clone(), span);
         }
         Ok(())
     }
 
     fn persist_span(&self, span: &Span) {
         if let Ok(bytes) = serde_json::to_vec(span) {
-            if let Err(e) = self.inner.backend.put(tables::SPANS, span.span_id.as_bytes(), &bytes) {
+            if let Err(e) = self
+                .inner
+                .backend
+                .put(tables::SPANS, span.span_id.as_bytes(), &bytes)
+            {
                 tracing::warn!(error = %e, "backend persist span failed");
             }
         }
@@ -351,7 +358,12 @@ impl TraceStore {
         // the in-memory state unchanged; rehydrate will pick up the
         // on-disk row.
         self.persist_span(&span);
-        let is_new = self.inner.by_span.write().insert(span_id.clone(), span).is_none();
+        let is_new = self
+            .inner
+            .by_span
+            .write()
+            .insert(span_id.clone(), span)
+            .is_none();
 
         if is_new {
             self.inner
@@ -386,12 +398,7 @@ impl TraceStore {
     }
 
     /// Close an open span. Optionally pin its final status.
-    pub fn close_span(
-        &self,
-        span_id: &str,
-        end_unix_ns: u128,
-        status: SpanStatus,
-    ) -> Result<()> {
+    pub fn close_span(&self, span_id: &str, end_unix_ns: u128, status: SpanStatus) -> Result<()> {
         let snapshot;
         let trace_id;
         {
@@ -450,7 +457,10 @@ impl TraceStore {
         for s in &all {
             by_id.insert(s.span_id.clone(), s);
             if let Some(p) = &s.parent_span_id {
-                children.entry(p.clone()).or_default().push(s.span_id.clone());
+                children
+                    .entry(p.clone())
+                    .or_default()
+                    .push(s.span_id.clone());
             }
         }
         let mut out = Vec::new();
@@ -588,9 +598,15 @@ mod tests {
     #[test]
     fn get_trace_returns_all_spans() {
         let store = TraceStore::new();
-        store.record_span(span("t1", "s1", None, "agent.run")).unwrap();
-        store.record_span(span("t1", "s2", Some("s1"), "llm.call")).unwrap();
-        store.record_span(span("t1", "s3", Some("s1"), "tool.search")).unwrap();
+        store
+            .record_span(span("t1", "s1", None, "agent.run"))
+            .unwrap();
+        store
+            .record_span(span("t1", "s2", Some("s1"), "llm.call"))
+            .unwrap();
+        store
+            .record_span(span("t1", "s3", Some("s1"), "tool.search"))
+            .unwrap();
         let spans = store.get_trace("t1");
         assert_eq!(spans.len(), 3);
     }
@@ -608,10 +624,18 @@ mod tests {
         //   ├── s2
         //   │   └── s4
         //   └── s3
-        store.record_span(span("t1", "s1", None, "agent.run")).unwrap();
-        store.record_span(span("t1", "s2", Some("s1"), "llm")).unwrap();
-        store.record_span(span("t1", "s3", Some("s1"), "tool")).unwrap();
-        store.record_span(span("t1", "s4", Some("s2"), "embed")).unwrap();
+        store
+            .record_span(span("t1", "s1", None, "agent.run"))
+            .unwrap();
+        store
+            .record_span(span("t1", "s2", Some("s1"), "llm"))
+            .unwrap();
+        store
+            .record_span(span("t1", "s3", Some("s1"), "tool"))
+            .unwrap();
+        store
+            .record_span(span("t1", "s4", Some("s2"), "embed"))
+            .unwrap();
 
         let sub = store.subtree("s2");
         let ids: Vec<String> = sub.iter().map(|s| s.span_id.clone()).collect();
@@ -624,7 +648,9 @@ mod tests {
     #[test]
     fn close_span_sets_end_and_status() {
         let store = TraceStore::new();
-        store.record_span(span("t1", "s1", None, "agent.run")).unwrap();
+        store
+            .record_span(span("t1", "s1", None, "agent.run"))
+            .unwrap();
         store.close_span("s1", 2_000_000, SpanStatus::Ok).unwrap();
         let s = store.get_span("s1").unwrap();
         assert_eq!(s.end_unix_ns, Some(2_000_000));
@@ -686,7 +712,9 @@ mod tests {
     fn change_bus_publishes_on_record() {
         let store = TraceStore::new();
         let mut rx = store.subscribe();
-        store.record_span(span("t1", "s1", None, "agent.run")).unwrap();
+        store
+            .record_span(span("t1", "s1", None, "agent.run"))
+            .unwrap();
         let event = rx.try_recv().expect("event published");
         assert_eq!(event.table, "trace");
         assert_eq!(event.key.as_deref(), Some("t1"));
@@ -696,7 +724,9 @@ mod tests {
     #[test]
     fn change_bus_publishes_update_on_close() {
         let store = TraceStore::new();
-        store.record_span(span("t1", "s1", None, "agent.run")).unwrap();
+        store
+            .record_span(span("t1", "s1", None, "agent.run"))
+            .unwrap();
         let mut rx = store.subscribe();
         store.close_span("s1", 2_000_000, SpanStatus::Ok).unwrap();
         let event = rx.try_recv().expect("update published");
@@ -723,7 +753,11 @@ mod tests {
         assert_eq!(v["status"], "ok");
         assert_eq!(v["attributes"]["model"], "gpt-4o");
         // Field name is parent_span_id, matching OTel convention.
-        assert!(v.get("parent_span_id").is_some() || v["parent_span_id"].is_null() || v.get("parent_span_id").is_none());
+        assert!(
+            v.get("parent_span_id").is_some()
+                || v["parent_span_id"].is_null()
+                || v.get("parent_span_id").is_none()
+        );
     }
 
     #[test]
@@ -771,7 +805,8 @@ mod tests {
                 attributes: serde_json::Value::Null,
             })
             .unwrap();
-            t.close_span("s-child", 2_000_000_000, SpanStatus::Ok).unwrap();
+            t.close_span("s-child", 2_000_000_000, SpanStatus::Ok)
+                .unwrap();
         }
         let t = TraceStore::open(backend.clone()).unwrap();
         let trace = t.get_trace("tr-1");

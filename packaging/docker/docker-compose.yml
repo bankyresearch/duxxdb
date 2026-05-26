@@ -23,7 +23,7 @@
 
 services:
   duxxdb:
-    image: ghcr.io/bankyresearch/duxxdb:latest
+    image: ${DUXX_IMAGE:-ghcr.io/bankyresearch/duxxdb:v0.2.2}
     # Or build locally from the repo root: `docker compose build`.
     build:
       context: ../..
@@ -42,6 +42,7 @@ services:
 
     environment:
       DUXX_STORAGE: "dir:/var/lib/duxxdb"
+      DUXX_PHASE7_STORAGE: "dir:/var/lib/duxxdb/phase7"
       DUXX_EMBEDDER: "${DUXX_EMBEDDER:-hash:32}"
       DUXX_TOKEN: "${DUXX_TOKEN:?DUXX_TOKEN is required for production. See .env.example.}"
       DUXX_METRICS_ADDR: "0.0.0.0:9100"

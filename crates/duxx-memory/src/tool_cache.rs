@@ -197,7 +197,8 @@ mod tests {
     #[test]
     fn exact_hit() {
         let c = ToolCache::new();
-        c.put("web", 42, vec![1.0, 0.0], b"answer".to_vec(), ttl()).unwrap();
+        c.put("web", 42, vec![1.0, 0.0], b"answer".to_vec(), ttl())
+            .unwrap();
         let hit = c.get("web", 42, &[1.0, 0.0]).unwrap();
         assert_eq!(hit.kind, HitKind::Exact);
         assert_eq!(hit.result, b"answer");
@@ -207,7 +208,8 @@ mod tests {
     fn semantic_near_hit() {
         let c = ToolCache::new();
         // Stored: (web, h=1, embedding ~[1, 0]).
-        c.put("web", 1, vec![1.0, 0.0], b"answer".to_vec(), ttl()).unwrap();
+        c.put("web", 1, vec![1.0, 0.0], b"answer".to_vec(), ttl())
+            .unwrap();
         // Query: same tool, different hash, embedding very close.
         let hit = c.get("web", 999, &[0.99, 0.05]).unwrap();
         assert_eq!(hit.kind, HitKind::SemanticNearHit);
@@ -218,7 +220,8 @@ mod tests {
     #[test]
     fn miss_when_below_threshold() {
         let c = ToolCache::new();
-        c.put("web", 1, vec![1.0, 0.0], b"a".to_vec(), ttl()).unwrap();
+        c.put("web", 1, vec![1.0, 0.0], b"a".to_vec(), ttl())
+            .unwrap();
         // Orthogonal vector should miss (cosine 0).
         assert!(c.get("web", 999, &[0.0, 1.0]).is_none());
     }
@@ -226,14 +229,22 @@ mod tests {
     #[test]
     fn miss_when_different_tool() {
         let c = ToolCache::new();
-        c.put("web", 1, vec![1.0, 0.0], b"a".to_vec(), ttl()).unwrap();
+        c.put("web", 1, vec![1.0, 0.0], b"a".to_vec(), ttl())
+            .unwrap();
         assert!(c.get("calc", 1, &[1.0, 0.0]).is_none());
     }
 
     #[test]
     fn ttl_expires_entries() {
         let c = ToolCache::new();
-        c.put("web", 1, vec![1.0, 0.0], b"a".to_vec(), Duration::from_millis(1)).unwrap();
+        c.put(
+            "web",
+            1,
+            vec![1.0, 0.0],
+            b"a".to_vec(),
+            Duration::from_millis(1),
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(10));
         assert!(c.get("web", 1, &[1.0, 0.0]).is_none());
     }
@@ -241,8 +252,22 @@ mod tests {
     #[test]
     fn purge_removes_only_expired() {
         let c = ToolCache::new();
-        c.put("web", 1, vec![1.0, 0.0], b"a".to_vec(), Duration::from_millis(1)).unwrap();
-        c.put("web", 2, vec![0.0, 1.0], b"b".to_vec(), Duration::from_secs(60)).unwrap();
+        c.put(
+            "web",
+            1,
+            vec![1.0, 0.0],
+            b"a".to_vec(),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        c.put(
+            "web",
+            2,
+            vec![0.0, 1.0],
+            b"b".to_vec(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let removed = c.purge_expired();
         assert_eq!(removed, 1);
@@ -252,8 +277,10 @@ mod tests {
     #[test]
     fn put_overwrites_same_key() {
         let c = ToolCache::new();
-        c.put("web", 1, vec![1.0, 0.0], b"first".to_vec(), ttl()).unwrap();
-        c.put("web", 1, vec![1.0, 0.0], b"second".to_vec(), ttl()).unwrap();
+        c.put("web", 1, vec![1.0, 0.0], b"first".to_vec(), ttl())
+            .unwrap();
+        c.put("web", 1, vec![1.0, 0.0], b"second".to_vec(), ttl())
+            .unwrap();
         assert_eq!(c.len(), 1);
         let hit = c.get("web", 1, &[1.0, 0.0]).unwrap();
         assert_eq!(hit.result, b"second");

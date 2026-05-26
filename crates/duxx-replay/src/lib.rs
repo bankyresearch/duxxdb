@@ -154,7 +154,10 @@ pub enum OverrideKind {
     SwapModel { model: String },
     /// Swap the prompt reference. Useful when comparing two prompt
     /// versions over the same dataset.
-    SwapPrompt { prompt_name: String, prompt_version: u64 },
+    SwapPrompt {
+        prompt_name: String,
+        prompt_version: u64,
+    },
     /// Skip execution entirely; use this canned output instead.
     /// Useful for deterministic snapshots in tests.
     InjectOutput { output: serde_json::Value },
@@ -367,10 +370,10 @@ impl ReplayRegistry {
 
     fn persist_session(&self, session: &ReplaySession) {
         if let Ok(bytes) = serde_json::to_vec(session) {
-            if let Err(e) = self
-                .inner
-                .backend
-                .put(tables::SESSIONS, session.trace_id.as_bytes(), &bytes)
+            if let Err(e) =
+                self.inner
+                    .backend
+                    .put(tables::SESSIONS, session.trace_id.as_bytes(), &bytes)
             {
                 tracing::warn!(error = %e, "backend persist replay session failed");
             }
@@ -379,7 +382,11 @@ impl ReplayRegistry {
 
     fn persist_run(&self, run: &ReplayRun) {
         if let Ok(bytes) = serde_json::to_vec(run) {
-            if let Err(e) = self.inner.backend.put(tables::RUNS, run.id.as_bytes(), &bytes) {
+            if let Err(e) = self
+                .inner
+                .backend
+                .put(tables::RUNS, run.id.as_bytes(), &bytes)
+            {
                 tracing::warn!(error = %e, "backend persist replay run failed");
             }
         }
@@ -395,19 +402,17 @@ impl ReplayRegistry {
 
     /// Capture one invocation against a `trace_id`. Append-only; idx
     /// is assigned in capture order. Returns the assigned idx.
-    pub fn capture(
-        &self,
-        trace_id: impl Into<String>,
-        mut invocation: ReplayInvocation,
-    ) -> usize {
+    pub fn capture(&self, trace_id: impl Into<String>, mut invocation: ReplayInvocation) -> usize {
         let trace_id = trace_id.into();
         let mut sessions = self.inner.sessions.write();
-        let session = sessions.entry(trace_id.clone()).or_insert_with(|| ReplaySession {
-            trace_id: trace_id.clone(),
-            invocations: Vec::new(),
-            fingerprint: String::new(),
-            captured_at_unix_ns: now_unix_ns(),
-        });
+        let session = sessions
+            .entry(trace_id.clone())
+            .or_insert_with(|| ReplaySession {
+                trace_id: trace_id.clone(),
+                invocations: Vec::new(),
+                fingerprint: String::new(),
+                captured_at_unix_ns: now_unix_ns(),
+            });
         let idx = session.invocations.len();
         invocation.idx = idx;
         if invocation.recorded_at_unix_ns == 0 {
@@ -513,7 +518,13 @@ impl ReplayRegistry {
         if run.status.is_terminal() {
             return Err(ReplayError::WrongState(run_id.into(), run.status));
         }
-        let session = match self.inner.sessions.read().get(&run.source_trace_id).cloned() {
+        let session = match self
+            .inner
+            .sessions
+            .read()
+            .get(&run.source_trace_id)
+            .cloned()
+        {
             Some(s) => s,
             None => return Err(ReplayError::SessionNotFound(run.source_trace_id.clone())),
         };
@@ -578,10 +589,7 @@ impl ReplayRegistry {
                 }) => {
                     let mut inv = original.clone();
                     if let serde_json::Value::Object(ref mut map) = inv.input {
-                        map.insert(
-                            "temperature".to_string(),
-                            serde_json::json!(temperature),
-                        );
+                        map.insert("temperature".to_string(), serde_json::json!(temperature));
                     }
                     inv
                 }
@@ -625,7 +633,12 @@ impl ReplayRegistry {
         if run.status.is_terminal() {
             return Err(ReplayError::WrongState(run_id.into(), run.status));
         }
-        let session = self.inner.sessions.read().get(&run.source_trace_id).cloned();
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .get(&run.source_trace_id)
+            .cloned();
         if let Some(s) = session {
             if invocation_idx >= s.invocations.len() {
                 return Err(ReplayError::OutOfRange(invocation_idx, s.invocations.len()));
@@ -815,7 +828,11 @@ impl ReplayRegistry {
 mod tests {
     use super::*;
 
-    fn inv(idx: usize, input: serde_json::Value, output: Option<serde_json::Value>) -> ReplayInvocation {
+    fn inv(
+        idx: usize,
+        input: serde_json::Value,
+        output: Option<serde_json::Value>,
+    ) -> ReplayInvocation {
         ReplayInvocation {
             idx,
             span_id: format!("span-{idx}"),
@@ -832,9 +849,30 @@ mod tests {
 
     fn captured_session(r: &ReplayRegistry) -> String {
         let trace_id = "trace-abc".to_string();
-        r.capture(&trace_id, inv(0, serde_json::json!({"prompt": "hi"}), Some(serde_json::json!("hello world"))));
-        r.capture(&trace_id, inv(0, serde_json::json!({"prompt": "what's 2+2?"}), Some(serde_json::json!("4"))));
-        r.capture(&trace_id, inv(0, serde_json::json!({"prompt": "bye"}), Some(serde_json::json!("goodbye"))));
+        r.capture(
+            &trace_id,
+            inv(
+                0,
+                serde_json::json!({"prompt": "hi"}),
+                Some(serde_json::json!("hello world")),
+            ),
+        );
+        r.capture(
+            &trace_id,
+            inv(
+                0,
+                serde_json::json!({"prompt": "what's 2+2?"}),
+                Some(serde_json::json!("4")),
+            ),
+        );
+        r.capture(
+            &trace_id,
+            inv(
+                0,
+                serde_json::json!({"prompt": "bye"}),
+                Some(serde_json::json!("goodbye")),
+            ),
+        );
         trace_id
     }
 
@@ -869,7 +907,10 @@ mod tests {
         let run = r.get_run(&run_id).unwrap();
         // All 3 captured outputs should be pre-populated.
         assert_eq!(run.outputs.len(), 3);
-        assert_eq!(run.outputs.get(&0).unwrap(), &serde_json::json!("hello world"));
+        assert_eq!(
+            run.outputs.get(&0).unwrap(),
+            &serde_json::json!("hello world")
+        );
     }
 
     #[test]
@@ -1062,7 +1103,9 @@ mod tests {
         r.record_output(&run_id, 0, serde_json::json!("x")).unwrap();
         r.complete(&run_id).unwrap();
         assert_eq!(r.get_run(&run_id).unwrap().status, ReplayStatus::Completed);
-        let err = r.record_output(&run_id, 1, serde_json::json!("y")).unwrap_err();
+        let err = r
+            .record_output(&run_id, 1, serde_json::json!("y"))
+            .unwrap_err();
         matches!(err, ReplayError::WrongState(_, _));
     }
 
@@ -1117,9 +1160,16 @@ mod tests {
         let r = ReplayRegistry::new();
         let id_a = captured_session(&r);
         // A second session.
-        r.capture("trace-b", inv(0, serde_json::json!({}), Some(serde_json::Value::Null)));
-        let run1 = r.start(&id_a, ReplayMode::Live, vec![], serde_json::Value::Null).unwrap();
-        let _run2 = r.start("trace-b", ReplayMode::Live, vec![], serde_json::Value::Null).unwrap();
+        r.capture(
+            "trace-b",
+            inv(0, serde_json::json!({}), Some(serde_json::Value::Null)),
+        );
+        let run1 = r
+            .start(&id_a, ReplayMode::Live, vec![], serde_json::Value::Null)
+            .unwrap();
+        let _run2 = r
+            .start("trace-b", ReplayMode::Live, vec![], serde_json::Value::Null)
+            .unwrap();
         let only_a = r.list_runs_for(&id_a);
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].id, run1);
@@ -1129,7 +1179,9 @@ mod tests {
     fn stats_counts_sessions_invocations_runs() {
         let r = ReplayRegistry::new();
         let id = captured_session(&r);
-        let run_id = r.start(&id, ReplayMode::Live, vec![], serde_json::Value::Null).unwrap();
+        let run_id = r
+            .start(&id, ReplayMode::Live, vec![], serde_json::Value::Null)
+            .unwrap();
         r.record_output(&run_id, 0, serde_json::json!("x")).unwrap();
         r.complete(&run_id).unwrap();
         let s = r.stats();

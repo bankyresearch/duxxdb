@@ -42,7 +42,7 @@
 use duxx_embed::Embedder;
 use duxx_index::vector::VectorIndex;
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
-use duxx_storage::{Backend, MemoryBackend, key};
+use duxx_storage::{key, Backend, MemoryBackend};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -146,6 +146,18 @@ pub struct EvalRun {
     /// Frozen at `complete()`; None while Running/Pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<EvalSummary>,
+}
+
+/// Parameters for starting a new eval run.
+#[derive(Debug, Clone)]
+pub struct EvalStart {
+    pub dataset_name: String,
+    pub dataset_version: u64,
+    pub prompt_name: Option<String>,
+    pub prompt_version: Option<u64>,
+    pub model: String,
+    pub scorer: ScorerName,
+    pub metadata: serde_json::Value,
 }
 
 /// Aggregated stats for a finished run.
@@ -390,12 +402,16 @@ impl EvalRegistry {
                     .write()
                     .insert(internal_id, emb)
                     .map_err(|e| EvalError::Embed(format!("vector index: {e}")))?;
-                self.inner.id_to_key.write().insert(internal_id, map_key.clone());
+                self.inner
+                    .id_to_key
+                    .write()
+                    .insert(internal_id, map_key.clone());
                 self.inner
                     .failure_index_ids
                     .write()
                     .insert(map_key.clone(), internal_id);
-                self.persist_id_to_key(internal_id, &score.run_id, &score.row_id).ok();
+                self.persist_id_to_key(internal_id, &score.run_id, &score.row_id)
+                    .ok();
             }
             self.inner.scores.write().insert(map_key, score);
         }
@@ -414,11 +430,10 @@ impl EvalRegistry {
                     Some(v) => v,
                     None => continue,
                 };
-                let parsed: (String, String) =
-                    match serde_json::from_slice(&value_bytes) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+                let parsed: (String, String) = match serde_json::from_slice(&value_bytes) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 if internal_id > max_internal {
                     max_internal = internal_id;
                 }
@@ -450,8 +465,8 @@ impl EvalRegistry {
     /// state-transitioning method (``start``, ``score``, ``complete``,
     /// ``fail``) so the on-disk row is always in sync with memory.
     fn persist_run(&self, run: &EvalRun) -> Result<()> {
-        let bytes = serde_json::to_vec(run)
-            .map_err(|e| EvalError::Embed(format!("run encode: {e}")))?;
+        let bytes =
+            serde_json::to_vec(run).map_err(|e| EvalError::Embed(format!("run encode: {e}")))?;
         self.inner
             .backend
             .put(tables::RUNS, run.id.as_bytes(), &bytes)
@@ -467,19 +482,16 @@ impl EvalRegistry {
 
     /// Start a new eval run. Status begins as Pending. Returns the
     /// assigned UUID-form run id.
-    pub fn start(
-        &self,
-        dataset_name: impl Into<String>,
-        dataset_version: u64,
-        prompt_name: Option<String>,
-        prompt_version: Option<u64>,
-        model: impl Into<String>,
-        scorer: impl Into<String>,
-        metadata: serde_json::Value,
-    ) -> EvalRunId {
-        let dataset_name = dataset_name.into();
-        let model = model.into();
-        let scorer = scorer.into();
+    pub fn start(&self, request: EvalStart) -> EvalRunId {
+        let EvalStart {
+            dataset_name,
+            dataset_version,
+            prompt_name,
+            prompt_version,
+            model,
+            scorer,
+            metadata,
+        } = request;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let name = format!(
             "{dataset_name}:{p}:{model}",
@@ -548,7 +560,11 @@ impl EvalRegistry {
             if was_pending {
                 run.status = EvalStatus::Running;
             }
-            if was_pending { Some(run.clone()) } else { None }
+            if was_pending {
+                Some(run.clone())
+            } else {
+                None
+            }
         };
         if let Some(run) = run_snapshot {
             if let Err(e) = self.persist_run(&run) {
@@ -733,14 +749,22 @@ impl EvalRegistry {
     /// so callers can compare across dataset revisions if the row
     /// ids stay stable.
     pub fn compare(&self, run_a: &str, run_b: &str) -> Result<EvalComparison> {
-        let a_run = self.get(run_a).ok_or_else(|| EvalError::RunNotFound(run_a.into()))?;
-        let b_run = self.get(run_b).ok_or_else(|| EvalError::RunNotFound(run_b.into()))?;
+        let a_run = self
+            .get(run_a)
+            .ok_or_else(|| EvalError::RunNotFound(run_a.into()))?;
+        let b_run = self
+            .get(run_b)
+            .ok_or_else(|| EvalError::RunNotFound(run_b.into()))?;
         let a_scores = self.scores(run_a);
         let b_scores = self.scores(run_b);
-        let a_by_row: HashMap<String, f32> =
-            a_scores.iter().map(|s| (s.row_id.clone(), s.score)).collect();
-        let b_by_row: HashMap<String, f32> =
-            b_scores.iter().map(|s| (s.row_id.clone(), s.score)).collect();
+        let a_by_row: HashMap<String, f32> = a_scores
+            .iter()
+            .map(|s| (s.row_id.clone(), s.score))
+            .collect();
+        let b_by_row: HashMap<String, f32> = b_scores
+            .iter()
+            .map(|s| (s.row_id.clone(), s.score))
+            .collect();
 
         let mut regressed = Vec::new();
         let mut improved = Vec::new();
@@ -775,8 +799,16 @@ impl EvalRegistry {
             }
         }
         // Sort regressions by largest absolute drop first.
-        regressed.sort_by(|a, b| a.delta.partial_cmp(&b.delta).unwrap_or(std::cmp::Ordering::Equal));
-        improved.sort_by(|a, b| b.delta.partial_cmp(&a.delta).unwrap_or(std::cmp::Ordering::Equal));
+        regressed.sort_by(|a, b| {
+            a.delta
+                .partial_cmp(&b.delta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        improved.sort_by(|a, b| {
+            b.delta
+                .partial_cmp(&a.delta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mean_a = a_run.summary.map(|s| s.mean).unwrap_or(0.0);
         let mean_b = b_run.summary.map(|s| s.mean).unwrap_or(0.0);
@@ -815,8 +847,16 @@ impl EvalRegistry {
         if !self.inner.runs.read().contains_key(run_id) {
             return Err(EvalError::RunNotFound(run_id.to_string()));
         }
-        let st = if score_threshold == 0.0 { 0.5 } else { score_threshold };
-        let smt = if sim_threshold == 0.0 { 0.8 } else { sim_threshold };
+        let st = if score_threshold == 0.0 {
+            0.5
+        } else {
+            score_threshold
+        };
+        let smt = if sim_threshold == 0.0 {
+            0.8
+        } else {
+            sim_threshold
+        };
 
         // Snapshot every failing score that's also in the index.
         let failures: Vec<EvalScore> = self
@@ -878,8 +918,8 @@ impl EvalRegistry {
                 }
             }
 
-            let mean = cluster_members.iter().map(|m| m.score).sum::<f32>()
-                / cluster_members.len() as f32;
+            let mean =
+                cluster_members.iter().map(|m| m.score).sum::<f32>() / cluster_members.len() as f32;
             clusters.push(FailureCluster {
                 representative_row_id: seed.row_id.clone(),
                 representative_text: seed.output_text.clone(),
@@ -887,7 +927,7 @@ impl EvalRegistry {
                 mean_score: mean,
             });
         }
-        clusters.sort_by(|a, b| b.members.len().cmp(&a.members.len()));
+        clusters.sort_by_key(|cluster| std::cmp::Reverse(cluster.members.len()));
         clusters.truncate(max_clusters);
         Ok(clusters)
     }
@@ -956,15 +996,15 @@ mod tests {
     }
 
     fn start_run(r: &EvalRegistry) -> EvalRunId {
-        r.start(
-            "qa-set",
-            1,
-            Some("classifier".into()),
-            Some(3),
-            "gpt-4o",
-            "llm_judge",
-            serde_json::json!({"branch": "main"}),
-        )
+        r.start(EvalStart {
+            dataset_name: "qa-set".into(),
+            dataset_version: 1,
+            prompt_name: Some("classifier".into()),
+            prompt_version: Some(3),
+            model: "gpt-4o".into(),
+            scorer: "llm_judge".into(),
+            metadata: serde_json::json!({"branch": "main"}),
+        })
     }
 
     #[test]
@@ -1003,8 +1043,14 @@ mod tests {
         let r = reg();
         let id = start_run(&r);
         for (i, s) in [0.1, 0.4, 0.5, 0.7, 0.9].iter().enumerate() {
-            r.score(&id, format!("row{i}"), *s, format!("out-{i}"), serde_json::Value::Null)
-                .unwrap();
+            r.score(
+                &id,
+                format!("row{i}"),
+                *s,
+                format!("out-{i}"),
+                serde_json::Value::Null,
+            )
+            .unwrap();
         }
         let summary = r.complete(&id).unwrap();
         assert_eq!(summary.total_scored, 5);
@@ -1022,7 +1068,8 @@ mod tests {
     fn cannot_score_after_complete() {
         let r = reg();
         let id = start_run(&r);
-        r.score(&id, "row1", 0.5, "x", serde_json::Value::Null).unwrap();
+        r.score(&id, "row1", 0.5, "x", serde_json::Value::Null)
+            .unwrap();
         r.complete(&id).unwrap();
         let err = r
             .score(&id, "row2", 0.5, "y", serde_json::Value::Null)
@@ -1034,7 +1081,8 @@ mod tests {
     fn fail_stores_reason_in_metadata() {
         let r = reg();
         let id = start_run(&r);
-        r.score(&id, "row1", 0.5, "x", serde_json::Value::Null).unwrap();
+        r.score(&id, "row1", 0.5, "x", serde_json::Value::Null)
+            .unwrap();
         r.fail(&id, "rate limited by provider").unwrap();
         let run = r.get(&id).unwrap();
         assert_eq!(run.status, EvalStatus::Failed);
@@ -1049,8 +1097,12 @@ mod tests {
         // a: row1=0.9, row2=0.5, row3=0.8
         // b: row1=0.7, row2=0.9, row4=0.6   (row3 dropped, row4 new)
         for (id, row, s) in [
-            (&a, "row1", 0.9), (&a, "row2", 0.5), (&a, "row3", 0.8),
-            (&b, "row1", 0.7), (&b, "row2", 0.9), (&b, "row4", 0.6),
+            (&a, "row1", 0.9),
+            (&a, "row2", 0.5),
+            (&a, "row3", 0.8),
+            (&b, "row1", 0.7),
+            (&b, "row2", 0.9),
+            (&b, "row4", 0.6),
         ] {
             r.score(id, row, s, "out", serde_json::Value::Null).unwrap();
         }
@@ -1069,8 +1121,24 @@ mod tests {
     #[test]
     fn list_runs_for_dataset_filter() {
         let r = reg();
-        let _ = r.start("alpha", 1, None, None, "m", "s", serde_json::Value::Null);
-        let beta_id = r.start("beta", 1, None, None, "m", "s", serde_json::Value::Null);
+        let _ = r.start(EvalStart {
+            dataset_name: "alpha".into(),
+            dataset_version: 1,
+            prompt_name: None,
+            prompt_version: None,
+            model: "m".into(),
+            scorer: "s".into(),
+            metadata: serde_json::Value::Null,
+        });
+        let beta_id = r.start(EvalStart {
+            dataset_name: "beta".into(),
+            dataset_version: 1,
+            prompt_name: None,
+            prompt_version: None,
+            model: "m".into(),
+            scorer: "s".into(),
+            metadata: serde_json::Value::Null,
+        });
         let runs = r.list_runs_for("beta", 1);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, beta_id);
@@ -1088,11 +1156,18 @@ mod tests {
             ("f4", "the model timed out before responding"),
             ("f5", "the model rejected the prompt as unsafe"),
         ] {
-            r.score(&id, row, 0.1, text, serde_json::Value::Null).unwrap();
+            r.score(&id, row, 0.1, text, serde_json::Value::Null)
+                .unwrap();
         }
         // One passing row (must NOT be indexed for clustering).
-        r.score(&id, "p1", 0.95, "model returned a perfect answer", serde_json::Value::Null)
-            .unwrap();
+        r.score(
+            &id,
+            "p1",
+            0.95,
+            "model returned a perfect answer",
+            serde_json::Value::Null,
+        )
+        .unwrap();
 
         let clusters = r.cluster_failures(&id, 0.5, 0.5, 10).unwrap();
         // Should produce at least one cluster covering f1/f2/f3.
@@ -1117,7 +1192,8 @@ mod tests {
         assert!(matches!(e.kind, ChangeKind::Insert));
         assert_eq!(e.key.as_deref(), Some(id.as_str()));
 
-        r.score(&id, "row", 0.5, "x", serde_json::Value::Null).unwrap();
+        r.score(&id, "row", 0.5, "x", serde_json::Value::Null)
+            .unwrap();
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.kind, ChangeKind::Update));
 
@@ -1132,9 +1208,11 @@ mod tests {
         let a = start_run(&r);
         let _b = start_run(&r);
         let c = start_run(&r);
-        r.score(&a, "row", 0.5, "x", serde_json::Value::Null).unwrap();
+        r.score(&a, "row", 0.5, "x", serde_json::Value::Null)
+            .unwrap();
         r.complete(&a).unwrap();
-        r.score(&c, "row", 0.5, "x", serde_json::Value::Null).unwrap();
+        r.score(&c, "row", 0.5, "x", serde_json::Value::Null)
+            .unwrap();
         r.fail(&c, "boom").unwrap();
         let s = r.stats();
         assert_eq!(s.runs, 3);
@@ -1149,7 +1227,8 @@ mod tests {
         let r = reg();
         let id = start_run(&r);
         for row in ["a", "b", "c"] {
-            r.score(&id, row, 0.5, "x", serde_json::Value::Null).unwrap();
+            r.score(&id, row, 0.5, "x", serde_json::Value::Null)
+                .unwrap();
         }
         let scores = r.scores(&id);
         assert_eq!(scores.len(), 3);
@@ -1164,18 +1243,25 @@ mod tests {
         let run_id;
         {
             let r = EvalRegistry::open(embedder.clone(), backend.clone()).unwrap();
-            run_id = r.start(
-                "ds",
-                1,
-                Some("classifier".into()),
-                Some(1),
-                "gpt-4o",
-                "llm_judge",
-                serde_json::Value::Null,
-            );
-            r.score(&run_id, "row1", 0.9, "REFUND", serde_json::Value::Null).unwrap();
-            r.score(&run_id, "row2", 0.2, "wrong answer here", serde_json::Value::Null)
+            run_id = r.start(EvalStart {
+                dataset_name: "ds".into(),
+                dataset_version: 1,
+                prompt_name: Some("classifier".into()),
+                prompt_version: Some(1),
+                model: "gpt-4o".into(),
+                scorer: "llm_judge".into(),
+                metadata: serde_json::Value::Null,
+            });
+            r.score(&run_id, "row1", 0.9, "REFUND", serde_json::Value::Null)
                 .unwrap();
+            r.score(
+                &run_id,
+                "row2",
+                0.2,
+                "wrong answer here",
+                serde_json::Value::Null,
+            )
+            .unwrap();
             r.complete(&run_id).unwrap();
         }
         let r = EvalRegistry::open(embedder.clone(), backend.clone()).unwrap();
@@ -1186,9 +1272,7 @@ mod tests {
         assert_eq!(scores.len(), 2);
         // The failure index should rebuild — row2 was a failure
         // (score < 0.8) with non-empty output.
-        let clusters = r
-            .cluster_failures(&run_id, 0.5, 0.0, 5)
-            .unwrap_or_default();
+        let clusters = r.cluster_failures(&run_id, 0.5, 0.0, 5).unwrap_or_default();
         assert!(!clusters.is_empty(), "failure index did not rehydrate");
     }
 }
