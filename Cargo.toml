@@ -104,7 +104,7 @@ tempfile = "3"
 arrow = "53"
 arrow-array = "53"
 arrow-schema = "53"
-parquet = { version = "53", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 
 # Internal crates (consumed by siblings)
 duxx-core = { path = "crates/duxx-core", version = "0.2.2" }
