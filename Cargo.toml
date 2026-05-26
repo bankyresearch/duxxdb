@@ -79,7 +79,7 @@ napi-build = "2"
 # in tonic::transport::Server (Phase 6.2).
 tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
-tonic-health = "0.12"
+tonic-health = "0.14"
 prost = "0.13"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
