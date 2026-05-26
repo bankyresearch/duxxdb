@@ -286,7 +286,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/duxxdb:${{ steps.tag.outputs.tag }}-${{ matrix.arch_suffix }}
-          provenance: false
+          provenance: true
+          sbom: true
           cache-from: type=gha,scope=${{ matrix.arch_suffix }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch_suffix }}
 

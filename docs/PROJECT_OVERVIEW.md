@@ -26,7 +26,7 @@
 11. [Roadmap](#11-roadmap)
 12. [Limitations & caveats](#12-limitations--caveats)
 13. [Contributing](#13-contributing)
-14. [License & acknowledgements](#14-license--acknowledgements)
+14. [License](#14-license)
 
 ---
 
@@ -604,28 +604,13 @@ deployment still wants Phase 6.3+ (mTLS, RBAC, sharding).
 
 ---
 
-## 14. License & acknowledgements
+## 14. License
 
 **License:** Apache 2.0. See [LICENSE](../LICENSE) and
 [NOTICE](../NOTICE).
 
-**Standing on the shoulders of:**
-
-- [tantivy](https://github.com/quickwit-oss/tantivy) — BM25 full-text
-- [hnsw_rs](https://crates.io/crates/hnsw_rs) — HNSW vectors
-- [redb](https://github.com/cberner/redb) — embedded ACID KV
-- [tonic](https://github.com/hyperium/tonic) + [prost](https://github.com/tokio-rs/prost) — gRPC + protobuf
-- [PyO3](https://github.com/PyO3/pyo3) + [maturin](https://github.com/PyO3/maturin) — Python bindings
-- [napi-rs](https://github.com/napi-rs/napi-rs) — Node bindings
-- [Apache Arrow](https://github.com/apache/arrow-rs) + [parquet](https://github.com/apache/arrow-rs) — cold-tier
-- [reqwest](https://github.com/seanmonstar/reqwest) + [rustls](https://github.com/rustls/rustls) — HTTP embedders
-- [DuckDB](https://duckdb.org/) — embedded-first philosophy
-- [LanceDB](https://github.com/lancedb/lance) — comparative bench peer
-- [Model Context Protocol](https://modelcontextprotocol.io/) — agent integration standard
-- [criterion.rs](https://github.com/bheisler/criterion.rs) — benchmark harness
-
-This project would not exist without the OSS work above. If DuxxDB is
-useful to you, please support its upstream dependencies first.
+Third-party dependency notices required for distribution are maintained
+in [NOTICE](../NOTICE).
 
 ---
 

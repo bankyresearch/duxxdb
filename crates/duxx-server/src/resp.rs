@@ -18,6 +18,17 @@
 use bytes::{Buf, BytesMut};
 use std::str;
 
+/// Maximum bytes accepted for one RESP bulk string.
+pub const MAX_BULK_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum items accepted in one RESP array.
+pub const MAX_ARRAY_ITEMS: usize = 4096;
+/// Maximum bytes accepted in a single RESP line before `\r\n`.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Maximum buffered inbound bytes per connection before the server
+/// closes it. This caps slowloris-style partial frames and excessive
+/// pipelining before authentication.
+pub const MAX_INPUT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
 /// One RESP value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RespValue {
@@ -131,17 +142,26 @@ fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError>
         b':' => {
             *cursor += 1;
             let line = read_line(data, cursor)?;
-            let n: i64 = line.parse().map_err(|_| ParseError::Bad(format!("bad int {line:?}")))?;
+            let n: i64 = line
+                .parse()
+                .map_err(|_| ParseError::Bad(format!("bad int {line:?}")))?;
             Ok(RespValue::Integer(n))
         }
         b'$' => {
             *cursor += 1;
             let line = read_line(data, cursor)?;
-            let len: i64 = line.parse().map_err(|_| ParseError::Bad(format!("bad bulk len {line:?}")))?;
+            let len: i64 = line
+                .parse()
+                .map_err(|_| ParseError::Bad(format!("bad bulk len {line:?}")))?;
             if len < 0 {
                 return Ok(RespValue::Null);
             }
             let len = len as usize;
+            if len > MAX_BULK_BYTES {
+                return Err(ParseError::Bad(format!(
+                    "bulk string too large: {len} bytes > {MAX_BULK_BYTES}"
+                )));
+            }
             if *cursor + len + 2 > data.len() {
                 return Err(ParseError::Incomplete);
             }
@@ -156,11 +176,18 @@ fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError>
         b'*' => {
             *cursor += 1;
             let line = read_line(data, cursor)?;
-            let len: i64 = line.parse().map_err(|_| ParseError::Bad(format!("bad array len {line:?}")))?;
+            let len: i64 = line
+                .parse()
+                .map_err(|_| ParseError::Bad(format!("bad array len {line:?}")))?;
             if len < 0 {
                 return Ok(RespValue::Null);
             }
             let len = len as usize;
+            if len > MAX_ARRAY_ITEMS {
+                return Err(ParseError::Bad(format!(
+                    "array too large: {len} items > {MAX_ARRAY_ITEMS}"
+                )));
+            }
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
                 items.push(parse_value(data, cursor)?);
@@ -186,6 +213,11 @@ fn read_line<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a str, ParseErr
     let start = *cursor;
     let mut i = start;
     while i + 1 < data.len() {
+        if i - start > MAX_LINE_BYTES {
+            return Err(ParseError::Bad(format!(
+                "line too large: > {MAX_LINE_BYTES} bytes"
+            )));
+        }
         if data[i] == b'\r' && data[i + 1] == b'\n' {
             let line = str::from_utf8(&data[start..i])
                 .map_err(|e| ParseError::Bad(format!("non-utf8 line: {e}")))?;
@@ -193,6 +225,11 @@ fn read_line<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a str, ParseErr
             return Ok(line);
         }
         i += 1;
+    }
+    if data.len().saturating_sub(start) > MAX_LINE_BYTES {
+        return Err(ParseError::Bad(format!(
+            "line too large: > {MAX_LINE_BYTES} bytes"
+        )));
     }
     Err(ParseError::Incomplete)
 }
@@ -279,5 +316,29 @@ mod tests {
         assert_eq!(a, RespValue::SimpleString("OK".into()));
         assert_eq!(b, RespValue::SimpleString("PONG".into()));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn oversized_bulk_is_rejected_before_body_allocation() {
+        let bytes = format!("${}\r\n", MAX_BULK_BYTES + 1);
+        let mut buf = BytesMut::from(bytes.as_bytes());
+        let err = parse(&mut buf).unwrap_err().to_string();
+        assert!(err.contains("bulk string too large"), "{err}");
+    }
+
+    #[test]
+    fn oversized_array_is_rejected_before_allocation() {
+        let bytes = format!("*{}\r\n", MAX_ARRAY_ITEMS + 1);
+        let mut buf = BytesMut::from(bytes.as_bytes());
+        let err = parse(&mut buf).unwrap_err().to_string();
+        assert!(err.contains("array too large"), "{err}");
+    }
+
+    #[test]
+    fn oversized_line_is_rejected() {
+        let line = "x".repeat(MAX_LINE_BYTES + 2);
+        let mut buf = BytesMut::from(line.as_bytes());
+        let err = parse(&mut buf).unwrap_err().to_string();
+        assert!(err.contains("line too large"), "{err}");
     }
 }

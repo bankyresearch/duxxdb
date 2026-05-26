@@ -44,7 +44,7 @@
 use duxx_embed::Embedder;
 use duxx_index::vector::VectorIndex;
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
-use duxx_storage::{Backend, BatchOp, MemoryBackend};
+use duxx_storage::{Backend, MemoryBackend};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -447,7 +447,10 @@ impl CostLedger {
         for (_k, value_bytes) in budgets {
             let budget: Budget = serde_json::from_slice(&value_bytes)
                 .map_err(|e| CostError::Embed(format!("budget decode: {e}")))?;
-            self.inner.budgets.write().insert(budget.tenant.clone(), budget);
+            self.inner
+                .budgets
+                .write()
+                .insert(budget.tenant.clone(), budget);
         }
         Ok(())
     }
@@ -614,12 +617,21 @@ impl CostLedger {
         }
         let mut out: Vec<_> = buckets.into_values().collect();
         // Sort buckets by total_usd descending — biggest spenders first.
-        out.sort_by(|a, b| b.total_usd.partial_cmp(&a.total_usd).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.total_usd
+                .partial_cmp(&a.total_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out
     }
 
     /// Convenience: total spend for a tenant within an optional window.
-    pub fn total_for(&self, tenant: &str, since_unix_ns: Option<u128>, until_unix_ns: Option<u128>) -> f64 {
+    pub fn total_for(
+        &self,
+        tenant: &str,
+        since_unix_ns: Option<u128>,
+        until_unix_ns: Option<u128>,
+    ) -> f64 {
         let filter = CostFilter {
             tenant: Some(tenant.to_string()),
             since_unix_ns,
@@ -680,7 +692,11 @@ impl CostLedger {
     pub fn delete_budget(&self, tenant: &str) -> bool {
         let removed = self.inner.budgets.write().remove(tenant).is_some();
         if removed {
-            if let Err(e) = self.inner.backend.delete(tables::BUDGETS, tenant.as_bytes()) {
+            if let Err(e) = self
+                .inner
+                .backend
+                .delete(tables::BUDGETS, tenant.as_bytes())
+            {
                 tracing::warn!(error = %e, "backend delete_budget failed");
             }
             self.inner.bus.publish(ChangeEvent {
@@ -706,9 +722,7 @@ impl CostLedger {
         let spent = self.total_for(tenant, Some(since), Some(now));
         if spent >= budget.amount_usd {
             BudgetStatus::Exceeded
-        } else if budget.warn_pct > 0.0
-            && spent >= (budget.amount_usd * budget.warn_pct as f64)
-        {
+        } else if budget.warn_pct > 0.0 && spent >= (budget.amount_usd * budget.warn_pct as f64) {
             BudgetStatus::Warning
         } else {
             BudgetStatus::Ok
@@ -771,7 +785,11 @@ impl CostLedger {
         max_clusters: usize,
         top_n: usize,
     ) -> Result<Vec<ExpenseCluster>> {
-        let smt = if sim_threshold == 0.0 { 0.7 } else { sim_threshold };
+        let smt = if sim_threshold == 0.0 {
+            0.7
+        } else {
+            sim_threshold
+        };
         let max_k = if max_clusters == 0 { 10 } else { max_clusters };
         let top = if top_n == 0 { 50 } else { top_n };
 
@@ -883,7 +901,7 @@ fn day_bucket(unix_ns: u128) -> String {
     // Civil-from-days algorithm (Howard Hinnant, public domain).
     let z = days as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as i64;
+    let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
@@ -1025,8 +1043,22 @@ mod tests {
     #[test]
     fn alerts_returns_only_at_or_above_warn() {
         let l = ledger();
-        l.set_budget("acme", BudgetPeriod::Daily, 10.0, 0.8, serde_json::Value::Null).unwrap();
-        l.set_budget("globex", BudgetPeriod::Daily, 100.0, 0.8, serde_json::Value::Null).unwrap();
+        l.set_budget(
+            "acme",
+            BudgetPeriod::Daily,
+            10.0,
+            0.8,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        l.set_budget(
+            "globex",
+            BudgetPeriod::Daily,
+            100.0,
+            0.8,
+            serde_json::Value::Null,
+        )
+        .unwrap();
         l.record(entry("acme", "gpt-4o", 9.0, "")).unwrap(); // 90% -> warning
         l.record(entry("globex", "gpt-4o", 1.0, "")).unwrap(); // 1% -> ok
         let alerts = l.alerts();
@@ -1041,16 +1073,36 @@ mod tests {
         // Expensive entries about phone-number queries (varying wording so
         // HashEmbedder produces distinct but similar vectors) + cheap
         // unrelated ones.
-        l.record(entry("acme", "gpt-4o", 5.0, "user asked for a phone number lookup"))
-            .unwrap();
-        l.record(entry("acme", "gpt-4o", 4.5, "phone number lookup with extras"))
-            .unwrap();
-        l.record(entry("acme", "gpt-4o", 4.0, "look up phone number for the user"))
-            .unwrap();
+        l.record(entry(
+            "acme",
+            "gpt-4o",
+            5.0,
+            "user asked for a phone number lookup",
+        ))
+        .unwrap();
+        l.record(entry(
+            "acme",
+            "gpt-4o",
+            4.5,
+            "phone number lookup with extras",
+        ))
+        .unwrap();
+        l.record(entry(
+            "acme",
+            "gpt-4o",
+            4.0,
+            "look up phone number for the user",
+        ))
+        .unwrap();
         l.record(entry("acme", "gpt-4o", 0.01, "what's the weather today"))
             .unwrap();
-        l.record(entry("acme", "gpt-4o", 0.01, "completely unrelated query about cars"))
-            .unwrap();
+        l.record(entry(
+            "acme",
+            "gpt-4o",
+            0.01,
+            "completely unrelated query about cars",
+        ))
+        .unwrap();
         let clusters = l
             .cluster_expensive(&CostFilter::default(), 0.5, 5, 50)
             .unwrap();
@@ -1059,8 +1111,7 @@ mod tests {
         // expensive phone-number entries (top by cost). Tests that the
         // ordering by total_usd places the expensive cluster first.
         assert!(
-            clusters[0].representative_input.contains("phone")
-                || clusters[0].total_usd >= 4.0,
+            clusters[0].representative_input.contains("phone") || clusters[0].total_usd >= 4.0,
             "top cluster should cover the expensive phone queries; got: {:?}",
             clusters[0]
         );
@@ -1080,7 +1131,14 @@ mod tests {
     #[test]
     fn change_bus_emits_alert_when_warn_crossed() {
         let l = ledger();
-        l.set_budget("acme", BudgetPeriod::Daily, 10.0, 0.8, serde_json::Value::Null).unwrap();
+        l.set_budget(
+            "acme",
+            BudgetPeriod::Daily,
+            10.0,
+            0.8,
+            serde_json::Value::Null,
+        )
+        .unwrap();
         // Drain initial budget-set event.
         let mut rx = l.subscribe();
         // First spend below warn — only normal insert.
@@ -1101,13 +1159,23 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_alert, "expected a cost.alerts event after crossing warn");
+        assert!(
+            saw_alert,
+            "expected a cost.alerts event after crossing warn"
+        );
     }
 
     #[test]
     fn delete_budget_removes_it() {
         let l = ledger();
-        l.set_budget("acme", BudgetPeriod::Daily, 10.0, 0.8, serde_json::Value::Null).unwrap();
+        l.set_budget(
+            "acme",
+            BudgetPeriod::Daily,
+            10.0,
+            0.8,
+            serde_json::Value::Null,
+        )
+        .unwrap();
         assert!(l.get_budget("acme").is_some());
         assert!(l.delete_budget("acme"));
         assert!(l.get_budget("acme").is_none());
@@ -1133,7 +1201,14 @@ mod tests {
         let l = ledger();
         l.record(entry("acme", "gpt-4o", 1.0, "")).unwrap();
         l.record(entry("globex", "gpt-4o", 2.0, "")).unwrap();
-        l.set_budget("acme", BudgetPeriod::Daily, 10.0, 0.8, serde_json::Value::Null).unwrap();
+        l.set_budget(
+            "acme",
+            BudgetPeriod::Daily,
+            10.0,
+            0.8,
+            serde_json::Value::Null,
+        )
+        .unwrap();
         let s = l.stats();
         assert_eq!(s.entries, 2);
         assert_eq!(s.tenants_with_budget, 1);
@@ -1165,10 +1240,18 @@ mod tests {
         let embedder = Arc::new(HashEmbedder::new(16));
         {
             let l = CostLedger::open(embedder.clone(), backend.clone()).unwrap();
-            l.record(entry("acme", "gpt-4o", 0.0042, "first call")).unwrap();
-            l.record(entry("acme", "gpt-4o-mini", 0.0011, "second")).unwrap();
-            l.set_budget("acme", BudgetPeriod::Monthly, 100.0, 0.8, serde_json::Value::Null)
+            l.record(entry("acme", "gpt-4o", 0.0042, "first call"))
                 .unwrap();
+            l.record(entry("acme", "gpt-4o-mini", 0.0011, "second"))
+                .unwrap();
+            l.set_budget(
+                "acme",
+                BudgetPeriod::Monthly,
+                100.0,
+                0.8,
+                serde_json::Value::Null,
+            )
+            .unwrap();
         }
         let l = CostLedger::open(embedder.clone(), backend.clone()).unwrap();
         let entries = l.query(&CostFilter::default());
@@ -1185,8 +1268,14 @@ mod tests {
         let embedder = Arc::new(HashEmbedder::new(16));
         {
             let l = CostLedger::open(embedder.clone(), backend.clone()).unwrap();
-            l.set_budget("acme", BudgetPeriod::Daily, 5.0, 0.8, serde_json::Value::Null)
-                .unwrap();
+            l.set_budget(
+                "acme",
+                BudgetPeriod::Daily,
+                5.0,
+                0.8,
+                serde_json::Value::Null,
+            )
+            .unwrap();
             assert!(l.delete_budget("acme"));
         }
         let l = CostLedger::open(embedder.clone(), backend.clone()).unwrap();

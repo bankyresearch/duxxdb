@@ -102,9 +102,8 @@ impl DuxxService {
         cert_path: impl AsRef<std::path::Path>,
         key_path: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Self> {
-        let cert = std::fs::read(cert_path.as_ref()).map_err(|e| {
-            anyhow::anyhow!("read TLS cert {}: {e}", cert_path.as_ref().display())
-        })?;
+        let cert = std::fs::read(cert_path.as_ref())
+            .map_err(|e| anyhow::anyhow!("read TLS cert {}: {e}", cert_path.as_ref().display()))?;
         let key = std::fs::read(key_path.as_ref())
             .map_err(|e| anyhow::anyhow!("read TLS key {}: {e}", key_path.as_ref().display()))?;
         self.tls_identity = Some(tonic::transport::Identity::from_pem(cert, key));
@@ -118,6 +117,7 @@ impl DuxxService {
 
     /// Build the bearer-token check used by [`Self::serve`]. Public
     /// so tests / custom serve loops can reuse it.
+    #[allow(clippy::result_large_err)]
     pub fn auth_interceptor(&self) -> impl tonic::service::Interceptor + Clone {
         let expected: Option<Arc<str>> = self.auth_token.clone();
         move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
@@ -210,19 +210,13 @@ impl Default for DuxxService {
 
 #[tonic::async_trait]
 impl Duxx for DuxxService {
-    async fn ping(
-        &self,
-        request: Request<PingRequest>,
-    ) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse {
             nonce: request.into_inner().nonce,
         }))
     }
 
-    async fn stats(
-        &self,
-        _: Request<StatsRequest>,
-    ) -> Result<Response<StatsResponse>, Status> {
+    async fn stats(&self, _: Request<StatsRequest>) -> Result<Response<StatsResponse>, Status> {
         Ok(Response::new(StatsResponse {
             memories: self.memory.len() as u64,
             sessions: 0, // SessionStore not exposed via gRPC yet

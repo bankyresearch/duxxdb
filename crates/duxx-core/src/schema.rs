@@ -21,13 +21,24 @@ pub struct VectorSpec {
     pub ef_construction: u32,
 }
 
-fn default_true() -> bool { true }
-fn default_m() -> u32 { 16 }
-fn default_ef() -> u32 { 64 }
+fn default_true() -> bool {
+    true
+}
+fn default_m() -> u32 {
+    16
+}
+fn default_ef() -> u32 {
+    64
+}
 
 impl VectorSpec {
     pub fn new(dim: usize) -> Self {
-        Self { dim, hnsw: true, m: 16, ef_construction: 64 }
+        Self {
+            dim,
+            hnsw: true,
+            m: 16,
+            ef_construction: 64,
+        }
     }
 }
 
@@ -59,7 +70,11 @@ pub struct Column {
 
 impl Column {
     pub fn new(name: impl Into<String>, kind: ColumnKind) -> Self {
-        Self { name: name.into(), kind, nullable: false }
+        Self {
+            name: name.into(),
+            kind,
+            nullable: false,
+        }
     }
 
     pub fn nullable(mut self, nullable: bool) -> Self {

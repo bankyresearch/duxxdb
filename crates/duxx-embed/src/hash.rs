@@ -58,13 +58,19 @@ mod tests {
     #[test]
     fn deterministic() {
         let e = HashEmbedder::new(16);
-        assert_eq!(e.embed("hello world").unwrap(), e.embed("hello world").unwrap());
+        assert_eq!(
+            e.embed("hello world").unwrap(),
+            e.embed("hello world").unwrap()
+        );
     }
 
     #[test]
     fn case_insensitive() {
         let e = HashEmbedder::new(16);
-        assert_eq!(e.embed("Hello World").unwrap(), e.embed("hello world").unwrap());
+        assert_eq!(
+            e.embed("Hello World").unwrap(),
+            e.embed("hello world").unwrap()
+        );
     }
 
     #[test]

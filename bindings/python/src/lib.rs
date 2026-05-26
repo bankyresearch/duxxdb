@@ -7,6 +7,12 @@
 //!
 //! [PyO3]: https://github.com/PyO3/pyo3
 
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::useless_conversion
+)]
+
 use duxx_cost::{
     Budget as RustBudget, BudgetPeriod as RustBudgetPeriod, BudgetStatus as RustBudgetStatus,
     CostEntry as RustCostEntry, CostFilter as RustCostFilter, CostLedger as RustCostLedger,
@@ -18,7 +24,7 @@ use duxx_datasets::{
 use duxx_embed::{Embedder, HashEmbedder};
 use duxx_eval::{
     EvalRegistry as RustEvalRegistry, EvalRun as RustEvalRun, EvalScore as RustEvalScore,
-    EvalStatus as RustEvalStatus, EvalSummary as RustEvalSummary,
+    EvalStart as RustEvalStart, EvalStatus as RustEvalStatus, EvalSummary as RustEvalSummary,
 };
 use duxx_memory::{
     HitKind as RustHitKind, MemoryStore as RustMemoryStore, SessionStore as RustSessionStore,
@@ -27,9 +33,8 @@ use duxx_memory::{
 use duxx_prompts::{Prompt as RustPrompt, PromptRegistry as RustPromptRegistry};
 use duxx_replay::{
     InvocationKind as RustInvocationKind, ReplayInvocation as RustReplayInvocation,
-    ReplayMode as RustReplayMode, ReplayRegistry as RustReplayRegistry,
-    ReplayRun as RustReplayRun, ReplaySession as RustReplaySession,
-    ReplayStatus as RustReplayStatus,
+    ReplayMode as RustReplayMode, ReplayRegistry as RustReplayRegistry, ReplayRun as RustReplayRun,
+    ReplaySession as RustReplaySession, ReplayStatus as RustReplayStatus,
 };
 use duxx_storage::{open_backend, Backend, MemoryBackend};
 use duxx_trace::{
@@ -251,12 +256,7 @@ impl ToolCache {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    fn get(
-        &self,
-        tool: &str,
-        args_hash: u64,
-        args_embedding: Vec<f32>,
-    ) -> Option<ToolCacheHit> {
+    fn get(&self, tool: &str, args_hash: u64, args_embedding: Vec<f32>) -> Option<ToolCacheHit> {
         self.inner
             .get(tool, args_hash, &args_embedding)
             .map(|hit| ToolCacheHit {
@@ -501,7 +501,11 @@ impl PromptRegistry {
     ///   * an ``int`` → that exact version
     ///   * a ``str`` → resolved as a tag
     #[pyo3(signature = (name, version_or_tag = None))]
-    fn get(&self, name: &str, version_or_tag: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Prompt>> {
+    fn get(
+        &self,
+        name: &str,
+        version_or_tag: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<Prompt>> {
         let prompt = match version_or_tag {
             None => self.inner.get_latest(name),
             Some(obj) => {
@@ -522,7 +526,11 @@ impl PromptRegistry {
 
     /// Every version of ``name``, ascending.
     fn list(&self, name: &str) -> Vec<Prompt> {
-        self.inner.list(name).into_iter().map(Prompt::from_rust).collect()
+        self.inner
+            .list(name)
+            .into_iter()
+            .map(Prompt::from_rust)
+            .collect()
     }
 
     /// Every known prompt name, lex order.
@@ -666,8 +674,7 @@ impl CostEntryPy {
 
 impl CostEntryPy {
     fn from_rust(e: RustCostEntry) -> Self {
-        let metadata_json =
-            serde_json::to_string(&e.metadata).unwrap_or_else(|_| "null".into());
+        let metadata_json = serde_json::to_string(&e.metadata).unwrap_or_else(|_| "null".into());
         Self {
             id: e.id,
             tenant: e.tenant,
@@ -722,8 +729,7 @@ impl BudgetPy {
 
 impl BudgetPy {
     fn from_rust(b: RustBudget) -> Self {
-        let metadata_json =
-            serde_json::to_string(&b.metadata).unwrap_or_else(|_| "null".into());
+        let metadata_json = serde_json::to_string(&b.metadata).unwrap_or_else(|_| "null".into());
         Self {
             tenant: b.tenant,
             period: budget_period_to_string(b.period),
@@ -899,8 +905,19 @@ impl CostLedger {
         until_unix_ns: Option<u128>,
         limit: usize,
     ) -> Vec<CostEntryPy> {
-        let f = cost_filter_from_kwargs(tenant, model, prompt_name, since_unix_ns, until_unix_ns, limit);
-        self.inner.query(&f).into_iter().map(CostEntryPy::from_rust).collect()
+        let f = cost_filter_from_kwargs(
+            tenant,
+            model,
+            prompt_name,
+            since_unix_ns,
+            until_unix_ns,
+            limit,
+        );
+        self.inner
+            .query(&f)
+            .into_iter()
+            .map(CostEntryPy::from_rust)
+            .collect()
     }
 
     /// Total spend for ``tenant`` in an optional time window.
@@ -929,7 +946,8 @@ impl CostLedger {
         until_unix_ns: Option<u128>,
     ) -> PyResult<Vec<(String, u64, u64, u64, f64, f64)>> {
         let gb = group_by_from_str(group_by)?;
-        let f = cost_filter_from_kwargs(tenant, model, prompt_name, since_unix_ns, until_unix_ns, 0);
+        let f =
+            cost_filter_from_kwargs(tenant, model, prompt_name, since_unix_ns, until_unix_ns, 0);
         Ok(self
             .inner
             .aggregate(&f, gb)
@@ -1039,7 +1057,8 @@ impl DatasetRowPy {
             text: r.text,
             data_json: serde_json::to_string(&r.data).unwrap_or_else(|_| "null".into()),
             split: r.split,
-            annotations_json: serde_json::to_string(&r.annotations).unwrap_or_else(|_| "null".into()),
+            annotations_json: serde_json::to_string(&r.annotations)
+                .unwrap_or_else(|_| "null".into()),
         }
     }
 }
@@ -1117,7 +1136,12 @@ impl DatasetRegistry {
 
     /// Register a dataset name with an optional schema hint.
     #[pyo3(signature = (name, schema = None))]
-    fn create(&self, py: Python<'_>, name: &str, schema: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    fn create(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        schema: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
         let sv = py_to_json(py, schema)?;
         self.inner
             .create(name.to_string(), sv)
@@ -1199,7 +1223,11 @@ impl DatasetRegistry {
     }
 
     fn list(&self, name: &str) -> Vec<DatasetPy> {
-        self.inner.list(name).into_iter().map(DatasetPy::from_rust).collect()
+        self.inner
+            .list(name)
+            .into_iter()
+            .map(DatasetPy::from_rust)
+            .collect()
     }
 
     fn names(&self) -> Vec<String> {
@@ -1222,7 +1250,13 @@ impl DatasetRegistry {
 
     /// Sample up to ``n`` rows from a specific version.
     #[pyo3(signature = (name, version, n, split = None))]
-    fn sample(&self, name: &str, version: u64, n: usize, split: Option<String>) -> Vec<DatasetRowPy> {
+    fn sample(
+        &self,
+        name: &str,
+        version: u64,
+        n: usize,
+        split: Option<String>,
+    ) -> Vec<DatasetRowPy> {
         self.inner
             .sample(name, version, n, split.as_deref())
             .into_iter()
@@ -1242,7 +1276,12 @@ impl DatasetRegistry {
     /// Semantic search across the catalog. Returns ``(dataset, version,
     /// row_id, score, text)`` tuples.
     #[pyo3(signature = (query, k = 10, name_filter = None))]
-    fn search(&self, query: &str, k: usize, name_filter: Option<String>) -> PyResult<Vec<(String, u64, String, f32, String)>> {
+    fn search(
+        &self,
+        query: &str,
+        k: usize,
+        name_filter: Option<String>,
+    ) -> PyResult<Vec<(String, u64, String, f32, String)>> {
         let hits = self
             .inner
             .search(query, k, name_filter.as_deref())
@@ -1475,15 +1514,15 @@ impl EvalRegistry {
         metadata: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<String> {
         let m = py_to_json(py, metadata)?;
-        Ok(self.inner.start(
-            dataset_name.to_string(),
+        Ok(self.inner.start(RustEvalStart {
+            dataset_name: dataset_name.to_string(),
             dataset_version,
             prompt_name,
             prompt_version,
-            model.to_string(),
-            scorer.to_string(),
-            m,
-        ))
+            model: model.to_string(),
+            scorer: scorer.to_string(),
+            metadata: m,
+        }))
     }
 
     #[pyo3(signature = (run_id, row_id, score, output_text = String::new(), notes = None))]
@@ -1520,7 +1559,11 @@ impl EvalRegistry {
     }
 
     fn scores(&self, run_id: &str) -> Vec<EvalScorePy> {
-        self.inner.scores(run_id).into_iter().map(EvalScorePy::from_rust).collect()
+        self.inner
+            .scores(run_id)
+            .into_iter()
+            .map(EvalScorePy::from_rust)
+            .collect()
     }
 
     #[pyo3(signature = (dataset_name = None, dataset_version = None))]
@@ -1534,7 +1577,11 @@ impl EvalRegistry {
 
     /// Returns ``(mean_delta, pass_rate_50_delta, regressed_row_count,
     /// improved_row_count, new_row_count, dropped_row_count)``.
-    fn compare(&self, run_a: &str, run_b: &str) -> PyResult<(f32, f32, usize, usize, usize, usize)> {
+    fn compare(
+        &self,
+        run_a: &str,
+        run_b: &str,
+    ) -> PyResult<(f32, f32, usize, usize, usize, usize)> {
         let c = self
             .inner
             .compare(run_a, run_b)
@@ -1650,7 +1697,9 @@ fn invocation_kind_from_string(s: &str) -> RustInvocationKind {
     if let Some(tool) = s.strip_prefix("tool_call:") {
         RustInvocationKind::ToolCall { tool: tool.into() }
     } else if let Some(label) = s.strip_prefix("other:") {
-        RustInvocationKind::Other { label: label.into() }
+        RustInvocationKind::Other {
+            label: label.into(),
+        }
     } else {
         RustInvocationKind::LlmCall
     }
@@ -1703,7 +1752,11 @@ impl ReplaySessionPy {
     fn from_rust(s: RustReplaySession) -> Self {
         Self {
             trace_id: s.trace_id,
-            invocations: s.invocations.into_iter().map(ReplayInvocationPy::from_rust).collect(),
+            invocations: s
+                .invocations
+                .into_iter()
+                .map(ReplayInvocationPy::from_rust)
+                .collect(),
             fingerprint: s.fingerprint,
             captured_at_unix_ns: s.captured_at_unix_ns,
         }
@@ -1856,11 +1909,17 @@ impl ReplayRegistry {
     }
 
     fn get_session(&self, trace_id: &str) -> Option<ReplaySessionPy> {
-        self.inner.get_session(trace_id).map(ReplaySessionPy::from_rust)
+        self.inner
+            .get_session(trace_id)
+            .map(ReplaySessionPy::from_rust)
     }
 
     fn list_sessions(&self) -> Vec<ReplaySessionPy> {
-        self.inner.list_sessions().into_iter().map(ReplaySessionPy::from_rust).collect()
+        self.inner
+            .list_sessions()
+            .into_iter()
+            .map(ReplaySessionPy::from_rust)
+            .collect()
     }
 
     /// Start a new replay run.
@@ -2053,8 +2112,8 @@ impl TraceStore {
     #[pyo3(signature = (storage = None))]
     fn new(storage: Option<&str>) -> PyResult<Self> {
         let backend = open_backend_arc(storage)?;
-        let inner = RustTraceStore::open(backend)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner =
+            RustTraceStore::open(backend).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner })
     }
 
@@ -2114,15 +2173,27 @@ impl TraceStore {
     }
 
     fn get_trace(&self, trace_id: &str) -> Vec<SpanPy> {
-        self.inner.get_trace(trace_id).into_iter().map(SpanPy::from_rust).collect()
+        self.inner
+            .get_trace(trace_id)
+            .into_iter()
+            .map(SpanPy::from_rust)
+            .collect()
     }
 
     fn subtree(&self, span_id: &str) -> Vec<SpanPy> {
-        self.inner.subtree(span_id).into_iter().map(SpanPy::from_rust).collect()
+        self.inner
+            .subtree(span_id)
+            .into_iter()
+            .map(SpanPy::from_rust)
+            .collect()
     }
 
     fn thread(&self, thread_id: &str) -> Vec<SpanPy> {
-        self.inner.thread(thread_id).into_iter().map(SpanPy::from_rust).collect()
+        self.inner
+            .thread(thread_id)
+            .into_iter()
+            .map(SpanPy::from_rust)
+            .collect()
     }
 
     fn __repr__(&self) -> String {

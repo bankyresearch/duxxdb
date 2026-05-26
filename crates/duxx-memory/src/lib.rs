@@ -23,9 +23,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 // Re-export so users get the full Storage surface from one place.
-pub use duxx_storage::{MemoryStorage, Storage as StorageTrait};
 #[cfg(feature = "redb-store")]
 pub use duxx_storage::RedbStorage;
+pub use duxx_storage::{MemoryStorage, Storage as StorageTrait};
 
 pub use session::{SessionStore, DEFAULT_TTL as DEFAULT_SESSION_TTL};
 pub use tool_cache::{HitKind, ToolCache, ToolCacheHit, DEFAULT_NEAR_HIT_THRESHOLD};
@@ -186,22 +186,18 @@ impl MemoryStore {
     /// indices. Subsequent `remember` calls write through to `storage`.
     ///
     /// Cold start cost is proportional to the corpus size — full HNSW
-    /// + tantivy rebuild from rows. For persisted indices that skip
-    /// the rebuild on graceful-shutdown reopens, use
-    /// [`MemoryStore::open_at`] instead.
-    pub fn with_storage(
-        dim: usize,
-        capacity: usize,
-        storage: Arc<dyn Storage>,
-    ) -> Result<Self> {
+    /// + tantivy rebuild from rows.
+    ///
+    /// For persisted indices that skip the rebuild on graceful-shutdown
+    /// reopens, use [`MemoryStore::open_at`] instead.
+    pub fn with_storage(dim: usize, capacity: usize, storage: Arc<dyn Storage>) -> Result<Self> {
         let store = Self::with_capacity(dim, capacity);
         let rows = storage.iter()?;
         let mut max_id = 0u64;
         let n = rows.len();
         for (id, bytes) in rows {
-            let stored: StoredMemory = bincode::deserialize(&bytes).map_err(|e| {
-                duxx_core::Error::Storage(format!("decode memory id={id}: {e}"))
-            })?;
+            let stored: StoredMemory = bincode::deserialize(&bytes)
+                .map_err(|e| duxx_core::Error::Storage(format!("decode memory id={id}: {e}")))?;
             if stored.embedding.len() != dim {
                 return Err(duxx_core::Error::Storage(format!(
                     "memory id={id} has dim {} but store expects {dim}",
@@ -213,7 +209,11 @@ impl MemoryStore {
                 .vector_index
                 .write()
                 .insert(id, stored.embedding.clone())?;
-            store.inner.text_index.write().insert(id, stored.text.clone())?;
+            store
+                .inner
+                .text_index
+                .write()
+                .insert(id, stored.text.clone())?;
             let mem = Memory {
                 id,
                 key: stored.key,
@@ -389,7 +389,10 @@ impl MemoryStore {
             *n += 1;
             v
         };
-        self.inner.vector_index.write().insert(id, embedding.clone())?;
+        self.inner
+            .vector_index
+            .write()
+            .insert(id, embedding.clone())?;
         self.inner.text_index.write().insert(id, text.clone())?;
         let mem = Memory {
             id,
@@ -404,9 +407,8 @@ impl MemoryStore {
         // want a phantom row in memory.
         if let Some(s) = &self.inner.storage {
             let stored = StoredMemory::from(&mem);
-            let bytes = bincode::serialize(&stored).map_err(|e| {
-                duxx_core::Error::Storage(format!("encode memory id={id}: {e}"))
-            })?;
+            let bytes = bincode::serialize(&stored)
+                .map_err(|e| duxx_core::Error::Storage(format!("encode memory id={id}: {e}")))?;
             s.put(id, &bytes)?;
         }
         self.inner.by_id.write().insert(id, mem);
@@ -445,17 +447,12 @@ impl MemoryStore {
     /// `vector_index.len()` to the row count and rebuild from the row
     /// store when they disagree.
     #[cfg(feature = "redb-store")]
-    pub fn open_at(
-        dim: usize,
-        capacity: usize,
-        dir: impl AsRef<std::path::Path>,
-    ) -> Result<Self> {
+    pub fn open_at(dim: usize, capacity: usize, dir: impl AsRef<std::path::Path>) -> Result<Self> {
         use duxx_index::{TextIndex, VectorIndex};
 
         let dir = dir.as_ref();
-        std::fs::create_dir_all(dir).map_err(|e| {
-            duxx_core::Error::Storage(format!("create memory dir {dir:?}: {e}"))
-        })?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| duxx_core::Error::Storage(format!("create memory dir {dir:?}: {e}")))?;
 
         // 1. Open the three on-disk artifacts.
         let storage: Arc<dyn Storage> =
@@ -479,9 +476,8 @@ impl MemoryStore {
         let mut text_index = text_index;
         let mut vector_index = vector_index;
         for (id, bytes) in rows {
-            let stored: StoredMemory = bincode::deserialize(&bytes).map_err(|e| {
-                duxx_core::Error::Storage(format!("decode memory id={id}: {e}"))
-            })?;
+            let stored: StoredMemory = bincode::deserialize(&bytes)
+                .map_err(|e| duxx_core::Error::Storage(format!("decode memory id={id}: {e}")))?;
             if stored.embedding.len() != dim {
                 return Err(duxx_core::Error::Storage(format!(
                     "memory id={id} has dim {} but store expects {dim}",
@@ -511,10 +507,7 @@ impl MemoryStore {
                 "rebuilt indices from row store (cold path)"
             );
         } else if indices_intact {
-            tracing::info!(
-                rows = row_count,
-                "skipped index rebuild (loaded from disk)"
-            );
+            tracing::info!(rows = row_count, "skipped index rebuild (loaded from disk)");
         }
 
         let inner = Arc::new(Inner {
@@ -572,7 +565,11 @@ impl MemoryStore {
         for h in &mut hits {
             h.score *= h.memory.effective_importance(half_life);
         }
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(k);
         Ok(hits)
     }
@@ -603,8 +600,12 @@ mod tests {
     fn remember_and_recall_roundtrip() {
         const DIM: usize = 16;
         let s = MemoryStore::new(DIM);
-        s.remember("u1", "I want a refund for my order", embed("refund order", DIM))
-            .unwrap();
+        s.remember(
+            "u1",
+            "I want a refund for my order",
+            embed("refund order", DIM),
+        )
+        .unwrap();
         s.remember("u1", "What's the weather?", embed("weather", DIM))
             .unwrap();
         assert_eq!(s.len(), 2);
@@ -639,7 +640,11 @@ mod tests {
 
         // Cap should hold the row count at 3.
         assert_eq!(s.len(), 3, "len should equal the cap");
-        assert_eq!(s.evictions_total(), 2, "two oldest rows should have been evicted");
+        assert_eq!(
+            s.evictions_total(),
+            2,
+            "two oldest rows should have been evicted"
+        );
 
         // The first two (oldest -> lowest decayed importance) are gone.
         let by_id = s.inner.by_id.read();
@@ -654,7 +659,7 @@ mod tests {
         // Default: no cap.
         assert_eq!(s.max_rows(), None);
         for i in 0..50 {
-            s.remember("u", &format!("msg-{i}"), embed(&format!("m{i}"), DIM))
+            s.remember("u", format!("msg-{i}"), embed(&format!("m{i}"), DIM))
                 .unwrap();
         }
         assert_eq!(s.len(), 50);
@@ -691,10 +696,8 @@ mod tests {
     #[test]
     fn redb_persistence_across_reopen() {
         const DIM: usize = 8;
-        let dir = std::env::temp_dir().join(format!(
-            "duxx-memory-persist-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("duxx-memory-persist-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("memories.redb");
 
@@ -732,13 +735,14 @@ mod tests {
     fn effective_importance_decays() {
         // Half-life 1ms → after a few ms, importance should be near zero.
         let s = MemoryStore::new(8);
-        let id = s
-            .remember("u", "test", embed("test", 8))
-            .unwrap();
+        let id = s.remember("u", "test", embed("test", 8)).unwrap();
         let m = s.inner.by_id.read().get(&id).cloned().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         let eff = m.effective_importance(std::time::Duration::from_millis(1));
-        assert!(eff < 0.01, "effective importance after many half-lives: {eff}");
+        assert!(
+            eff < 0.01,
+            "effective importance after many half-lives: {eff}"
+        );
     }
 
     #[test]
@@ -760,17 +764,18 @@ mod tests {
     #[test]
     fn open_at_persists_indices_across_restart() {
         const DIM: usize = 4;
-        let dir = std::env::temp_dir().join(format!(
-            "duxx-open-at-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("duxx-open-at-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // First open: write 3 memories.
         {
             let store = MemoryStore::open_at(DIM, 1_000, &dir).unwrap();
             store
-                .remember("alice", "I lost my wallet at the cafe", embed("wallet", DIM))
+                .remember(
+                    "alice",
+                    "I lost my wallet at the cafe",
+                    embed("wallet", DIM),
+                )
                 .unwrap();
             store
                 .remember("alice", "Favorite color is blue", embed("blue", DIM))
@@ -814,10 +819,7 @@ mod tests {
         // memory's created_at_unix_ns matches the original (i.e. the
         // age grew across the reopen, didn't reset).
         const DIM: usize = 4;
-        let dir = std::env::temp_dir().join(format!(
-            "duxx-decay-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("duxx-decay-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("decay.redb");
 

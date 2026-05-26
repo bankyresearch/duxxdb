@@ -35,7 +35,7 @@
 use duxx_embed::Embedder;
 use duxx_index::vector::VectorIndex;
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
-use duxx_storage::{Backend, BatchOp, MemoryBackend, key};
+use duxx_storage::{key, Backend, BatchOp, MemoryBackend};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -407,11 +407,10 @@ impl DatasetRegistry {
                     Some(v) => v,
                     None => continue,
                 };
-                let parsed: (String, u64, String) =
-                    match serde_json::from_slice(&value_bytes) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+                let parsed: (String, u64, String) = match serde_json::from_slice(&value_bytes) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 if internal_id > max_internal {
                     max_internal = internal_id;
                 }
@@ -472,8 +471,8 @@ impl DatasetRegistry {
                 Ok(s) => s.to_string(),
                 Err(_) => continue,
             };
-            let schema: serde_json::Value = serde_json::from_slice(&value_bytes)
-                .unwrap_or(serde_json::Value::Null);
+            let schema: serde_json::Value =
+                serde_json::from_slice(&value_bytes).unwrap_or(serde_json::Value::Null);
             self.inner.schemas.write().insert(name, schema);
         }
         Ok(())
@@ -550,7 +549,8 @@ impl DatasetRegistry {
                 .id_to_key
                 .write()
                 .insert(internal_id, (name.clone(), version, row.id.clone()));
-            self.persist_id_to_key(internal_id, &name, version, &row.id).ok();
+            self.persist_id_to_key(internal_id, &name, version, &row.id)
+                .ok();
         }
         let schema = self
             .inner
@@ -622,10 +622,7 @@ impl DatasetRegistry {
             .get(&(name.to_string(), version))
             .map(|d| {
                 let tags = self.tags_for_version(name, version);
-                Dataset {
-                    tags,
-                    ..d.clone()
-                }
+                Dataset { tags, ..d.clone() }
             })
     }
 
@@ -840,12 +837,7 @@ impl DatasetRegistry {
     }
 
     /// Total rows in a specific version, optionally restricted to a split.
-    pub fn size(
-        &self,
-        name: &str,
-        version: DatasetVersion,
-        split: Option<&str>,
-    ) -> usize {
+    pub fn size(&self, name: &str, version: DatasetVersion, split: Option<&str>) -> usize {
         match self.get(name, version) {
             Some(d) => d
                 .rows
@@ -873,7 +865,12 @@ impl DatasetRegistry {
 
     /// Semantic search across every row of every version. Optionally
     /// restricted to one dataset. Returns up to `k` hits.
-    pub fn search(&self, query: &str, k: usize, name_filter: Option<&str>) -> Result<Vec<DatasetHit>> {
+    pub fn search(
+        &self,
+        query: &str,
+        k: usize,
+        name_filter: Option<&str>,
+    ) -> Result<Vec<DatasetHit>> {
         let query_vec = self
             .inner
             .embedder
@@ -973,8 +970,12 @@ mod tests {
     #[test]
     fn add_returns_monotonic_version() {
         let r = reg();
-        let v1 = r.add("d", vec![row("a", "train")], serde_json::Value::Null).unwrap();
-        let v2 = r.add("d", vec![row("b", "train")], serde_json::Value::Null).unwrap();
+        let v1 = r
+            .add("d", vec![row("a", "train")], serde_json::Value::Null)
+            .unwrap();
+        let v2 = r
+            .add("d", vec![row("b", "train")], serde_json::Value::Null)
+            .unwrap();
         assert_eq!((v1, v2), (1, 2));
     }
 
@@ -983,7 +984,8 @@ mod tests {
         let r = reg();
         let schema = serde_json::json!({"fields": ["q", "a"]});
         r.create("d", schema.clone()).unwrap();
-        r.add("d", vec![row("hello", "train")], serde_json::Value::Null).unwrap();
+        r.add("d", vec![row("hello", "train")], serde_json::Value::Null)
+            .unwrap();
         let ds = r.get_latest("d").unwrap();
         assert_eq!(ds.schema, schema);
     }
@@ -991,8 +993,10 @@ mod tests {
     #[test]
     fn get_returns_named_version_with_tags() {
         let r = reg();
-        r.add("d", vec![row("a", "train")], serde_json::Value::Null).unwrap();
-        r.add("d", vec![row("b", "train")], serde_json::Value::Null).unwrap();
+        r.add("d", vec![row("a", "train")], serde_json::Value::Null)
+            .unwrap();
+        r.add("d", vec![row("b", "train")], serde_json::Value::Null)
+            .unwrap();
         r.tag("d", 2, "golden").unwrap();
         let ds = r.get("d", 2).unwrap();
         assert_eq!(ds.tags, vec!["golden"]);
@@ -1002,8 +1006,10 @@ mod tests {
     #[test]
     fn get_by_tag_resolves_alias_and_re_targets() {
         let r = reg();
-        r.add("d", vec![row("a", "train")], serde_json::Value::Null).unwrap();
-        r.add("d", vec![row("b", "train")], serde_json::Value::Null).unwrap();
+        r.add("d", vec![row("a", "train")], serde_json::Value::Null)
+            .unwrap();
+        r.add("d", vec![row("b", "train")], serde_json::Value::Null)
+            .unwrap();
         r.tag("d", 1, "golden").unwrap();
         assert_eq!(r.get_by_tag("d", "golden").unwrap().version, 1);
         r.tag("d", 2, "golden").unwrap();
@@ -1013,7 +1019,8 @@ mod tests {
     #[test]
     fn tag_on_missing_version_errors() {
         let r = reg();
-        r.add("d", vec![row("a", "train")], serde_json::Value::Null).unwrap();
+        r.add("d", vec![row("a", "train")], serde_json::Value::Null)
+            .unwrap();
         let err = r.tag("d", 99, "golden").unwrap_err();
         matches!(err, DatasetError::VersionNotFound { .. });
     }
@@ -1021,7 +1028,8 @@ mod tests {
     #[test]
     fn untag_removes_alias_idempotently() {
         let r = reg();
-        r.add("d", vec![row("a", "train")], serde_json::Value::Null).unwrap();
+        r.add("d", vec![row("a", "train")], serde_json::Value::Null)
+            .unwrap();
         r.tag("d", 1, "golden").unwrap();
         assert!(r.untag("d", "golden"));
         assert!(r.get_by_tag("d", "golden").is_none());
@@ -1031,10 +1039,14 @@ mod tests {
     #[test]
     fn delete_preserves_monotonic_counter() {
         let r = reg();
-        r.add("d", vec![row("a", "train")], serde_json::Value::Null).unwrap();
-        r.add("d", vec![row("b", "train")], serde_json::Value::Null).unwrap();
+        r.add("d", vec![row("a", "train")], serde_json::Value::Null)
+            .unwrap();
+        r.add("d", vec![row("b", "train")], serde_json::Value::Null)
+            .unwrap();
         assert!(r.delete("d", 2));
-        let v3 = r.add("d", vec![row("c", "train")], serde_json::Value::Null).unwrap();
+        let v3 = r
+            .add("d", vec![row("c", "train")], serde_json::Value::Null)
+            .unwrap();
         // delete v2 then add gives v3, never v2 reused.
         assert_eq!(v3, 3);
         assert!(r.get("d", 2).is_none());
@@ -1044,7 +1056,8 @@ mod tests {
     fn list_returns_versions_ascending() {
         let r = reg();
         for _ in 0..3 {
-            r.add("d", vec![row("a", "train")], serde_json::Value::Null).unwrap();
+            r.add("d", vec![row("a", "train")], serde_json::Value::Null)
+                .unwrap();
         }
         let vs = r.list("d");
         assert_eq!(vs.len(), 3);
@@ -1055,8 +1068,10 @@ mod tests {
     #[test]
     fn names_returns_known_datasets_lexicographic() {
         let r = reg();
-        r.add("beta", vec![row("a", "")], serde_json::Value::Null).unwrap();
-        r.add("alpha", vec![row("b", "")], serde_json::Value::Null).unwrap();
+        r.add("beta", vec![row("a", "")], serde_json::Value::Null)
+            .unwrap();
+        r.add("alpha", vec![row("b", "")], serde_json::Value::Null)
+            .unwrap();
         assert_eq!(r.names(), vec!["alpha".to_string(), "beta".to_string()]);
     }
 
@@ -1082,11 +1097,7 @@ mod tests {
     #[test]
     fn size_and_splits_reflect_per_split_counts() {
         let r = reg();
-        let rows = vec![
-            row("a", "train"),
-            row("b", "train"),
-            row("c", "eval"),
-        ];
+        let rows = vec![row("a", "train"), row("b", "train"), row("c", "eval")];
         let v = r.add("d", rows, serde_json::Value::Null).unwrap();
         assert_eq!(r.size("d", v, None), 3);
         assert_eq!(r.size("d", v, Some("train")), 2);
@@ -1112,8 +1123,18 @@ mod tests {
     #[test]
     fn search_filters_by_dataset_name() {
         let r = reg();
-        r.add("a", vec![row("hello world", "eval")], serde_json::Value::Null).unwrap();
-        r.add("b", vec![row("hello world", "eval")], serde_json::Value::Null).unwrap();
+        r.add(
+            "a",
+            vec![row("hello world", "eval")],
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        r.add(
+            "b",
+            vec![row("hello world", "eval")],
+            serde_json::Value::Null,
+        )
+        .unwrap();
         let hits = r.search("hello", 10, Some("a")).unwrap();
         assert!(hits.iter().all(|h| h.dataset == "a"));
     }
@@ -1127,7 +1148,8 @@ mod tests {
         assert!(matches!(e.kind, ChangeKind::Update));
         assert_eq!(e.key.as_deref(), Some("d"));
 
-        r.add("d", vec![row("a", "train")], serde_json::Value::Null).unwrap();
+        r.add("d", vec![row("a", "train")], serde_json::Value::Null)
+            .unwrap();
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.kind, ChangeKind::Insert));
 
@@ -1162,9 +1184,16 @@ mod tests {
     #[test]
     fn stats_counts_everything() {
         let r = reg();
-        r.add("a", vec![row("x", "train"), row("y", "train")], serde_json::Value::Null).unwrap();
-        r.add("a", vec![row("z", "eval")], serde_json::Value::Null).unwrap();
-        r.add("b", vec![row("p", "train")], serde_json::Value::Null).unwrap();
+        r.add(
+            "a",
+            vec![row("x", "train"), row("y", "train")],
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        r.add("a", vec![row("z", "eval")], serde_json::Value::Null)
+            .unwrap();
+        r.add("b", vec![row("p", "train")], serde_json::Value::Null)
+            .unwrap();
         r.tag("a", 1, "golden").unwrap();
         let s = r.stats();
         assert_eq!(s.names, 2);
@@ -1181,7 +1210,8 @@ mod tests {
         let embedder = Arc::new(HashEmbedder::new(16));
         {
             let r = DatasetRegistry::open(embedder.clone(), backend.clone()).unwrap();
-            r.create("refunds", serde_json::json!({"version": 1})).unwrap();
+            r.create("refunds", serde_json::json!({"version": 1}))
+                .unwrap();
             r.add(
                 "refunds",
                 vec![row("r1", "train"), row("r2", "eval")],
@@ -1201,7 +1231,9 @@ mod tests {
         assert_eq!(v2.rows.len(), 1);
         assert_eq!(v2.tags, vec!["golden"]);
         // Counter must NOT reuse 1.
-        let v3 = r.add("refunds", vec![row("r4", "train")], serde_json::Value::Null).unwrap();
+        let v3 = r
+            .add("refunds", vec![row("r4", "train")], serde_json::Value::Null)
+            .unwrap();
         assert_eq!(v3, 3);
         // Schema survives.
         assert_eq!(r.names(), vec!["refunds".to_string()]);
@@ -1215,7 +1247,10 @@ mod tests {
             let r = DatasetRegistry::open(embedder.clone(), backend.clone()).unwrap();
             r.add(
                 "qa",
-                vec![row("hello world how are you", "train"), row("goodbye see you soon", "train")],
+                vec![
+                    row("hello world how are you", "train"),
+                    row("goodbye see you soon", "train"),
+                ],
                 serde_json::Value::Null,
             )
             .unwrap();

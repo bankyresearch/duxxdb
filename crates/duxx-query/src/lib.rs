@@ -48,7 +48,11 @@ pub fn rrf_fuse(rankings: Vec<Vec<(u64, f32)>>, k: f32, top_n: usize) -> Vec<Rec
         .into_iter()
         .map(|(id, score)| RecallHit { id, score })
         .collect();
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.truncate(top_n);
     out
 }
@@ -67,7 +71,11 @@ pub fn hybrid_recall(
     let per = (k * 3).max(32);
     let v_hits = vector_index.search(query_vec, per);
     let t_hits = text_index.search(query_text, per);
-    tracing::debug!(v = v_hits.len(), t = t_hits.len(), "hybrid_recall pre-fusion");
+    tracing::debug!(
+        v = v_hits.len(),
+        t = t_hits.len(),
+        "hybrid_recall pre-fusion"
+    );
     Ok(rrf_fuse(vec![v_hits, t_hits], DEFAULT_RRF_K, k))
 }
 

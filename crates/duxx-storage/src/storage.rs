@@ -29,6 +29,10 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     fn iter(&self) -> Result<Vec<(u64, Vec<u8>)>>;
     /// Number of stored rows.
     fn len(&self) -> Result<usize>;
+    /// Whether the store currently contains no rows.
+    fn is_empty(&self) -> Result<bool> {
+        self.len().map(|n| n == 0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +193,10 @@ mod redb_impl {
                 .open_table(TABLE)
                 .map_err(|e| Error::Storage(format!("redb open_table: {e}")))?;
             let mut out = Vec::new();
-            for entry in t.iter().map_err(|e| Error::Storage(format!("redb iter: {e}")))? {
+            for entry in t
+                .iter()
+                .map_err(|e| Error::Storage(format!("redb iter: {e}")))?
+            {
                 let (k, v) = entry.map_err(|e| Error::Storage(format!("redb iter: {e}")))?;
                 out.push((k.value(), v.value().to_vec()));
             }
@@ -262,7 +269,8 @@ mod tests {
     #[cfg(feature = "redb-store")]
     #[test]
     fn redb_storage_persists_across_reopen() {
-        let dir = std::env::temp_dir().join(format!("duxx-storage-persist-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("duxx-storage-persist-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("persist.redb");
         {

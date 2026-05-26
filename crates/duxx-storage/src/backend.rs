@@ -148,9 +148,12 @@ pub mod key {
 /// Use for tests, ephemeral demos, and as the default when no
 /// `storage="..."` selector is passed. Preserves the exact behavior
 /// of the v0.1.x Phase 7 primitives.
+type MemoryTable = BTreeMap<Vec<u8>, Vec<u8>>;
+type MemoryTables = BTreeMap<String, MemoryTable>;
+
 #[derive(Debug, Default)]
 pub struct MemoryBackend {
-    tables: RwLock<BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>>>,
+    tables: RwLock<MemoryTables>,
 }
 
 impl MemoryBackend {
@@ -231,12 +234,7 @@ impl Backend for MemoryBackend {
     }
 
     fn count(&self, table: &str) -> Result<usize> {
-        Ok(self
-            .tables
-            .read()
-            .get(table)
-            .map(|t| t.len())
-            .unwrap_or(0))
+        Ok(self.tables.read().get(table).map(|t| t.len()).unwrap_or(0))
     }
 }
 
@@ -366,8 +364,7 @@ mod redb_backend {
                 .iter()
                 .map_err(|e| Error::Storage(format!("redb iter: {e}")))?
             {
-                let (k, v) =
-                    entry.map_err(|e| Error::Storage(format!("redb iter entry: {e}")))?;
+                let (k, v) = entry.map_err(|e| Error::Storage(format!("redb iter entry: {e}")))?;
                 out.push((k.value().to_vec(), v.value().to_vec()));
             }
             Ok(out)
@@ -399,8 +396,7 @@ mod redb_backend {
                     .map_err(|e| Error::Storage(format!("redb range: {e}")))?,
             };
             for entry in iter {
-                let (k, v) =
-                    entry.map_err(|e| Error::Storage(format!("redb iter entry: {e}")))?;
+                let (k, v) = entry.map_err(|e| Error::Storage(format!("redb iter entry: {e}")))?;
                 let key_vec = k.value().to_vec();
                 if !key_vec.starts_with(prefix) {
                     break;
@@ -521,8 +517,14 @@ mod tests {
         backend.put("t", b"alpha", b"1").unwrap();
         backend.put("t", b"bravo", b"2").unwrap();
         backend.put("t", b"charlie", b"3").unwrap();
-        assert_eq!(backend.get("t", b"alpha").unwrap().as_deref(), Some(&b"1"[..]));
-        assert_eq!(backend.get("t", b"bravo").unwrap().as_deref(), Some(&b"2"[..]));
+        assert_eq!(
+            backend.get("t", b"alpha").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(
+            backend.get("t", b"bravo").unwrap().as_deref(),
+            Some(&b"2"[..])
+        );
         assert_eq!(backend.get("t", b"missing").unwrap(), None);
         assert_eq!(backend.count("t").unwrap(), 3);
         let rows = backend.scan("t").unwrap();
@@ -554,9 +556,7 @@ mod tests {
         backend.put("t", &key::two(b"bob", b"v1"), b"b1").unwrap();
         backend.put("t", &key::two(b"bob", b"v2"), b"b2").unwrap();
 
-        let alice = backend
-            .scan_prefix("t", &key::prefix(&[b"alice"]))
-            .unwrap();
+        let alice = backend.scan_prefix("t", &key::prefix(&[b"alice"])).unwrap();
         assert_eq!(alice.len(), 3);
         for (_k, v) in &alice {
             assert!(v[0] == b'a');

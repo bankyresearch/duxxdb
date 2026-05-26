@@ -46,21 +46,26 @@ async fn main() -> anyhow::Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--addr" | "-a" => {
-                addr = args.next().ok_or_else(|| anyhow::anyhow!("--addr needs a value"))?;
+                addr = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--addr needs a value"))?;
             }
             "--embedder" | "-e" => {
                 embedder_spec = Some(
-                    args.next().ok_or_else(|| anyhow::anyhow!("--embedder needs a value"))?,
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--embedder needs a value"))?,
                 );
             }
             "--storage" | "-s" => {
                 storage_spec = Some(
-                    args.next().ok_or_else(|| anyhow::anyhow!("--storage needs a value"))?,
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--storage needs a value"))?,
                 );
             }
             "--token" | "-t" => {
                 token = Some(
-                    args.next().ok_or_else(|| anyhow::anyhow!("--token needs a value"))?,
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--token needs a value"))?,
                 );
             }
             "--drain-secs" => {
@@ -71,9 +76,8 @@ async fn main() -> anyhow::Result<()> {
             }
             "--metrics-addr" => {
                 metrics_addr = Some(
-                    args.next().ok_or_else(|| {
-                        anyhow::anyhow!("--metrics-addr needs HOST:PORT")
-                    })?,
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--metrics-addr needs HOST:PORT"))?,
                 );
             }
             "--tls-cert" => {
@@ -112,8 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("DUXX_EMBEDDER").ok())
         .unwrap_or_else(|| "hash:32".to_string());
     let storage_spec = storage_spec.or_else(|| std::env::var("DUXX_STORAGE").ok());
-    let phase7_storage =
-        phase7_storage.or_else(|| std::env::var("DUXX_PHASE7_STORAGE").ok());
+    let phase7_storage = phase7_storage.or_else(|| std::env::var("DUXX_PHASE7_STORAGE").ok());
 
     tracing::info!(
         version = duxx_server::SERVER_VERSION,
@@ -221,9 +224,7 @@ async fn main() -> anyhow::Result<()> {
     let still_open = server.serve_with_shutdown(&addr, shutdown, drain).await?;
     drop(server); // explicit: triggers MemoryStore Drop -> tantivy commit + HNSW dump
     if still_open > 0 {
-        tracing::warn!(
-            "{still_open} connections did not close within {drain_secs}s drain window"
-        );
+        tracing::warn!("{still_open} connections did not close within {drain_secs}s drain window");
     }
     tracing::info!("duxx-server stopped");
     Ok(())
@@ -247,9 +248,7 @@ fn open_storage(spec: &str) -> anyhow::Result<Arc<dyn duxx_storage::Storage>> {
             }
             Ok(Arc::new(duxx_storage::RedbStorage::open(path)?))
         }
-        other => anyhow::bail!(
-            "unknown storage kind: {other} (built-in: memory, redb, dir)"
-        ),
+        other => anyhow::bail!("unknown storage kind: {other} (built-in: memory, redb, dir)"),
     }
 }
 

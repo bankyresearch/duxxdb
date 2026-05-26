@@ -11,8 +11,8 @@ from one Rust codebase. Speaks RESP2/3, gRPC, and MCP out of the box.
 [![CI](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml/badge.svg)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Made with Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-112%20passing-success)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
-[![Status](https://img.shields.io/badge/status-Public%20Ready-brightgreen)](docs/PROJECT_OVERVIEW.md)
+[![Tests](https://img.shields.io/badge/tests-workspace%20passing-success)](https://github.com/bankyresearch/duxxdb/actions/workflows/ci.yml)
+[![Status](https://img.shields.io/badge/status-Self--hosted%20beta-blue)](docs/PROJECT_OVERVIEW.md)
 [![Docs](https://img.shields.io/badge/docs-7%20guides-blue)](docs/)
 
 [**Install**](#install) · [**Quickstart**](#quickstart) · [**Why**](#why-duxxdb) · [**Features**](#features) · [**Integrate**](docs/INTEGRATION_GUIDE.md) · [**FAQ**](docs/FAQ.md) · [**Architecture**](#architecture) · [**Benchmarks**](#benchmarks) · [**Roadmap**](docs/ROADMAP.md) · [**Contribute**](CONTRIBUTING.md)
@@ -37,10 +37,11 @@ DuxxDB just spoke RESP — `redis-cli`, `valkey-cli`, `redis-rs`,
 `node-redis`, `go-redis`, all work unchanged. Now switch to the
 [Quickstart](#quickstart) for Python, gRPC, or MCP.
 
-> **Status:** Public-ready — feature-complete through Phase 6.2
-> (auth · native TLS · health · Prometheus · graceful shutdown ·
-> importance-based eviction). 112 tests green on Linux + macOS +
-> Windows. See the [Roadmap](docs/ROADMAP.md).
+> **Status:** self-hosted beta — feature-complete through Phase 7
+> with auth, native TLS, health, Prometheus, graceful shutdown,
+> persistence, and importance-based eviction. Enterprise-grade
+> multi-tenant isolation, mTLS client identity, and clustering remain
+> roadmap items. See the [Roadmap](docs/ROADMAP.md).
 
 ---
 
@@ -328,6 +329,7 @@ patterns: [docs/PROJECT_OVERVIEW.md § 8](docs/PROJECT_OVERVIEW.md#8-competitive
 | [USER_GUIDE.md](docs/USER_GUIDE.md) | Writing client code in any of 6 languages |
 | [INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md) | Wiring DuxxDB into a chatbot, voice bot, or autonomous agent (with diagrams) |
 | [DUXX_STACK_INTEGRATION.md](docs/DUXX_STACK_INTEGRATION.md) | How **duxx-ai** (Python framework) plugs into DuxxDB — backend protocol, API contracts, deployment shapes |
+| [DRAGONFLY_COMPARISON.md](docs/DRAGONFLY_COMPARISON.md) | Enterprise reliability roadmap inspired by DragonflyDB's operational model |
 | [FAQ.md](docs/FAQ.md) | "Is DuxxDB right for me?" — when to use, when not to, framework support, migration |
 | [PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md) | Pitching DuxxDB to a teammate / making a build-vs-buy call |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Understanding the internals before contributing |
@@ -386,7 +388,7 @@ Full guide, including how to run the test matrix locally, the
 commit-message style, and the PR review process:
 **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
-This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
+This project follows the project [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---
 
@@ -401,19 +403,8 @@ Please report vulnerabilities **privately** via the process in
 
 [Apache License 2.0](LICENSE). No proprietary "open core" tax.
 
-Standing on the shoulders of:
-[tantivy](https://github.com/quickwit-oss/tantivy),
-[hnsw_rs](https://crates.io/crates/hnsw_rs),
-[redb](https://github.com/cberner/redb),
-[tonic](https://github.com/hyperium/tonic),
-[PyO3](https://github.com/PyO3/pyo3),
-[napi-rs](https://github.com/napi-rs/napi-rs),
-[Apache Arrow](https://github.com/apache/arrow-rs),
-[rustls](https://github.com/rustls/rustls),
-the [Model Context Protocol](https://modelcontextprotocol.io/),
-and many more — see [NOTICE](NOTICE).
-
-If DuxxDB is useful to you, please support its upstream dependencies first.
+Third-party dependency notices required for distribution are maintained
+in [NOTICE](NOTICE).
 
 ---
 

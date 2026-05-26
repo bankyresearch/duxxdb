@@ -239,7 +239,10 @@ impl McpServer {
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_params("missing 'name'"))?;
-        let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let args = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
 
         let body = match name {
             "remember" => self.tool_remember(&args)?,
@@ -262,8 +265,14 @@ impl McpServer {
     }
 
     fn tool_remember(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
-        let key = args.get("key").and_then(Value::as_str).ok_or_else(|| invalid_params("missing 'key'"))?;
-        let text = args.get("text").and_then(Value::as_str).ok_or_else(|| invalid_params("missing 'text'"))?;
+        let key = args
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'key'"))?;
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'text'"))?;
         let emb = self
             .embedder
             .embed(text)
@@ -283,8 +292,14 @@ impl McpServer {
     }
 
     fn tool_recall(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
-        let key = args.get("key").and_then(Value::as_str).ok_or_else(|| invalid_params("missing 'key'"))?;
-        let query = args.get("query").and_then(Value::as_str).ok_or_else(|| invalid_params("missing 'query'"))?;
+        let key = args
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'key'"))?;
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'query'"))?;
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
         let qvec = self
             .embedder
@@ -412,10 +427,7 @@ mod tests {
     #[test]
     fn unknown_method_returns_minus_32601() {
         let s = McpServer::new();
-        let resp = run_one(
-            &s,
-            r#"{"jsonrpc":"2.0","id":99,"method":"nonexistent"}"#,
-        );
+        let resp = run_one(&s, r#"{"jsonrpc":"2.0","id":99,"method":"nonexistent"}"#);
         assert_eq!(resp["error"]["code"], -32601);
     }
 
@@ -423,9 +435,8 @@ mod tests {
     fn notifications_produce_no_response() {
         let s = McpServer::new();
         let mut output = Vec::new();
-        let input = Cursor::new(
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
-        );
+        let input =
+            Cursor::new(r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#);
         s.run(input, &mut output).unwrap();
         assert!(String::from_utf8(output).unwrap().trim().is_empty());
     }

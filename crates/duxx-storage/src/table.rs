@@ -92,7 +92,10 @@ fn check_value(value: &Value, col: &Column) -> Result<()> {
         return if col.nullable {
             Ok(())
         } else {
-            Err(Error::Schema(format!("column '{}' is not nullable", col.name)))
+            Err(Error::Schema(format!(
+                "column '{}' is not nullable",
+                col.name
+            )))
         };
     }
     let ok = matches!(

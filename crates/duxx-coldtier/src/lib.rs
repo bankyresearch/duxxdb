@@ -39,9 +39,7 @@
 //! | `importance`      | `Float32`                               |
 //! | `created_at_ns`   | `UInt64` (Unix epoch nanoseconds)       |
 
-use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, StringArray, UInt64Array,
-};
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use duxx_memory::{Memory, MemoryStore};
@@ -109,10 +107,12 @@ impl ParquetExporter {
         }
 
         let ids: ArrayRef = Arc::new(UInt64Array::from_iter_values(rows.iter().map(|m| m.id)));
-        let keys: ArrayRef =
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|m| m.key.as_str())));
-        let texts: ArrayRef =
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|m| m.text.as_str())));
+        let keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|m| m.key.as_str()),
+        ));
+        let texts: ArrayRef = Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|m| m.text.as_str()),
+        ));
 
         // Flatten all embeddings into a single Float32Array, then wrap
         // in a FixedSizeList of the right stride.
@@ -129,8 +129,9 @@ impl ParquetExporter {
             None,
         ));
 
-        let importances: ArrayRef =
-            Arc::new(Float32Array::from_iter_values(rows.iter().map(|m| m.importance)));
+        let importances: ArrayRef = Arc::new(Float32Array::from_iter_values(
+            rows.iter().map(|m| m.importance),
+        ));
 
         // u128 -> u64 truncation. Unix nanos fit in u64 until year 2554.
         let timestamps: ArrayRef = Arc::new(UInt64Array::from_iter_values(
@@ -158,22 +159,22 @@ impl ParquetExporter {
             // Still write an empty file with the proper schema so
             // readers don't need to special-case "no rows yet".
             let schema = Arc::new(self.arrow_schema(store.dim()));
-            let file = File::create(path.as_ref())
-                .map_err(|e| ColdTierError::Io(e.to_string()))?;
+            let file = File::create(path.as_ref()).map_err(|e| ColdTierError::Io(e.to_string()))?;
             let props = WriterProperties::builder()
                 .set_compression(self.compression)
                 .build();
-            let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+            let writer = ArrowWriter::try_new(file, schema, Some(props))
                 .map_err(|e| ColdTierError::Parquet(e.to_string()))?;
-            writer.close().map_err(|e| ColdTierError::Parquet(e.to_string()))?;
+            writer
+                .close()
+                .map_err(|e| ColdTierError::Parquet(e.to_string()))?;
             return Ok(0);
         }
 
         let dim = store.dim();
         let batch = self.to_record_batch(&memories, dim)?;
 
-        let file = File::create(path.as_ref())
-            .map_err(|e| ColdTierError::Io(e.to_string()))?;
+        let file = File::create(path.as_ref()).map_err(|e| ColdTierError::Io(e.to_string()))?;
         let props = WriterProperties::builder()
             .set_compression(self.compression)
             .build();
@@ -182,7 +183,9 @@ impl ParquetExporter {
         writer
             .write(&batch)
             .map_err(|e| ColdTierError::Parquet(e.to_string()))?;
-        writer.close().map_err(|e| ColdTierError::Parquet(e.to_string()))?;
+        writer
+            .close()
+            .map_err(|e| ColdTierError::Parquet(e.to_string()))?;
 
         tracing::info!(
             path = %path.as_ref().display(),
@@ -222,9 +225,7 @@ pub enum ColdTierError {
     Parquet(String),
     #[error("Arrow error: {0}")]
     Arrow(String),
-    #[error(
-        "memory id={id} embedding has dim {got} but schema expects {want}"
-    )]
+    #[error("memory id={id} embedding has dim {got} but schema expects {want}")]
     DimMismatch { id: u64, got: usize, want: usize },
 }
 
@@ -264,9 +265,15 @@ mod tests {
     fn write_and_read_roundtrip() {
         const DIM: usize = 16;
         let store = MemoryStore::new(DIM);
-        store.remember("alice", "wallet at the cafe", embed("wallet", DIM)).unwrap();
-        store.remember("alice", "favorite color is blue", embed("blue", DIM)).unwrap();
-        store.remember("bob", "tracking number DX-002341", embed("tracking", DIM)).unwrap();
+        store
+            .remember("alice", "wallet at the cafe", embed("wallet", DIM))
+            .unwrap();
+        store
+            .remember("alice", "favorite color is blue", embed("blue", DIM))
+            .unwrap();
+        store
+            .remember("bob", "tracking number DX-002341", embed("tracking", DIM))
+            .unwrap();
 
         let dir = std::env::temp_dir().join(format!(
             "duxx-coldtier-test-{}",

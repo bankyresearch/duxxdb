@@ -39,12 +39,21 @@ fn main() -> anyhow::Result<()> {
     let store = MemoryStore::new(DIM);
 
     let corpus = [
-        ("user_42", "I want a refund for order #9910 — it arrived broken."),
+        (
+            "user_42",
+            "I want a refund for order #9910 — it arrived broken.",
+        ),
         ("user_42", "What's the status of my delivery?"),
-        ("user_42", "I love your customer service team, very helpful."),
+        (
+            "user_42",
+            "I love your customer service team, very helpful.",
+        ),
         ("user_42", "Can you recommend a good winter coat?"),
         ("user_42", "The tracking number is DX-002341."),
-        ("user_42", "Order arrived damaged, need replacement or money back."),
+        (
+            "user_42",
+            "Order arrived damaged, need replacement or money back.",
+        ),
         ("user_42", "My favorite colour is blue."),
     ];
 
@@ -61,7 +70,11 @@ fn main() -> anyhow::Result<()> {
     let hits = store.recall("user_42", query, &qvec, 3)?;
     let elapsed = start.elapsed();
 
-    println!("\nTop-3 recall for {:?}  ({} μs):", query, elapsed.as_micros());
+    println!(
+        "\nTop-3 recall for {:?}  ({} μs):",
+        query,
+        elapsed.as_micros()
+    );
     for (i, h) in hits.iter().enumerate() {
         println!(
             "  {}. id={}  score={:.4}  — {}",

@@ -302,14 +302,9 @@ These are implementation-time decisions and don't block scaffolding.
 
 ---
 
-## 14. References & Credits
+## 14. Implementation Notes
 
-Standing on the shoulders of:
-
-- [Lance](https://github.com/lancedb/lance) — columnar + vector storage
-- [Apache DataFusion](https://github.com/apache/datafusion) — SQL engine
-- [usearch](https://github.com/unum-cloud/usearch) — HNSW
-- [tantivy](https://github.com/quickwit-oss/tantivy) — BM25
-- [redb](https://github.com/cberner/redb) — embedded KV
-- [DuckDB](https://duckdb.org/) — embedded-first philosophy
-- [Model Context Protocol](https://modelcontextprotocol.io/) — agent integration standard
+Runtime dependency notices for distributed builds are maintained in
+[`../NOTICE`](../NOTICE). Design and implementation details in this
+document describe DuxxDB behavior and release scope rather than acting
+as a dependency credit list.

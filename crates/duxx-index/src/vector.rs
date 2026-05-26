@@ -94,8 +94,7 @@ impl VectorIndex {
     /// missing dump on reopen and rebuild from rows.
     pub fn open(dim: usize, capacity: usize, dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| Error::Index(format!("create hnsw dir: {e}")))?;
+        std::fs::create_dir_all(&dir).map_err(|e| Error::Index(format!("create hnsw dir: {e}")))?;
         let graph_path = dir.join(format!("{HNSW_NAME}.hnsw.graph"));
         let meta_path = dir.join(META_FILE);
 
@@ -370,7 +369,10 @@ mod tests {
         // Phase 2: reopen, search must work without re-inserting.
         {
             let idx = VectorIndex::open(3, 100, &dir).unwrap();
-            assert!(idx.was_loaded_from_disk(), "should have loaded existing dump");
+            assert!(
+                idx.was_loaded_from_disk(),
+                "should have loaded existing dump"
+            );
             assert_eq!(idx.len(), 3, "id_map must survive dump/load");
             let hits = idx.search(&[1.0, 0.0, 0.0], 3);
             assert!(!hits.is_empty(), "loaded hnsw must be searchable");
@@ -405,11 +407,12 @@ mod tests {
             // index pointing at the same dir AFTER the loaded one
             // exits scope. Easier: explicitly call dump() on an empty
             // index and verify it returns Ok(false) without writing.
-            let placeholder = VectorIndex::open(3, 100, &std::env::temp_dir().join("does-not-matter-empty"));
+            let placeholder =
+                VectorIndex::open(3, 100, std::env::temp_dir().join("does-not-matter-empty"));
             // The placeholder is in a separate dir; harmless. The real
             // assertion is that dump on empty returns Ok(false).
             let placeholder = placeholder.unwrap();
-            assert_eq!(placeholder.dump().unwrap(), false);
+            assert!(!placeholder.dump().unwrap());
         }
         // Confirm the original pre-populated dump survived.
         {

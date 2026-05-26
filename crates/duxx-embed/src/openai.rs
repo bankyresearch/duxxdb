@@ -89,9 +89,7 @@ impl Embedder for OpenAIEmbedder {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().unwrap_or_default();
-            return Err(Error::Internal(format!(
-                "openai HTTP {status}: {body}"
-            )));
+            return Err(Error::Internal(format!("openai HTTP {status}: {body}")));
         }
 
         let parsed: EmbedResponse = resp
