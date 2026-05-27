@@ -24,20 +24,22 @@ Sources reviewed:
 | Wire compatibility | Redis and Memcached APIs | RESP subset, gRPC, MCP, Python, Node | Expand RESP compatibility only where it helps agent stacks |
 | AI primitives | Redis-compatible data structures plus vector search | Memory, tool cache, sessions, traces, prompts, datasets, evals, replay, costs | Add lifecycle, governance, and isolation around these primitives |
 | Scale model | Vertical multi-core first, HA replicas/operator/cloud | Single node with persistence | Add shard-per-core execution, replicas, and operator-managed failover |
-| Enterprise ops | Snapshots, replication, K8s operator, Prometheus, OTel | Prometheus, health, TLS, token auth, packaging | Add mTLS, RBAC, OTel, backup/restore CLI, HA controller |
+| Enterprise ops | Snapshots, replication, K8s operator, Prometheus, OTel | Prometheus, health, TLS/mTLS, token auth, configurable RESP limits, offline snapshot CLI, packaging | Add RBAC, OTel, live snapshots, HA controller |
 
 ## Features To Add
 
 ### P0: Enterprise Gatekeepers
 
 1. **Protocol resource limits**
-   - Status: initial RESP frame, line, bulk, and array limits added.
-   - Next: make limits configurable via `DUXX_MAX_FRAME_BYTES`,
-     `DUXX_MAX_BULK_BYTES`, and per-IP connection caps.
+   - Status: RESP frame, line, bulk, array, nesting-depth, and
+     per-connection input-buffer limits are configurable via CLI flags
+     and `DUXX_MAX_*` environment variables.
+   - Next: add per-IP connection caps and tenant-aware request budgets.
 
 2. **mTLS and service identity**
-   - Add client certificate verification for RESP and gRPC.
-   - Map cert subjects/SANs to service principals.
+   - Status: RESP and gRPC listeners can require client certificates
+     with `--tls-client-ca` / `DUXX_TLS_CLIENT_CA`.
+   - Next: map cert subjects/SANs to service principals.
    - Keep token auth as a simple bootstrap mode.
 
 3. **RBAC and tenant isolation**
@@ -48,10 +50,12 @@ Sources reviewed:
      gRPC, Python bindings, subscriptions, export, or recall.
 
 4. **Backup and restore CLI**
-   - Add `duxx-snapshot create`, `duxx-snapshot verify`, and
-     `duxx-snapshot restore`.
-   - Support local filesystem first, then S3-compatible object storage.
-   - Restore must be automatic, documented, and tested in CI.
+   - Status: `duxx-snapshot create`, `duxx-snapshot verify`, and
+     `duxx-snapshot restore` support offline local filesystem snapshots
+     with a SHA-256 manifest.
+   - Next: add live/nonblocking snapshots and S3-compatible object
+     storage.
+   - Restore must stay documented and tested in CI.
 
 5. **Supply-chain release controls**
    - Keep hard `fmt`, `clippy -D warnings`, tests, and `cargo audit`.
@@ -66,10 +70,11 @@ Sources reviewed:
    - Preserve agent-level consistency for multi-primitive workflows.
 
 2. **Low-overhead snapshotting**
-   - Build an async snapshot writer that does not block recall/write
-     traffic.
-   - Snapshot row stores, HNSW metadata, Tantivy segments, and Phase 7
-     primitive backends together with a manifest.
+   - Status: offline manifest snapshotting covers row stores, HNSW
+     metadata, Tantivy segments, and Phase 7 primitive backends when
+     they live under the same storage directory.
+   - Next: build an async snapshot writer that does not block
+     recall/write traffic.
    - Record snapshot checkpoints so restore can reject partial or mixed
      versions.
 

@@ -28,6 +28,90 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// closes it. This caps slowloris-style partial frames and excessive
 /// pipelining before authentication.
 pub const MAX_INPUT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum recursive nesting accepted for RESP arrays.
+pub const MAX_NESTING_DEPTH: usize = 64;
+
+/// Runtime limits for RESP parsing and per-connection buffering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RespLimits {
+    pub max_bulk_bytes: usize,
+    pub max_array_items: usize,
+    pub max_line_bytes: usize,
+    pub max_input_buffer_bytes: usize,
+    pub max_nesting_depth: usize,
+}
+
+impl RespLimits {
+    pub const fn new(
+        max_bulk_bytes: usize,
+        max_array_items: usize,
+        max_line_bytes: usize,
+        max_input_buffer_bytes: usize,
+        max_nesting_depth: usize,
+    ) -> Self {
+        Self {
+            max_bulk_bytes,
+            max_array_items,
+            max_line_bytes,
+            max_input_buffer_bytes,
+            max_nesting_depth,
+        }
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self {
+            max_bulk_bytes: read_limit_env("DUXX_MAX_BULK_BYTES", MAX_BULK_BYTES)?,
+            max_array_items: read_limit_env("DUXX_MAX_ARRAY_ITEMS", MAX_ARRAY_ITEMS)?,
+            max_line_bytes: read_limit_env("DUXX_MAX_LINE_BYTES", MAX_LINE_BYTES)?,
+            max_input_buffer_bytes: read_limit_env(
+                "DUXX_MAX_INPUT_BUFFER_BYTES",
+                MAX_INPUT_BUFFER_BYTES,
+            )?,
+            max_nesting_depth: read_limit_env("DUXX_MAX_NESTING_DEPTH", MAX_NESTING_DEPTH)?,
+        }
+        .validate()
+    }
+
+    pub fn validate(self) -> anyhow::Result<Self> {
+        validate_limit("max_bulk_bytes", self.max_bulk_bytes)?;
+        validate_limit("max_array_items", self.max_array_items)?;
+        validate_limit("max_line_bytes", self.max_line_bytes)?;
+        validate_limit("max_input_buffer_bytes", self.max_input_buffer_bytes)?;
+        validate_limit("max_nesting_depth", self.max_nesting_depth)?;
+        Ok(self)
+    }
+}
+
+impl Default for RespLimits {
+    fn default() -> Self {
+        Self::new(
+            MAX_BULK_BYTES,
+            MAX_ARRAY_ITEMS,
+            MAX_LINE_BYTES,
+            MAX_INPUT_BUFFER_BYTES,
+            MAX_NESTING_DEPTH,
+        )
+    }
+}
+
+fn read_limit_env(name: &str, default: usize) -> anyhow::Result<usize> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| anyhow::anyhow!("{name} must be a positive integer: {e}")),
+        Ok(_) => anyhow::bail!("{name} must not be empty"),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => anyhow::bail!("reading {name}: {e}"),
+    }
+}
+
+fn validate_limit(name: &str, value: usize) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(())
+}
 
 /// One RESP value.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,11 +193,20 @@ pub enum ParseError {
 /// Try to consume one RESP value from `buf`. On success the consumed
 /// bytes are removed from `buf`.
 pub fn parse(buf: &mut BytesMut) -> Result<Option<RespValue>, ParseError> {
+    parse_with_limits(buf, RespLimits::default())
+}
+
+/// Try to consume one RESP value from `buf` using explicit runtime
+/// limits. On success the consumed bytes are removed from `buf`.
+pub fn parse_with_limits(
+    buf: &mut BytesMut,
+    limits: RespLimits,
+) -> Result<Option<RespValue>, ParseError> {
     if buf.is_empty() {
         return Ok(None);
     }
     let mut cursor = 0;
-    match parse_value(&buf[..], &mut cursor) {
+    match parse_value(&buf[..], &mut cursor, &limits, 0) {
         Ok(v) => {
             buf.advance(cursor);
             Ok(Some(v))
@@ -123,7 +216,18 @@ pub fn parse(buf: &mut BytesMut) -> Result<Option<RespValue>, ParseError> {
     }
 }
 
-fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError> {
+fn parse_value(
+    data: &[u8],
+    cursor: &mut usize,
+    limits: &RespLimits,
+    depth: usize,
+) -> Result<RespValue, ParseError> {
+    if depth > limits.max_nesting_depth {
+        return Err(ParseError::Bad(format!(
+            "RESP nesting too deep: > {}",
+            limits.max_nesting_depth
+        )));
+    }
     if *cursor >= data.len() {
         return Err(ParseError::Incomplete);
     }
@@ -131,17 +235,17 @@ fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError>
     match prefix {
         b'+' => {
             *cursor += 1;
-            let line = read_line(data, cursor)?;
+            let line = read_line(data, cursor, limits)?;
             Ok(RespValue::SimpleString(line.to_string()))
         }
         b'-' => {
             *cursor += 1;
-            let line = read_line(data, cursor)?;
+            let line = read_line(data, cursor, limits)?;
             Ok(RespValue::Error(line.to_string()))
         }
         b':' => {
             *cursor += 1;
-            let line = read_line(data, cursor)?;
+            let line = read_line(data, cursor, limits)?;
             let n: i64 = line
                 .parse()
                 .map_err(|_| ParseError::Bad(format!("bad int {line:?}")))?;
@@ -149,7 +253,7 @@ fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError>
         }
         b'$' => {
             *cursor += 1;
-            let line = read_line(data, cursor)?;
+            let line = read_line(data, cursor, limits)?;
             let len: i64 = line
                 .parse()
                 .map_err(|_| ParseError::Bad(format!("bad bulk len {line:?}")))?;
@@ -157,9 +261,10 @@ fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError>
                 return Ok(RespValue::Null);
             }
             let len = len as usize;
-            if len > MAX_BULK_BYTES {
+            if len > limits.max_bulk_bytes {
                 return Err(ParseError::Bad(format!(
-                    "bulk string too large: {len} bytes > {MAX_BULK_BYTES}"
+                    "bulk string too large: {len} bytes > {}",
+                    limits.max_bulk_bytes
                 )));
             }
             if *cursor + len + 2 > data.len() {
@@ -175,7 +280,7 @@ fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError>
         }
         b'*' => {
             *cursor += 1;
-            let line = read_line(data, cursor)?;
+            let line = read_line(data, cursor, limits)?;
             let len: i64 = line
                 .parse()
                 .map_err(|_| ParseError::Bad(format!("bad array len {line:?}")))?;
@@ -183,21 +288,22 @@ fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError>
                 return Ok(RespValue::Null);
             }
             let len = len as usize;
-            if len > MAX_ARRAY_ITEMS {
+            if len > limits.max_array_items {
                 return Err(ParseError::Bad(format!(
-                    "array too large: {len} items > {MAX_ARRAY_ITEMS}"
+                    "array too large: {len} items > {}",
+                    limits.max_array_items
                 )));
             }
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                items.push(parse_value(data, cursor)?);
+                items.push(parse_value(data, cursor, limits, depth + 1)?);
             }
             Ok(RespValue::Array(items))
         }
         _ => {
             // Inline command: no prefix. Read the rest of the line and
             // split on whitespace into bulk strings.
-            let line = read_line(data, cursor)?;
+            let line = read_line(data, cursor, limits)?;
             let items = line
                 .split_whitespace()
                 .map(|tok| RespValue::bulk(tok.to_string()))
@@ -209,13 +315,18 @@ fn parse_value(data: &[u8], cursor: &mut usize) -> Result<RespValue, ParseError>
 
 /// Read up to `\r\n` and advance the cursor past it. Returns the line
 /// content (without the trailer).
-fn read_line<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a str, ParseError> {
+fn read_line<'a>(
+    data: &'a [u8],
+    cursor: &mut usize,
+    limits: &RespLimits,
+) -> Result<&'a str, ParseError> {
     let start = *cursor;
     let mut i = start;
     while i + 1 < data.len() {
-        if i - start > MAX_LINE_BYTES {
+        if i - start > limits.max_line_bytes {
             return Err(ParseError::Bad(format!(
-                "line too large: > {MAX_LINE_BYTES} bytes"
+                "line too large: > {} bytes",
+                limits.max_line_bytes
             )));
         }
         if data[i] == b'\r' && data[i + 1] == b'\n' {
@@ -226,9 +337,10 @@ fn read_line<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a str, ParseErr
         }
         i += 1;
     }
-    if data.len().saturating_sub(start) > MAX_LINE_BYTES {
+    if data.len().saturating_sub(start) > limits.max_line_bytes {
         return Err(ParseError::Bad(format!(
-            "line too large: > {MAX_LINE_BYTES} bytes"
+            "line too large: > {} bytes",
+            limits.max_line_bytes
         )));
     }
     Err(ParseError::Incomplete)
@@ -340,5 +452,27 @@ mod tests {
         let mut buf = BytesMut::from(line.as_bytes());
         let err = parse(&mut buf).unwrap_err().to_string();
         assert!(err.contains("line too large"), "{err}");
+    }
+
+    #[test]
+    fn custom_limits_are_enforced() {
+        let limits = RespLimits::new(3, MAX_ARRAY_ITEMS, MAX_LINE_BYTES, 128, MAX_NESTING_DEPTH);
+        let mut buf = BytesMut::from(&b"$4\r\ntest\r\n"[..]);
+        let err = parse_with_limits(&mut buf, limits).unwrap_err().to_string();
+        assert!(err.contains("bulk string too large"), "{err}");
+    }
+
+    #[test]
+    fn nested_arrays_are_limited() {
+        let limits = RespLimits::new(
+            MAX_BULK_BYTES,
+            MAX_ARRAY_ITEMS,
+            MAX_LINE_BYTES,
+            MAX_INPUT_BUFFER_BYTES,
+            1,
+        );
+        let mut buf = BytesMut::from(&b"*1\r\n*1\r\n*0\r\n"[..]);
+        let err = parse_with_limits(&mut buf, limits).unwrap_err().to_string();
+        assert!(err.contains("RESP nesting too deep"), "{err}");
     }
 }

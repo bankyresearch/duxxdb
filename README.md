@@ -39,8 +39,9 @@ DuxxDB just spoke RESP — `redis-cli`, `valkey-cli`, `redis-rs`,
 
 > **Status:** self-hosted beta — feature-complete through Phase 7
 > with auth, native TLS, health, Prometheus, graceful shutdown,
-> persistence, and importance-based eviction. Enterprise-grade
-> multi-tenant isolation, mTLS client identity, and clustering remain
+> persistence, mTLS client verification, configurable protocol limits,
+> offline snapshot/restore, and importance-based eviction.
+> Enterprise-grade multi-tenant isolation, RBAC, and clustering remain
 > roadmap items. See the [Roadmap](docs/ROADMAP.md).
 
 ---
@@ -139,10 +140,13 @@ out of one codebase. Pure Rust, no GC pauses.
 #### Production hardening (Phase 6.1 + 6.2)
 - Token auth (`--token` / `DUXX_TOKEN`)
 - **Native TLS** on RESP + gRPC (rustls)
+- **mTLS client verification** with `--tls-client-ca`
+- **Configurable RESP resource limits** (`DUXX_MAX_*`)
 - Prometheus `/metrics` + `/health`
 - gRPC `grpc.health.v1.Health` protocol
 - Graceful shutdown drain
 - **Memory cap + importance-based eviction**
+- Offline `duxx-snapshot create/verify/restore`
 - Apache Parquet cold-tier export
 
 </td></tr>

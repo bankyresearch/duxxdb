@@ -117,7 +117,7 @@ jobs:
           EXT=""
           if [[ "${{ matrix.target }}" == *windows* ]]; then EXT=".exe"; fi
 
-          for bin in duxx-server duxx-grpc duxx-mcp duxx-export; do
+          for bin in duxx-server duxx-grpc duxx-mcp duxx-export duxx-snapshot; do
             cp "target/${{ matrix.target }}/release/${bin}${EXT}" "dist/${STAGE}/"
           done
           cp LICENSE NOTICE README.md "dist/${STAGE}/"

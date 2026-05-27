@@ -80,7 +80,8 @@ real, use one of the production paths below.
 ## Docker (single command)
 
 The image is multi-arch (linux/amd64 + linux/arm64). It bundles
-`duxx-server`, `duxx-grpc`, `duxx-mcp`, and `duxx-export` and runs as a
+`duxx-server`, `duxx-grpc`, `duxx-mcp`, `duxx-export`, and
+`duxx-snapshot` and runs as a
 non-root user with a `redis-cli PING` healthcheck baked in.
 
 ### Persistent run (host bind-mount)
@@ -377,11 +378,12 @@ git clone https://github.com/bankyresearch/duxxdb.git
 cd duxxdb
 cargo build --release --workspace
 
-# Install the four daemons globally (optional).
+# Install the runtime binaries globally (optional).
 sudo install -m 0755 target/release/duxx-server /usr/local/bin/
 sudo install -m 0755 target/release/duxx-grpc   /usr/local/bin/
 sudo install -m 0755 target/release/duxx-mcp    /usr/local/bin/
 sudo install -m 0755 target/release/duxx-export /usr/local/bin/
+sudo install -m 0755 target/release/duxx-snapshot /usr/local/bin/
 ```
 
 Verify:
@@ -515,6 +517,7 @@ npm test
 | gRPC | `grpcurl -plaintext -H 'x-duxx-token: '$TOKEN :50051 duxx.v1.Duxx/Ping` | `nonce: ""` |
 | MCP stdio | `duxx-mcp` (echo `{"jsonrpc":"2.0","id":1,"method":"initialize"}`) | `serverInfo: {name: "duxxdb", …}` |
 | Parquet export | `duxx-export --storage dir:./data --out cold.parquet` | `exported N memories -> cold.parquet` |
+| Snapshot verify | `duxx-snapshot create --source dir:./data --out ./snap && duxx-snapshot verify --snapshot ./snap` | `verified snapshot ...` |
 
 Full surface tour with copy-paste examples per language:
 **[USER_GUIDE.md](USER_GUIDE.md)**.
@@ -538,14 +541,20 @@ The most-used knobs:
 | `DUXX_METRICS_ADDR` | `--metrics-addr` | (off) | `127.0.0.1:9100` is the convention. |
 | `DUXX_TLS_CERT` | `--tls-cert` | (off) | PEM cert chain. Both --tls-cert AND --tls-key required. |
 | `DUXX_TLS_KEY` | `--tls-key` | (off) | PEM private key. Phase 6.2. |
+| `DUXX_TLS_CLIENT_CA` | `--tls-client-ca` | (off) | PEM CA bundle; enables client certificate verification. |
 | `DUXX_MAX_MEMORIES` | `--max-memories` | unlimited | Soft row cap. Lowest decayed-importance rows evicted on overflow. |
+| `DUXX_MAX_INPUT_BUFFER_BYTES` | `--max-input-buffer-bytes` | `33554432` | Per-connection inbound buffer cap. |
+| `DUXX_MAX_BULK_BYTES` | `--max-bulk-bytes` | `16777216` | Max RESP bulk string bytes. |
+| `DUXX_MAX_ARRAY_ITEMS` | `--max-array-items` | `4096` | Max RESP array items. |
+| `DUXX_MAX_LINE_BYTES` | `--max-line-bytes` | `65536` | Max RESP line bytes before CRLF. |
+| `DUXX_MAX_NESTING_DEPTH` | `--max-nesting-depth` | `64` | Max RESP array nesting depth. |
 | — | `--addr` | `127.0.0.1:6379` | RESP listen address. |
 | — | `--drain-secs` | `30` | SIGTERM drain budget. |
 | `RUST_LOG` | — | `info` | Use `debug` for troubleshooting. |
 | `OPENAI_API_KEY` | — | — | Required iff `DUXX_EMBEDDER=openai:*`. |
 | `COHERE_API_KEY` | — | — | Required iff `DUXX_EMBEDDER=cohere:*`. |
 
-### Enabling TLS (Phase 6.2)
+### Enabling TLS / mTLS
 
 ```bash
 # 1. Get a cert + key. With Let's Encrypt + certbot:
@@ -558,6 +567,7 @@ duxx-server --addr 0.0.0.0:6379 \
   --token "$DUXX_TOKEN" \
   --tls-cert /etc/letsencrypt/live/duxxdb.example.com/fullchain.pem \
   --tls-key  /etc/letsencrypt/live/duxxdb.example.com/privkey.pem \
+  --tls-client-ca /etc/duxxdb/client-ca.pem \
   --storage  dir:/var/lib/duxxdb
 
 # 3. Connect with redis-cli:
@@ -565,7 +575,9 @@ redis-cli --tls -h duxxdb.example.com -p 6379 -a "$DUXX_TOKEN" PING
 # +PONG
 ```
 
-The same `--tls-cert` / `--tls-key` flags work on `duxx-grpc`. For
+Omit `--tls-client-ca` when you want server TLS without client
+certificate verification. The same TLS and mTLS flags work on
+`duxx-grpc`. For
 `grpcurl`:
 
 ```bash
@@ -600,7 +612,7 @@ docker compose restart duxxdb         # compose
 | Homebrew | `brew services stop duxxdb && brew uninstall duxxdb` | `rm -rf $(brew --prefix)/var/lib/duxxdb` |
 | Docker single | `docker rm -f duxxdb` | `docker volume rm duxxdb-data` |
 | Docker Compose | `docker compose down` | `docker compose down -v` |
-| One-line installer | `sudo rm /usr/local/bin/duxx-{server,grpc,mcp,export}` | (no managed data dir) |
+| One-line installer | `sudo rm /usr/local/bin/duxx-{server,grpc,mcp,export,snapshot}` | (no managed data dir) |
 | From source | `cargo clean` and remove your binaries from `$PATH` | (you chose where to write data) |
 
 ### Troubleshooting

@@ -50,7 +50,8 @@ COPY rust-toolchain.toml* ./
 # Pre-fetch the dep graph.
 RUN cargo fetch
 
-# Build everything ops needs at runtime: RESP, gRPC, MCP, cold-tier export.
+# Build everything ops needs at runtime: RESP, gRPC, MCP, cold-tier export,
+# and offline snapshot/restore.
 RUN cargo build --release \
       -p duxx-server \
       -p duxx-grpc \
@@ -71,11 +72,12 @@ RUN apt-get update \
       redis-tools \
  && rm -rf /var/lib/apt/lists/*
 
-# Bring all four binaries.
+# Bring all runtime binaries.
 COPY --from=builder /usr/src/duxxdb/target/release/duxx-server   /usr/local/bin/duxx-server
 COPY --from=builder /usr/src/duxxdb/target/release/duxx-grpc     /usr/local/bin/duxx-grpc
 COPY --from=builder /usr/src/duxxdb/target/release/duxx-mcp      /usr/local/bin/duxx-mcp
 COPY --from=builder /usr/src/duxxdb/target/release/duxx-export   /usr/local/bin/duxx-export
+COPY --from=builder /usr/src/duxxdb/target/release/duxx-snapshot /usr/local/bin/duxx-snapshot
 
 # Non-root user for safety. UID matches packaging/debian/postinst.
 RUN useradd --system --uid 10001 --home /var/lib/duxxdb --shell /usr/sbin/nologin duxxdb \

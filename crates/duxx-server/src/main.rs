@@ -40,8 +40,14 @@ async fn main() -> anyhow::Result<()> {
     let mut metrics_addr: Option<String> = None;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut tls_client_ca: Option<String> = None;
     let mut max_memories: Option<usize> = None;
     let mut phase7_storage: Option<String> = None;
+    let mut max_bulk_bytes: Option<usize> = None;
+    let mut max_array_items: Option<usize> = None;
+    let mut max_line_bytes: Option<usize> = None;
+    let mut max_input_buffer_bytes: Option<usize> = None;
+    let mut max_nesting_depth: Option<usize> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -92,6 +98,12 @@ async fn main() -> anyhow::Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("--tls-key needs a path"))?,
                 );
             }
+            "--tls-client-ca" => {
+                tls_client_ca = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--tls-client-ca needs a path"))?,
+                );
+            }
             "--max-memories" => {
                 let v = args
                     .next()
@@ -102,6 +114,36 @@ async fn main() -> anyhow::Result<()> {
                 phase7_storage = Some(args.next().ok_or_else(|| {
                     anyhow::anyhow!("--phase7-storage needs SPEC (memory|redb:<file>|dir:<dir>)")
                 })?);
+            }
+            "--max-bulk-bytes" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-bulk-bytes needs a value"))?;
+                max_bulk_bytes = Some(v.parse()?);
+            }
+            "--max-array-items" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-array-items needs a value"))?;
+                max_array_items = Some(v.parse()?);
+            }
+            "--max-line-bytes" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-line-bytes needs a value"))?;
+                max_line_bytes = Some(v.parse()?);
+            }
+            "--max-input-buffer-bytes" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-input-buffer-bytes needs a value"))?;
+                max_input_buffer_bytes = Some(v.parse()?);
+            }
+            "--max-nesting-depth" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-nesting-depth needs a value"))?;
+                max_nesting_depth = Some(v.parse()?);
             }
             "--help" | "-h" => {
                 print_help();
@@ -155,6 +197,33 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(spec = %p7, "Phase 7 primitives persisted");
     }
 
+    let mut resp_limits = duxx_server::resp::RespLimits::from_env()?;
+    if let Some(v) = max_bulk_bytes {
+        resp_limits.max_bulk_bytes = v;
+    }
+    if let Some(v) = max_array_items {
+        resp_limits.max_array_items = v;
+    }
+    if let Some(v) = max_line_bytes {
+        resp_limits.max_line_bytes = v;
+    }
+    if let Some(v) = max_input_buffer_bytes {
+        resp_limits.max_input_buffer_bytes = v;
+    }
+    if let Some(v) = max_nesting_depth {
+        resp_limits.max_nesting_depth = v;
+    }
+    let resp_limits = resp_limits.validate()?;
+    server = server.with_resp_limits(resp_limits);
+    tracing::info!(
+        max_bulk_bytes = resp_limits.max_bulk_bytes,
+        max_array_items = resp_limits.max_array_items,
+        max_line_bytes = resp_limits.max_line_bytes,
+        max_input_buffer_bytes = resp_limits.max_input_buffer_bytes,
+        max_nesting_depth = resp_limits.max_nesting_depth,
+        "RESP protocol limits configured"
+    );
+
     if let Some(t) = token {
         if t.is_empty() {
             anyhow::bail!("--token / DUXX_TOKEN must not be empty");
@@ -176,15 +245,23 @@ async fn main() -> anyhow::Result<()> {
     // --tls-key must be provided together, or neither.
     let tls_cert = tls_cert.or_else(|| std::env::var("DUXX_TLS_CERT").ok());
     let tls_key = tls_key.or_else(|| std::env::var("DUXX_TLS_KEY").ok());
-    match (tls_cert, tls_key) {
-        (Some(cert), Some(key)) => {
+    let tls_client_ca = tls_client_ca.or_else(|| std::env::var("DUXX_TLS_CLIENT_CA").ok());
+    match (tls_cert, tls_key, tls_client_ca) {
+        (Some(cert), Some(key), Some(client_ca)) => {
+            server = server.with_mtls_files(&cert, &key, &client_ca)?;
+            tracing::info!(cert = %cert, client_ca = %client_ca, "mTLS termination ENABLED");
+        }
+        (Some(cert), Some(key), None) => {
             server = server.with_tls_files(&cert, &key)?;
             tracing::info!(cert = %cert, "TLS termination ENABLED");
         }
-        (Some(_), None) | (None, Some(_)) => {
+        (Some(_), None, _) | (None, Some(_), _) => {
             anyhow::bail!("TLS requires BOTH --tls-cert and --tls-key");
         }
-        (None, None) => {}
+        (None, None, Some(_)) => {
+            anyhow::bail!("--tls-client-ca / DUXX_TLS_CLIENT_CA requires TLS cert and key");
+        }
+        (None, None, None) => {}
     }
 
     // Optional memory cap with importance-based eviction (Phase 6.2).
@@ -268,11 +345,18 @@ fn print_help() {
     println!("                         (default: disabled)");
     println!("  --tls-cert PATH        PEM cert chain (Phase 6.2)");
     println!("  --tls-key  PATH        PEM private key (must accompany --tls-cert)");
+    println!("  --tls-client-ca PATH   PEM CA bundle for client certificate auth");
     println!("  --max-memories N       Cap memory rows; oldest decayed-importance");
     println!("                         is evicted on overflow (default: unlimited)");
     println!("  --phase7-storage SPEC  Persist Phase 7 primitives (trace / prompts /");
     println!("                         datasets / evals / replay / cost). New in v0.2.0.");
     println!("                         Defaults to in-memory.");
+    println!("  --max-bulk-bytes N     Max bytes in one RESP bulk string");
+    println!("  --max-array-items N    Max items in one RESP array");
+    println!("  --max-line-bytes N     Max bytes in one RESP line before CRLF");
+    println!("  --max-input-buffer-bytes N");
+    println!("                         Max buffered inbound bytes per connection");
+    println!("  --max-nesting-depth N  Max recursive RESP array depth");
     println!();
     println!("EMBEDDER SPECS:");
     println!("  hash:<dim>                          deterministic toy embedder");
@@ -293,6 +377,9 @@ fn print_help() {
     println!("                                      Single-file redb mode arrives in v0.2.1.");
     println!();
     println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_PHASE7_STORAGE, DUXX_TOKEN,");
-    println!("     DUXX_METRICS_ADDR, DUXX_TLS_CERT, DUXX_TLS_KEY, DUXX_MAX_MEMORIES,");
+    println!("     DUXX_METRICS_ADDR, DUXX_TLS_CERT, DUXX_TLS_KEY, DUXX_TLS_CLIENT_CA,");
+    println!("     DUXX_MAX_MEMORIES,");
+    println!("     DUXX_MAX_BULK_BYTES, DUXX_MAX_ARRAY_ITEMS, DUXX_MAX_LINE_BYTES,");
+    println!("     DUXX_MAX_INPUT_BUFFER_BYTES, DUXX_MAX_NESTING_DEPTH,");
     println!("     OPENAI_API_KEY, COHERE_API_KEY");
 }

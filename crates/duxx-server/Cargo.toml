@@ -42,6 +42,7 @@ assets = [
     ["../../target/release/duxx-grpc",   "usr/bin/duxx-grpc",   "755"],
     ["../../target/release/duxx-mcp",    "usr/bin/duxx-mcp",    "755"],
     ["../../target/release/duxx-export", "usr/bin/duxx-export", "755"],
+    ["../../target/release/duxx-snapshot", "usr/bin/duxx-snapshot", "755"],
     ["../../packaging/systemd/duxxdb.service", "lib/systemd/system/duxxdb.service", "644"],
     ["../../packaging/systemd/duxx.env",       "etc/duxxdb/duxx.env",                "640"],
     ["../../README.md",                        "usr/share/doc/duxxdb/README.md",     "644"],

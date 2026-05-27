@@ -182,8 +182,8 @@ UAT-ready prod-level capabilities for the core daemons.
       then triggers `MemoryStore::Drop` (tantivy commit + HNSW dump)
       so a `dir:` backend reopen takes the fast path.
 - [x] **Backup & restore documented.** `USER_GUIDE.md` § 6 covers
-      Parquet snapshot via cron + a Rust restore stub + a
-      disaster-recovery posture table.
+      `duxx-snapshot create/verify/restore`, Parquet cold-tier export,
+      and a disaster-recovery posture table.
 
 [tonic-health]: https://crates.io/crates/tonic-health
 
@@ -208,6 +208,10 @@ sidecar to be exposed safely.
       / Python `grpc.secure_channel(creds)` work. Health protocol
       stays unencrypted-on-the-internal-port-friendly via separate
       builder.
+- [x] **mTLS client verification** on RESP and gRPC with
+      `--tls-client-ca PATH` / `DUXX_TLS_CLIENT_CA`.
+- [x] **Configurable RESP resource limits** for bulk strings, arrays,
+      line length, input buffers, and recursive nesting.
 - [x] **Row cap + importance-based eviction.**
       `--max-memories N` / `DUXX_MAX_MEMORIES` on `duxx-server`. Once
       exceeded, every `REMEMBER` evicts the row with the lowest
@@ -426,7 +430,6 @@ In-memory store; persistence lands in 7.2b alongside trace persistence.
 
 Tracked, not yet scheduled.
 
-- mTLS (client cert auth).
 - Index-side eviction (HNSW tombstones, tantivy deletes) so cap
   reclaims index memory too — Phase 6.2 only reclaims row + storage
   bytes; the indices retain entries until restart.

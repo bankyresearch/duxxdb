@@ -33,6 +33,7 @@ class Duxxdb < Formula
     bin.install "duxx-grpc"
     bin.install "duxx-mcp"
     bin.install "duxx-export"
+    bin.install "duxx-snapshot"
 
     # Default config + data dirs.
     (etc/"duxxdb").mkpath
@@ -48,6 +49,8 @@ class Duxxdb < Formula
         DUXX_STORAGE=dir:#{var}/lib/duxxdb
         DUXX_EMBEDDER=hash:32
         DUXX_METRICS_ADDR=127.0.0.1:9100
+        # DUXX_TLS_CLIENT_CA=/path/to/client-ca.pem
+        # DUXX_MAX_INPUT_BUFFER_BYTES=33554432
         RUST_LOG=info
       EOS
     end

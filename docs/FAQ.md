@@ -90,8 +90,9 @@ are agent-friendly but not a Postgres replacement for joins, window
 functions, CTEs, etc. Use DuxxDB for the agent path, Postgres for the
 analytics / business path. See [coexistence pattern](INTEGRATION_GUIDE.md#coexistence-keep-postgres--add-duxxdb).
 
-❌ You need **mTLS / per-key RBAC / row-level security**. Phase 6.3+.
-Today DuxxDB has a single shared bearer/AUTH token per daemon.
+❌ You need **per-key RBAC / row-level security**. DuxxDB supports
+mTLS transport authentication, but one bearer/AUTH token still grants
+full access inside a daemon.
 
 ❌ You're indexing **billions of vectors** in a single table.
 hnsw_rs scales well, but at that point you're shopping for Milvus /
@@ -254,9 +255,10 @@ brew / k8s manifests / one-line installer all available.
 
 ### Backups?
 
-Periodic Apache Parquet snapshot via `duxx-export`, then ship to
-S3 / GCS / Azure. Restore by reading the Parquet file back into
-`MemoryStore`. See [USER_GUIDE.md § 6](USER_GUIDE.md#6-backup--restore).
+Use `duxx-snapshot create`, `duxx-snapshot verify`, and
+`duxx-snapshot restore` for restorable filesystem snapshots. Use
+`duxx-export` for Parquet analytics/cold-tier copies. See
+[USER_GUIDE.md § 6](USER_GUIDE.md#6-backup--restore).
 
 ### Replication?
 
@@ -304,7 +306,9 @@ directly.
 
 ### mTLS / per-key RBAC?
 
-Phase 6.3+.
+mTLS is available on RESP and gRPC with `--tls-client-ca` /
+`DUXX_TLS_CLIENT_CA`. Per-key RBAC and row-level security are still
+future work.
 
 ### Sensitive data — PII, PHI?
 
@@ -313,7 +317,7 @@ classify or redact. If your data is regulated:
 
 - Encrypt at rest at the filesystem layer (LUKS / dm-crypt / your
   cloud's volume encryption).
-- Use Phase 6.2 native TLS for the wire.
+- Use native TLS or mTLS for the wire.
 - Pin DuxxDB to a private network; expose only behind a load
   balancer / ingress with auth.
 - Use the `--max-memories` cap + your own retention policy via

@@ -46,6 +46,13 @@ services:
       DUXX_EMBEDDER: "${DUXX_EMBEDDER:-hash:32}"
       DUXX_TOKEN: "${DUXX_TOKEN:?DUXX_TOKEN is required for production. See .env.example.}"
       DUXX_METRICS_ADDR: "0.0.0.0:9100"
+      DUXX_MAX_INPUT_BUFFER_BYTES: "${DUXX_MAX_INPUT_BUFFER_BYTES:-33554432}"
+      DUXX_MAX_BULK_BYTES: "${DUXX_MAX_BULK_BYTES:-16777216}"
+      DUXX_MAX_ARRAY_ITEMS: "${DUXX_MAX_ARRAY_ITEMS:-4096}"
+      DUXX_MAX_LINE_BYTES: "${DUXX_MAX_LINE_BYTES:-65536}"
+      DUXX_MAX_NESTING_DEPTH: "${DUXX_MAX_NESTING_DEPTH:-64}"
+      # To enable native TLS / mTLS, mount certs and add DUXX_TLS_CERT,
+      # DUXX_TLS_KEY, and optionally DUXX_TLS_CLIENT_CA here.
       RUST_LOG: "${RUST_LOG:-info}"
       # Pass through API keys ONLY if you actually use the OpenAI/Cohere
       # embedders. Leave blank otherwise.
