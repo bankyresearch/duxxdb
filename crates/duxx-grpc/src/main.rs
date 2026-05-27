@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let mut token: Option<String> = None;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut tls_client_ca: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -63,6 +64,12 @@ async fn main() -> anyhow::Result<()> {
                 tls_key = Some(
                     args.next()
                         .ok_or_else(|| anyhow::anyhow!("--tls-key needs a path"))?,
+                );
+            }
+            "--tls-client-ca" => {
+                tls_client_ca = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--tls-client-ca needs a path"))?,
                 );
             }
             "--help" | "-h" => {
@@ -124,15 +131,23 @@ async fn main() -> anyhow::Result<()> {
     // must be provided together, or neither.
     let tls_cert = tls_cert.or_else(|| std::env::var("DUXX_TLS_CERT").ok());
     let tls_key = tls_key.or_else(|| std::env::var("DUXX_TLS_KEY").ok());
-    match (tls_cert, tls_key) {
-        (Some(cert), Some(key)) => {
+    let tls_client_ca = tls_client_ca.or_else(|| std::env::var("DUXX_TLS_CLIENT_CA").ok());
+    match (tls_cert, tls_key, tls_client_ca) {
+        (Some(cert), Some(key), Some(client_ca)) => {
+            svc = svc.with_mtls_files(&cert, &key, &client_ca)?;
+            tracing::info!(cert = %cert, client_ca = %client_ca, "gRPC mTLS termination ENABLED");
+        }
+        (Some(cert), Some(key), None) => {
             svc = svc.with_tls_files(&cert, &key)?;
             tracing::info!(cert = %cert, "gRPC TLS termination ENABLED");
         }
-        (Some(_), None) | (None, Some(_)) => {
+        (Some(_), None, _) | (None, Some(_), _) => {
             anyhow::bail!("TLS requires BOTH --tls-cert and --tls-key");
         }
-        (None, None) => {}
+        (None, None, Some(_)) => {
+            anyhow::bail!("--tls-client-ca / DUXX_TLS_CLIENT_CA requires TLS cert and key");
+        }
+        (None, None, None) => {}
     }
 
     tokio::select! {
@@ -159,10 +174,12 @@ fn print_help() {
     println!("                         (default: no auth -- localhost-only safe)");
     println!("  --tls-cert PATH        PEM cert chain   (Phase 6.2)");
     println!("  --tls-key  PATH        PEM private key  (must accompany --tls-cert)");
+    println!("  --tls-client-ca PATH   PEM CA bundle for client certificate auth");
     println!();
     println!("Health: grpc.health.v1.Health/Check is always available");
     println!("(no auth required) for k8s livenessProbe / readinessProbe.");
     println!();
     println!("ENV: DUXX_EMBEDDER, DUXX_STORAGE, DUXX_TOKEN, DUXX_TLS_CERT, DUXX_TLS_KEY,");
+    println!("     DUXX_TLS_CLIENT_CA,");
     println!("     OPENAI_API_KEY, COHERE_API_KEY");
 }

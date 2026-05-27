@@ -96,7 +96,7 @@ fi
 log "extracting"
 tar -xzf "$tmp/$archive" -C "$tmp"
 
-# Archive layout: duxxdb-<version>-<target>/{duxx-server, duxx-grpc, duxx-mcp, duxx-export, ...}
+# Archive layout: duxxdb-<version>-<target>/{duxx-server, duxx-grpc, duxx-mcp, duxx-export, duxx-snapshot, ...}
 src="$tmp/duxxdb-${VERSION}-${target}"
 [ -d "$src" ] || err "unexpected archive layout (no $src)"
 
@@ -114,7 +114,7 @@ mkdir_priv()  { $need_sudo mkdir -p "$1"; }
 install_priv() { $need_sudo install -m 0755 "$1" "$2"; }
 
 mkdir_priv "$INSTALL_DIR"
-for bin in duxx-server duxx-grpc duxx-mcp duxx-export; do
+for bin in duxx-server duxx-grpc duxx-mcp duxx-export duxx-snapshot; do
   if [ -f "$src/$bin" ]; then
     install_priv "$src/$bin" "$INSTALL_DIR/$bin"
     log "  installed $bin"

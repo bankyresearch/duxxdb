@@ -54,6 +54,8 @@ pub struct DuxxService {
     /// uses tonic's tls support (rustls under the hood) so clients
     /// connect over h2 + TLS.
     tls_identity: Option<tonic::transport::Identity>,
+    /// Optional client CA root for mTLS client certificate verification.
+    tls_client_ca: Option<tonic::transport::Certificate>,
 }
 
 impl DuxxService {
@@ -71,6 +73,7 @@ impl DuxxService {
             dim,
             auth_token: None,
             tls_identity: None,
+            tls_client_ca: None,
         }
     }
 
@@ -87,6 +90,7 @@ impl DuxxService {
             dim,
             auth_token: None,
             tls_identity: None,
+            tls_client_ca: None,
         })
     }
 
@@ -107,6 +111,29 @@ impl DuxxService {
         let key = std::fs::read(key_path.as_ref())
             .map_err(|e| anyhow::anyhow!("read TLS key {}: {e}", key_path.as_ref().display()))?;
         self.tls_identity = Some(tonic::transport::Identity::from_pem(cert, key));
+        Ok(self)
+    }
+
+    /// Enable native TLS and require clients to present certificates
+    /// chaining to `client_ca_path`.
+    pub fn with_mtls_files(
+        mut self,
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+        client_ca_path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let cert = std::fs::read(cert_path.as_ref())
+            .map_err(|e| anyhow::anyhow!("read TLS cert {}: {e}", cert_path.as_ref().display()))?;
+        let key = std::fs::read(key_path.as_ref())
+            .map_err(|e| anyhow::anyhow!("read TLS key {}: {e}", key_path.as_ref().display()))?;
+        let client_ca = std::fs::read(client_ca_path.as_ref()).map_err(|e| {
+            anyhow::anyhow!(
+                "read TLS client CA {}: {e}",
+                client_ca_path.as_ref().display()
+            )
+        })?;
+        self.tls_identity = Some(tonic::transport::Identity::from_pem(cert, key));
+        self.tls_client_ca = Some(tonic::transport::Certificate::from_pem(client_ca));
         Ok(self)
     }
 
@@ -158,6 +185,7 @@ impl DuxxService {
             %addr,
             auth = self.auth_token.is_some(),
             tls = self.tls_identity.is_some(),
+            mtls = self.tls_client_ca.is_some(),
             "duxx-grpc listening"
         );
 
@@ -169,12 +197,16 @@ impl DuxxService {
             .await;
 
         let tls_identity = self.tls_identity.clone();
+        let tls_client_ca = self.tls_client_ca.clone();
         let interceptor = self.auth_interceptor();
         let duxx_with_auth = DuxxServer::with_interceptor(self, interceptor);
 
         let mut builder = tonic::transport::Server::builder();
         if let Some(identity) = tls_identity {
-            let tls_cfg = tonic::transport::ServerTlsConfig::new().identity(identity);
+            let mut tls_cfg = tonic::transport::ServerTlsConfig::new().identity(identity);
+            if let Some(client_ca) = tls_client_ca {
+                tls_cfg = tls_cfg.client_ca_root(client_ca);
+            }
             builder = builder
                 .tls_config(tls_cfg)
                 .map_err(|e| anyhow::anyhow!("gRPC TLS config: {e}"))?;

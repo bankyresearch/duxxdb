@@ -465,12 +465,24 @@ duxx-server [OPTIONS]
   --token TOKEN             require AUTH <TOKEN> (default: no auth)
   --drain-secs N            graceful-shutdown drain window (default 30)
   --metrics-addr HOST:PORT  Prometheus + /health endpoint (default: disabled)
+  --tls-cert PATH           PEM cert chain
+  --tls-key PATH            PEM private key
+  --tls-client-ca PATH      require client certificates signed by this CA
+  --max-bulk-bytes N        max RESP bulk string bytes
+  --max-array-items N       max RESP array items
+  --max-line-bytes N        max RESP line bytes
+  --max-input-buffer-bytes N
+                            max buffered inbound bytes per connection
+  --max-nesting-depth N     max RESP array nesting depth
 
 duxx-grpc [OPTIONS]
   --addr HOST:PORT          default 127.0.0.1:50051
   --embedder SPEC           default hash:32
   --storage SPEC            default in-memory only
   --token TOKEN             require Bearer TOKEN (default: no auth)
+  --tls-cert PATH           PEM cert chain
+  --tls-key PATH            PEM private key
+  --tls-client-ca PATH      require client certificates signed by this CA
   # grpc.health.v1.Health is always served (no auth required)
 
 duxx-mcp                    # stdio JSON-RPC; uses DUXX_EMBEDDER + DUXX_STORAGE env
@@ -479,6 +491,11 @@ duxx-export
   --storage SPEC            required
   --out PATH                required Parquet path
   --dim N                   default 32
+
+duxx-snapshot
+  create  --source dir:/var/lib/duxx --out /backups/snap-001
+  verify  --snapshot /backups/snap-001
+  restore --snapshot /backups/snap-001 --target dir:/var/lib/duxx [--force]
 ```
 
 **Auth semantics:**
@@ -492,7 +509,9 @@ duxx-export
   side-channel attacks.
 
 Env vars override defaults but lose to explicit CLI flags:
-`DUXX_EMBEDDER` / `DUXX_STORAGE` / `DUXX_TOKEN` / `DUXX_METRICS_ADDR`.
+`DUXX_EMBEDDER` / `DUXX_STORAGE` / `DUXX_TOKEN` / `DUXX_METRICS_ADDR`,
+`DUXX_TLS_CERT` / `DUXX_TLS_KEY` / `DUXX_TLS_CLIENT_CA`, and the
+`DUXX_MAX_*` protocol limits.
 
 ---
 
@@ -507,12 +526,13 @@ Env vars override defaults but lose to explicit CLI flags:
 | **Prometheus metrics** | ✅ Phase 6.1 | `--metrics-addr 0.0.0.0:9091` exposes `/metrics` (text format) + `/health` |
 | **Graceful shutdown** | ✅ Phase 6.1 | SIGINT/SIGTERM stops accepting new connections, drains for `--drain-secs` (default 30) before exiting. Rolling-deploy safe. |
 | **Native TLS** | ✅ Phase 6.2 | `--tls-cert PATH --tls-key PATH` on RESP and gRPC. rustls-backed. `redis-cli --tls` / `grpcurl` work. |
+| **mTLS (client cert auth)** | ✅ | Add `--tls-client-ca PATH` / `DUXX_TLS_CLIENT_CA` on RESP or gRPC. |
+| **Protocol resource limits** | ✅ | Configure RESP bulk, array, line, input-buffer, and nesting limits with CLI flags or `DUXX_MAX_*`. |
 | **Memory cap + eviction** | ✅ Phase 6.2 | `--max-memories N`. Lowest *effective* (decayed) importance row evicted on overflow. |
 | Multi-tenancy | ⚠ no isolation in process | One `--storage dir:./tenant-X` daemon per tenant for now |
 | RBAC | ✗ | Deferred to Phase 6.3+ |
-| mTLS (client cert auth) | ✗ | Deferred to Phase 6.3+ |
 | Sharding / replication | ✗ | Single node; replicate at the orchestration layer (Kubernetes) for now |
-| Backups | ✅ Parquet export | See [§ 3.5](#35-cold-tier-export-to-parquet) and [§ 6](#6-backup--restore) below |
+| Backups | ✅ Snapshot CLI + Parquet export | Use `duxx-snapshot` for restoreable filesystem snapshots; use `duxx-export` for analytics/cold tier. |
 
 ### Production startup recipe
 
@@ -524,8 +544,10 @@ duxx-server \
   --token "$(cat /etc/duxx/token)" \
   --tls-cert /etc/letsencrypt/live/duxxdb.example.com/fullchain.pem \
   --tls-key  /etc/letsencrypt/live/duxxdb.example.com/privkey.pem \
+  --tls-client-ca /etc/duxx/client-ca.pem \
   --metrics-addr 127.0.0.1:9091 \
   --max-memories 1000000 \
+  --max-input-buffer-bytes 33554432 \
   --drain-secs 60
 ```
 
@@ -536,7 +558,8 @@ duxx-grpc \
   --embedder openai:text-embedding-3-small \
   --token "$(cat /etc/duxx/token)" \
   --tls-cert /etc/letsencrypt/live/duxxdb.example.com/fullchain.pem \
-  --tls-key  /etc/letsencrypt/live/duxxdb.example.com/privkey.pem
+  --tls-key  /etc/letsencrypt/live/duxxdb.example.com/privkey.pem \
+  --tls-client-ca /etc/duxx/client-ca.pem
 ```
 
 K8s liveness probe:
@@ -560,7 +583,42 @@ readinessProbe:
 
 ## 6. Backup & restore
 
-### Backup — periodic Parquet dump
+### Backup - restorable filesystem snapshot
+
+Stop `duxx-server` or otherwise quiesce writes before creating an
+offline snapshot. The snapshot includes all files under the storage
+directory, including Phase 7 primitive backends when
+`DUXX_PHASE7_STORAGE` is inside that same tree.
+
+```bash
+duxx-snapshot create \
+  --source dir:/var/lib/duxx \
+  --out /var/backups/duxx/$(date +%Y%m%d-%H%M%S)
+
+duxx-snapshot verify \
+  --snapshot /var/backups/duxx/20260527-210000
+```
+
+Each snapshot has a `manifest.json` with file sizes and SHA-256 hashes.
+
+### Restore - from a verified snapshot
+
+```bash
+sudo systemctl stop duxxdb
+
+duxx-snapshot restore \
+  --snapshot /var/backups/duxx/20260527-210000 \
+  --target dir:/var/lib/duxx \
+  --force
+
+sudo systemctl start duxxdb
+```
+
+`--force` moves the existing target directory aside as
+`<target>.pre-restore-<timestamp>` before copying data back. It does
+not delete the old directory.
+
+### Cold-tier export - periodic Parquet dump
 
 ```cron
 # /etc/cron.hourly/duxx-backup
@@ -573,42 +631,16 @@ readinessProbe:
 Uploads to S3 / GCS / Azure are a follow-on `aws s3 cp …` — treat
 the parquet file as any other artifact.
 
-### Restore — from Parquet back into DuxxDB
-
-There's no auto-import yet (Phase 6.2). Until then, write a small
-Rust program against `MemoryStore` that reads the Parquet file via
-the `parquet` crate and calls `remember()` for each row:
-
-```rust
-use duxx_memory::{MemoryStore, Memory};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::fs::File;
-
-fn main() -> anyhow::Result<()> {
-    let store = MemoryStore::open_at(1536, 100_000, "/var/lib/duxx")?;
-    let file = File::open("/var/cold/snapshot.parquet")?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-    for batch in reader {
-        let batch = batch?;
-        // … decode columns, call store.remember(...) for each row …
-    }
-    Ok(())
-}
-```
-
-The `bench/comparative/bench.py` harness has a similar pattern in
-Python via `pyarrow` — copy that loop and point it at your file.
-
 ### Disaster recovery posture
 
 | Failure | Recovery |
 |---|---|
 | Server crashed (panic / SIGKILL) | Restart — auto-rebuilds tantivy + HNSW from `redb` rows. Sub-minute for 100k memories; minutes for 1M. |
-| Disk corruption on `redb` | Restore from latest Parquet dump (hourly). |
-| Disk lost entirely | Restore from latest Parquet dump in object storage. |
+| Disk corruption on `redb` | Restore from latest verified `duxx-snapshot`. |
+| Disk lost entirely | Restore from latest verified snapshot copied from object storage. |
 | Single bad memory | Manually `DEL` via the row store, or `--remove` flag (Phase 6.2). |
 
-### Public-internet checklist (Phase 6.2 ready)
+### Public-internet checklist
 
 For an internet-exposed deployment:
 
@@ -622,8 +654,8 @@ For an internet-exposed deployment:
 7. Run as a non-root user (the `.deb` does this automatically).
 8. Bind metrics + health to localhost only; expose RESP/gRPC publicly.
 
-Multi-tenant SaaS deployments still need Phase 6.3+ (mTLS, per-key
-RBAC, sharding) — see [ROADMAP.md](ROADMAP.md).
+Multi-tenant SaaS deployments still need Phase 6.3+ (per-key RBAC,
+tenant isolation, sharding) — see [ROADMAP.md](ROADMAP.md).
 
 ---
 

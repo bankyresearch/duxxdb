@@ -227,6 +227,8 @@ Windows.
   no OpenSSL dependency. RESP via tokio-rustls in the accept loop;
   gRPC via tonic's `tls` feature. `redis-cli --tls`, `grpcurl --tls`,
   any rustls / OpenSSL client connect directly.
+- **mTLS client verification.** Add `--tls-client-ca PATH` /
+  `DUXX_TLS_CLIENT_CA` to require client certificates on RESP or gRPC.
 - **Health.** gRPC standard `grpc.health.v1.Health` via [tonic-health];
   RESP exposes `/health` on the metrics listener.
 - **Prometheus metrics.** `--metrics-addr HOST:PORT` /
@@ -239,8 +241,8 @@ Windows.
   `DUXX_MAX_MEMORIES` enforces a soft row cap. On overflow, the
   lowest *effective* (decayed) importance row is evicted first —
   agent-friendly forgetting, not naive LRU.
-- **Backup.** Cron-driven Parquet snapshots; restore stub +
-  disaster-recovery posture documented in
+- **Backup.** Offline `duxx-snapshot create/verify/restore` with a
+  SHA-256 manifest, plus Parquet cold-tier export, documented in
   [USER_GUIDE.md § 6](USER_GUIDE.md#6-backup--restore).
 
 [tonic-health]: https://crates.io/crates/tonic-health
@@ -550,7 +552,7 @@ Full version: [ROADMAP.md](ROADMAP.md). Snapshot:
 | 7.4 | `duxx-eval` — eval runs + scorers + regression detection | Planned |
 | 7.5 | `duxx-replay` — deterministic agent replay | Planned |
 | 7.6 | `duxx-cost` — token + cost ledger with budgets | Planned |
-| 6.3+ | mTLS, distributed mode, RBAC, OpenTelemetry, SIMD tuning | Future |
+| 6.3+ | distributed mode, RBAC, OpenTelemetry, SIMD tuning | Future |
 | Lance | As alternate `Storage` impl | Designed; not blocking — redb covers durability |
 
 ---
@@ -559,33 +561,31 @@ Full version: [ROADMAP.md](ROADMAP.md). Snapshot:
 
 We're **public-ready** (v0.1). Honest list of what's still missing:
 
-1. **No mTLS** (client-cert auth). Single shared bearer/AUTH token
-   per daemon today. Per-client cert verification lands in Phase 6.3+.
-2. **No per-key / per-agent RBAC.** One token grants full access to
+1. **No per-key / per-agent RBAC.** One token grants full access to
    all keys. Phase 6.3+.
-3. **No multi-tenant isolation** in a single process. Run one
+2. **No multi-tenant isolation** in a single process. Run one
    `--storage dir:./tenant-X` daemon per tenant for now.
-4. **Eviction reclaims rows but not index memory.** When the
+3. **Eviction reclaims rows but not index memory.** When the
    `--max-memories` cap evicts a row, the row store + duxx-memory
    row map drop it (so `recall` never returns it again), but the
    HNSW + tantivy entries stay until the next process restart.
    Index-side tombstones are Phase 6.3.
-5. **No SIMD-tuned distance kernels yet.** `hnsw_rs` has decent SIMD
+4. **No SIMD-tuned distance kernels yet.** `hnsw_rs` has decent SIMD
    internally; future work may swap to AVX-512 hand-tuned routines.
-6. **Single node only.** No sharding / replication. Phase 6.3+.
-7. **No schema migrations.** Tables are immutable in shape; the row
+5. **Single node only.** No sharding / replication. Phase 6.3+.
+6. **No schema migrations.** Tables are immutable in shape; the row
    store is just bytes-keyed today.
-8. **Public API may shift** before v1.0. Pin a git SHA / tag, not
+7. **Public API may shift** before v1.0. Pin a git SHA / tag, not
    `master`, if stability matters. The `duxx-memory` surface has been
    stable since Phase 2.6.
-9. **Comparative bench has 3 wired-but-unrun targets** (Redis Stack,
+8. **Comparative bench has 3 wired-but-unrun targets** (Redis Stack,
    Qdrant, pgvector). Numbers fill in once Docker daemon is up on a
    bench host.
 
-With Phase 6.2 shipped (native TLS, eviction) DuxxDB is suitable for
-**public-internet exposure** behind a TLS cert (Let's Encrypt /
-cert-manager / your CA) — no sidecar required. Multi-tenant SaaS
-deployment still wants Phase 6.3+ (mTLS, RBAC, sharding).
+With native TLS, mTLS, auth, resource limits, and eviction, DuxxDB is
+suitable for single-tenant network exposure behind an operator-managed
+certificate. Multi-tenant SaaS deployment still wants Phase 6.3+
+(RBAC, tenant isolation, sharding).
 
 ---
 

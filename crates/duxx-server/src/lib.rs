@@ -87,6 +87,9 @@ pub struct Server {
     /// Optional Prometheus metrics. When Some, accept-loop + handler
     /// hooks update counters. Use [`Server::with_metrics`] to attach.
     metrics: Option<metrics::Metrics>,
+    /// Runtime bounds for RESP frame parsing and per-connection input
+    /// buffering.
+    resp_limits: resp::RespLimits,
     /// When Some, the accept loop wraps each TcpStream in a rustls
     /// TlsStream before handing it to `handle_connection`. Phase 6.2.
     tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -148,6 +151,7 @@ impl Server {
             auth_token: None,
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
+            resp_limits: resp::RespLimits::default(),
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
@@ -173,6 +177,12 @@ impl Server {
         self
     }
 
+    /// Override RESP parser and per-connection buffering limits.
+    pub fn with_resp_limits(mut self, limits: resp::RespLimits) -> Self {
+        self.resp_limits = limits;
+        self
+    }
+
     /// Enable TLS termination on the listener. Pass paths to a
     /// PEM-encoded certificate chain and private key. Once set,
     /// every accepted TCP stream is upgraded to rustls before any
@@ -186,6 +196,19 @@ impl Server {
         key_path: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Self> {
         let cfg = tls::load_server_config(cert_path, key_path)?;
+        self.tls_config = Some(cfg);
+        Ok(self)
+    }
+
+    /// Enable TLS termination and require clients to present a
+    /// certificate chaining to `client_ca_path`.
+    pub fn with_mtls_files(
+        mut self,
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+        client_ca_path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let cfg = tls::load_server_config_with_client_ca(cert_path, key_path, client_ca_path)?;
         self.tls_config = Some(cfg);
         Ok(self)
     }
@@ -341,6 +364,7 @@ impl Server {
             auth_token: None,
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
+            resp_limits: resp::RespLimits::default(),
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
@@ -373,6 +397,7 @@ impl Server {
             auth_token: None,
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
+            resp_limits: resp::RespLimits::default(),
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
@@ -535,6 +560,7 @@ impl Server {
         let mut buf = bytes::BytesMut::with_capacity(4096);
         let mut out = Vec::with_capacity(1024);
         let mut state = SubState::default();
+        let resp_limits = self.resp_limits;
         // Pre-authed when no token is configured. Otherwise stays
         // false until the client issues AUTH <token>.
         let mut authed = self.auth_token.is_none();
@@ -542,7 +568,7 @@ impl Server {
         loop {
             // Drain any complete commands already in `buf`.
             loop {
-                match resp::parse(&mut buf) {
+                match resp::parse_with_limits(&mut buf, resp_limits) {
                     Ok(Some(v)) => {
                         out.clear();
                         let action = self.dispatch_with_auth(v, state.is_subscribed(), &mut authed);
@@ -616,11 +642,11 @@ impl Server {
                         read = socket.read_buf(&mut buf) => {
                             let n = read?;
                             if n == 0 { return Ok(()); }
-                            if buf.len() > resp::MAX_INPUT_BUFFER_BYTES {
+                            if buf.len() > resp_limits.max_input_buffer_bytes {
                                 out.clear();
                                 RespValue::Error(format!(
                                     "ERR request buffer too large (max {} bytes)",
-                                    resp::MAX_INPUT_BUFFER_BYTES
+                                    resp_limits.max_input_buffer_bytes
                                 ))
                                 .write_to(&mut out);
                                 socket.write_all(&out).await?;
@@ -665,11 +691,11 @@ impl Server {
                     if n == 0 {
                         return Ok(());
                     }
-                    if buf.len() > resp::MAX_INPUT_BUFFER_BYTES {
+                    if buf.len() > resp_limits.max_input_buffer_bytes {
                         out.clear();
                         RespValue::Error(format!(
                             "ERR request buffer too large (max {} bytes)",
-                            resp::MAX_INPUT_BUFFER_BYTES
+                            resp_limits.max_input_buffer_bytes
                         ))
                         .write_to(&mut out);
                         socket.write_all(&out).await?;

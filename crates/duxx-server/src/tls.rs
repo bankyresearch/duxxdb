@@ -1,27 +1,26 @@
 //! TLS support for `duxx-server`.
 //!
-//! rustls + tokio-rustls. No OpenSSL, no platform certs — operators
-//! provide an explicit cert + key pair on disk (typically the same
-//! files served by their LB / cert-manager / Let's Encrypt setup).
+//! rustls + tokio-rustls. No OpenSSL, no platform certs: operators
+//! provide an explicit cert + key pair on disk. When a client CA bundle
+//! is also configured, the server verifies client certificates and runs
+//! in mTLS mode.
 //!
 //! ## What this gives you
 //!
 //! Once a server is built with [`Server::with_tls_files`], the accept
-//! loop terminates TLS *inside* `duxx-server` and feeds the decrypted
+//! loop terminates TLS inside `duxx-server` and feeds the decrypted
 //! stream to the same `handle_connection` path used for plain TCP. So:
 //!
 //! - The auth + drain + metrics paths all run unchanged.
-//! - Clients connect with `redis-cli --tls` (or any RESP client that
-//!   speaks rustls / OpenSSL).
-//! - You no longer need a TLS-terminating sidecar to expose DuxxDB on
-//!   a public network.
+//! - Clients connect with `redis-cli --tls` or any RESP client that
+//!   speaks rustls / OpenSSL.
+//! - Operators can enable client certificate verification with
+//!   [`Server::with_mtls_files`].
 //!
 //! ## What this does NOT do
 //!
-//! - mTLS (client cert auth) — that's Phase 6.3+.
-//! - Automatic cert reloading — restart the daemon to pick up new
-//!   files. cert-manager + a sidecar renewer is the standard pattern.
-//! - SNI multiplexing — one cert per listener.
+//! - Automatic cert reloading: restart the daemon to pick up new files.
+//! - SNI multiplexing: one cert per listener.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -29,7 +28,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
+use rustls::server::danger::ClientCertVerifier;
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
 
 /// Load a PEM-encoded cert + key from disk and build a rustls
 /// `ServerConfig` ready for `tokio_rustls::TlsAcceptor`.
@@ -41,12 +42,31 @@ pub fn load_server_config(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
 ) -> anyhow::Result<Arc<ServerConfig>> {
-    // Process-wide default crypto provider. Idempotent — install once,
+    load_server_config_inner(cert_path.as_ref(), key_path.as_ref(), None)
+}
+
+/// Load a server TLS config that also verifies client certificates
+/// against the supplied PEM CA bundle.
+pub fn load_server_config_with_client_ca(
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+    client_ca_path: impl AsRef<Path>,
+) -> anyhow::Result<Arc<ServerConfig>> {
+    load_server_config_inner(
+        cert_path.as_ref(),
+        key_path.as_ref(),
+        Some(client_ca_path.as_ref()),
+    )
+}
+
+fn load_server_config_inner(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca_path: Option<&Path>,
+) -> anyhow::Result<Arc<ServerConfig>> {
+    // Process-wide default crypto provider. Idempotent: install once,
     // ignore the "already installed" error if a different caller beat us.
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cert_path = cert_path.as_ref();
-    let key_path = key_path.as_ref();
 
     let certs = load_certs(cert_path)?;
     if certs.is_empty() {
@@ -54,12 +74,38 @@ pub fn load_server_config(
     }
     let key = load_private_key(key_path)?;
 
-    let cfg = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("rustls: invalid cert/key combination: {e}"))?;
+    let cfg = match client_ca_path {
+        Some(path) => {
+            let verifier = client_cert_verifier(path)?;
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+        }
+        None => ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key),
+    }
+    .map_err(|e| anyhow::anyhow!("rustls: invalid cert/key combination: {e}"))?;
 
     Ok(Arc::new(cfg))
+}
+
+fn client_cert_verifier(path: &Path) -> anyhow::Result<Arc<dyn ClientCertVerifier>> {
+    let certs = load_certs(path)?;
+    if certs.is_empty() {
+        anyhow::bail!("no client CA certificates found in {}", path.display());
+    }
+
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| anyhow::anyhow!("invalid client CA {}: {e}", path.display()))?;
+    }
+
+    WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| anyhow::anyhow!("client CA verifier: {e}"))
 }
 
 fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
@@ -109,6 +155,13 @@ mod tests {
         let (_dir, cert, key) = self_signed_pair();
         let cfg = load_server_config(&cert, &key).expect("load");
         // ServerConfig is opaque; just confirm we got an Arc out.
+        assert!(Arc::strong_count(&cfg) >= 1);
+    }
+
+    #[test]
+    fn loads_self_signed_cert_with_client_ca() {
+        let (_dir, cert, key) = self_signed_pair();
+        let cfg = load_server_config_with_client_ca(&cert, &key, &cert).expect("load");
         assert!(Arc::strong_count(&cfg) >= 1);
     }
 

@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "duxx-export"
 path = "src/main.rs"
 
+[[bin]]
+name = "duxx-snapshot"
+path = "src/snapshot.rs"
+
 [dependencies]
 duxx-core.workspace = true
 duxx-memory.workspace = true
@@ -27,3 +31,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
