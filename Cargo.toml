@@ -85,7 +85,7 @@ async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Prometheus metrics (Phase 6.1)
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
