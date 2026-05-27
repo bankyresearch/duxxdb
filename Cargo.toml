@@ -80,7 +80,7 @@ napi-build = "2"
 tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
 tonic-health = "0.12"
-prost = "0.13"
+prost = "0.14"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
