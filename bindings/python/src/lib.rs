@@ -606,7 +606,7 @@ fn py_to_json(py: Python<'_>, obj: Option<&Bound<'_, PyAny>>) -> PyResult<serde_
     if obj.is_none() {
         return Ok(serde_json::Value::Null);
     }
-    let json_mod = py.import_bound("json")?;
+    let json_mod = py.import("json")?;
     let dumps = json_mod.getattr("dumps")?;
     let s: String = dumps.call1((obj,))?.extract()?;
     serde_json::from_str(&s)
@@ -617,7 +617,7 @@ fn py_to_json(py: Python<'_>, obj: Option<&Bound<'_, PyAny>>) -> PyResult<serde_
 /// a string in [`Prompt`] and only inflate it when the user
 /// touches the attribute.
 fn json_str_to_py(py: Python<'_>, json: &str) -> PyResult<PyObject> {
-    let json_mod = py.import_bound("json")?;
+    let json_mod = py.import("json")?;
     let loads = json_mod.getattr("loads")?;
     Ok(loads.call1((json,))?.unbind())
 }
