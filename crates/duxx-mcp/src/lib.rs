@@ -417,7 +417,8 @@ impl McpServer {
             .get("value")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_params("missing 'value'"))?;
-        self.sessions.put(sid.to_string(), value.as_bytes().to_vec());
+        self.sessions
+            .put(sid.to_string(), value.as_bytes().to_vec());
         Ok(json!({ "ok": true }))
     }
 
@@ -593,7 +594,12 @@ mod tests {
     #[test]
     fn session_set_then_get_round_trips() {
         let s = McpServer::new();
-        call_tool(&s, 1, "session_set", json!({"session_id":"c1","value":"turn-buffer"}));
+        call_tool(
+            &s,
+            1,
+            "session_set",
+            json!({"session_id":"c1","value":"turn-buffer"}),
+        );
         let got = call_tool(&s, 2, "session_get", json!({"session_id":"c1"}));
         assert_eq!(got["value"], "turn-buffer");
         let miss = call_tool(&s, 3, "session_get", json!({"session_id":"nope"}));

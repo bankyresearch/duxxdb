@@ -143,16 +143,16 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             "--make-snapshot" => {
-                make_snapshot = Some(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--make-snapshot needs a destination dir"))?,
-                );
+                make_snapshot =
+                    Some(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--make-snapshot needs a destination dir")
+                    })?);
             }
             "--bootstrap-snapshot" => {
-                bootstrap_snapshot = Some(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--bootstrap-snapshot needs a snapshot dir"))?,
-                );
+                bootstrap_snapshot =
+                    Some(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--bootstrap-snapshot needs a snapshot dir")
+                    })?);
             }
             "--tls-cert" => {
                 tls_cert = Some(
@@ -273,7 +273,9 @@ async fn main() -> anyhow::Result<()> {
         tenants_dir
             .clone()
             .or_else(|| std::env::var("DUXX_TENANTS_DIR").ok())
-            .ok_or_else(|| anyhow::anyhow!("snapshot commands require --tenants-dir (the data dir)"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("snapshot commands require --tenants-dir (the data dir)")
+            })
     };
 
     // One-shot: snapshot the durable data at the leader's WAL sequence, then
@@ -577,7 +579,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Leader/follower replication (Gap 2) --------------------------------
-    let replication_token = replication_token.or_else(|| std::env::var("DUXX_REPLICATION_TOKEN").ok());
+    let replication_token =
+        replication_token.or_else(|| std::env::var("DUXX_REPLICATION_TOKEN").ok());
 
     // Leader: open the durable WAL and start logging mutations to it.
     if let Some(wal_path) = replication_wal {
@@ -585,7 +588,9 @@ async fn main() -> anyhow::Result<()> {
             duxx_cluster::RedbLog::open(&wal_path)
                 .map_err(|e| anyhow::anyhow!("replication WAL: {e}"))?,
         );
-        let node_id = replication_addr.clone().unwrap_or_else(|| "leader".to_string());
+        let node_id = replication_addr
+            .clone()
+            .unwrap_or_else(|| "leader".to_string());
         let coord = std::sync::Arc::new(duxx_cluster::StaticCoordinator::solo(node_id));
         server = server.with_replication(log, coord);
         if let Some(tok) = &replication_token {
@@ -617,7 +622,8 @@ async fn main() -> anyhow::Result<()> {
         // Persist the applied sequence so a restart resumes instead of
         // re-pulling (and re-applying) from zero.
         let cursor_dir = std::env::var("DUXX_TENANTS_DIR").unwrap_or_else(|_| ".".to_string());
-        let cursor = duxx_cluster::DurableCursor::open(format!("{cursor_dir}/replication-applied.seq"));
+        let cursor =
+            duxx_cluster::DurableCursor::open(format!("{cursor_dir}/replication-applied.seq"));
         std::thread::spawn(move || {
             let mut applied = cursor.load();
             tracing::info!(resume_seq = applied, "replication follower resuming");
@@ -702,7 +708,9 @@ fn print_help() {
     println!("  --replication-leader URL Follower: pull from this leader and apply.");
     println!("  --replication-token TOK  Shared cluster token for replication pulls.");
     println!("  --make-snapshot DIR      One-shot: snapshot --tenants-dir at the WAL seq, exit.");
-    println!("  --bootstrap-snapshot DIR Fresh follower: restore a snapshot, then resume from its seq.");
+    println!(
+        "  --bootstrap-snapshot DIR Fresh follower: restore a snapshot, then resume from its seq."
+    );
     println!("  --drain-secs N         Shutdown drain budget (default 30)");
     println!("  --metrics-addr HOST:PORT  Bind a Prometheus + /health endpoint");
     println!("                         (default: disabled)");

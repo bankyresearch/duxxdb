@@ -326,7 +326,13 @@ fn chunk_text(text: &str, max_chars: usize, overlap: usize) -> Vec<String> {
     let mut start = 0;
     while start < chars.len() {
         let end = (start + max_chars).min(chars.len());
-        out.push(chars[start..end].iter().collect::<String>().trim().to_string());
+        out.push(
+            chars[start..end]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string(),
+        );
         if end == chars.len() {
             break;
         }
@@ -393,16 +399,23 @@ mod tests {
     fn reingest_bumps_version_and_replaces_chunks() {
         let docs = store();
         let uri = "s3://kb/doc.md";
-        let v1 = docs.ingest_text(uri, "text/markdown", "first version about lions").unwrap();
+        let v1 = docs
+            .ingest_text(uri, "text/markdown", "first version about lions")
+            .unwrap();
         assert_eq!(v1.version, 1);
 
-        let v2 = docs.ingest_text(uri, "text/markdown", "second version about tigers").unwrap();
+        let v2 = docs
+            .ingest_text(uri, "text/markdown", "second version about tigers")
+            .unwrap();
         assert_eq!(v2.version, 2, "re-ingest bumps version");
         assert_eq!(v1.id, v2.id, "same uri → same document id");
 
         // Only the new version's content is searchable.
         let hits = docs.search("tigers lions", 10).unwrap();
-        assert!(hits.iter().all(|h| !h.text.contains("lions")), "old chunks must be gone");
+        assert!(
+            hits.iter().all(|h| !h.text.contains("lions")),
+            "old chunks must be gone"
+        );
         assert!(hits.iter().any(|h| h.text.contains("tigers")));
         assert_eq!(docs.list_documents().len(), 1);
     }
@@ -416,7 +429,10 @@ mod tests {
         assert!(!docs.search("falcon", 5).unwrap().is_empty());
 
         assert!(docs.delete(&doc.id, false).unwrap());
-        assert!(docs.search("falcon", 5).unwrap().is_empty(), "deleted doc not searchable");
+        assert!(
+            docs.search("falcon", 5).unwrap().is_empty(),
+            "deleted doc not searchable"
+        );
         assert!(docs.document(&doc.id).is_none());
     }
 
