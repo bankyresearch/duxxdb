@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Duxx Studio</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e; --accent:#a371f7; --good:#3fb950; --bad:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--border); display:flex; align-items:baseline; gap:12px; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:13px; }
+  .auth { padding:16px 24px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:center; }
+  .auth input { flex:1; }
+  input, button, select { font:inherit; padding:8px 11px; border-radius:6px; border:1px solid var(--border); background:#0d1117; color:var(--fg); }
+  button { background:var(--accent); border-color:var(--accent); color:#fff; cursor:pointer; }
+  button:hover { filter:brightness(1.1); }
+  button.tab { background:transparent; color:var(--fg); }
+  button.tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  nav { display:flex; gap:8px; padding:14px 24px 0; flex-wrap:wrap; }
+  main { padding:18px 24px; }
+  .row { display:flex; gap:10px; margin-bottom:14px; align-items:center; }
+  .row input { flex:1; }
+  .stat { display:inline-block; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px 18px; margin-right:12px; }
+  .stat b { display:block; font-size:22px; }
+  .stat span { color:var(--muted); font-size:12px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  pre { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px; overflow:auto; max-height:60vh; }
+  .err { color:var(--bad); }
+  .pill { font-size:11px; padding:1px 8px; border-radius:999px; border:1px solid var(--border); color:var(--muted); }
+</style>
+</head>
+<body>
+<header><h1>Duxx Studio</h1><span class="sub">workspace observability · read-only</span></header>
+<div class="auth">
+  <input id="jwt" placeholder="Paste a workspace JWT (from the Control Console)" />
+  <button onclick="connect()">Connect</button>
+  <span id="who" class="pill"></span>
+</div>
+<nav id="tabs" style="display:none">
+  <button class="tab active" data-tab="overview" onclick="go('overview')">Overview</button>
+  <button class="tab" data-tab="memory" onclick="go('memory')">Memory</button>
+  <button class="tab" data-tab="cost" onclick="go('cost')">Cost</button>
+  <button class="tab" data-tab="evals" onclick="go('evals')">Evals</button>
+  <button class="tab" data-tab="datasets" onclick="go('datasets')">Datasets</button>
+  <button class="tab" data-tab="documents" onclick="go('documents')">Documents</button>
+  <button class="tab" data-tab="replay" onclick="go('replay')">Replay</button>
+  <button class="tab" data-tab="traces" onclick="go('traces')">Traces</button>
+  <button class="tab" data-tab="audit" onclick="go('audit')">Audit</button>
+</nav>
+<main id="view"></main>
+
+<script>
+let JWT = null;
+const view = () => document.getElementById('view');
+const get = (p) => fetch(p,{headers:{authorization:'Bearer '+JWT}}).then(async r=>{const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j;});
+const esc = s => String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function connect(){
+  JWT = document.getElementById('jwt').value.trim();
+  if(!JWT) return;
+  try {
+    const o = await get('/studio/overview');
+    document.getElementById('who').textContent = o.tenant+' · '+o.role;
+    document.getElementById('tabs').style.display='flex';
+    go('overview');
+  } catch(e){ view().innerHTML = `<p class="err">Auth failed: ${esc(e.message)}</p>`; }
+}
+function setTab(t){ document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active', b.dataset.tab===t)); }
+
+async function go(tab){
+  setTab(tab);
+  try {
+    if(tab==='overview'){
+      const o = await get('/studio/overview');
+      view().innerHTML = `<div>
+        <div class="stat"><b>${o.memory_count}</b><span>memories</span></div>
+        <div class="stat"><b>${(o.prompts||[]).length}</b><span>prompts</span></div>
+        <div class="stat"><b>${esc(o.tenant)}</b><span>workspace</span></div></div>
+        <h3>Prompts</h3>${list(o.prompts)}`;
+    } else if(tab==='memory'){
+      view().innerHTML = `<div class="row"><input id="q" placeholder="Search memory…" onkeydown="if(event.key==='Enter')searchMem()"/><input id="k" type="number" value="10" style="max-width:80px"/><button onclick="searchMem()">Recall</button></div><div id="memres" class="muted">Enter a query to search this workspace's memory.</div>`;
+    } else if(tab==='cost'){
+      const c = await get('/studio/cost');
+      view().innerHTML = `<div class="stat"><b>$${Number(c.total_usd).toFixed(4)}</b><span>total spend</span></div>
+        <h3>By model</h3>${table(c.by_model,['key','count','tokens_in','tokens_out','total_usd','mean_usd'])}`;
+    } else if(tab==='evals'){
+      const e = await get('/studio/evals');
+      view().innerHTML = `<h3>Eval runs (${e.runs.length})</h3>${table(e.runs,['id','name','model','status','dataset_name'])}`;
+    } else if(tab==='datasets'){
+      const d = await get('/studio/datasets');
+      view().innerHTML = `<h3>Datasets</h3>${list(d.datasets)}`;
+    } else if(tab==='documents'){
+      const d = await get('/studio/documents');
+      view().innerHTML = `<h3>Documents (${d.documents.length})</h3>${table(d.documents,['uri','content_type','version','chunks'])}`;
+    } else if(tab==='replay'){
+      const r = await get('/studio/replay');
+      view().innerHTML = `<h3>Replay sessions (${r.sessions.length})</h3>${table(r.sessions,['trace_id','captured_at_unix_ns'])}`;
+    } else if(tab==='traces'){
+      view().innerHTML = `<div class="row"><input id="tid" placeholder="trace_id…"/><button onclick="getTrace()">Load trace</button></div><div id="traceres" class="muted">Enter a trace_id to view its spans.</div>`;
+    } else if(tab==='audit'){
+      const a = await get('/studio/audit?limit=200');
+      view().innerHTML = `<h3>Audit trail (${a.events.length})</h3>${table(a.events,['ts_unix_ns','principal','command','outcome'])}`;
+    }
+  } catch(e){ view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+async function searchMem(){
+  const q = document.getElementById('q').value.trim(), k = document.getElementById('k').value||10;
+  if(!q) return;
+  try { const r = await get('/studio/memory?q='+encodeURIComponent(q)+'&k='+k);
+    document.getElementById('memres').innerHTML = r.hits.length ? table(r.hits,['id','score','text']) : '<p class="muted">no hits</p>';
+  } catch(e){ document.getElementById('memres').innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+async function getTrace(){
+  const tid = document.getElementById('tid').value.trim(); if(!tid) return;
+  try { const r = await get('/studio/traces?trace_id='+encodeURIComponent(tid));
+    document.getElementById('traceres').innerHTML = r.spans.length ? `<pre>${esc(JSON.stringify(r.spans,null,2))}</pre>` : '<p class="muted">no spans for that trace_id</p>';
+  } catch(e){ document.getElementById('traceres').innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+function list(arr){ arr=arr||[]; return arr.length ? '<ul>'+arr.map(x=>`<li class="mono">${esc(x)}</li>`).join('')+'</ul>' : '<p class="muted">none</p>'; }
+function table(rows,cols){ rows=rows||[]; if(!rows.length) return '<p class="muted">none</p>';
+  return `<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>${
+    rows.map(r=>`<tr>${cols.map(c=>`<td class="mono">${esc(r[c]??'')}</td>`).join('')}</tr>`).join('')}</tbody></table>`; }
+</script>
+</body>
+</html>

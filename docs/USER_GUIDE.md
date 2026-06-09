@@ -463,6 +463,8 @@ duxx-server [OPTIONS]
   --embedder SPEC           default hash:32
   --storage SPEC            default in-memory only
   --token TOKEN             require AUTH <TOKEN> (default: no auth)
+  --auth-key SPEC           principal:token:role[:tenant], repeatable
+                            roles: read, write, admin
   --drain-secs N            graceful-shutdown drain window (default 30)
   --metrics-addr HOST:PORT  Prometheus + /health endpoint (default: disabled)
   --tls-cert PATH           PEM cert chain
@@ -474,6 +476,9 @@ duxx-server [OPTIONS]
   --max-input-buffer-bytes N
                             max buffered inbound bytes per connection
   --max-nesting-depth N     max RESP array nesting depth
+  --audit-log PATH          append JSON-lines security audit events
+  --max-connections N       active connection cap
+  --max-commands-per-sec N  per-connection command rate limit
 
 duxx-grpc [OPTIONS]
   --addr HOST:PORT          default 127.0.0.1:50051
@@ -511,7 +516,7 @@ duxx-snapshot
 Env vars override defaults but lose to explicit CLI flags:
 `DUXX_EMBEDDER` / `DUXX_STORAGE` / `DUXX_TOKEN` / `DUXX_METRICS_ADDR`,
 `DUXX_TLS_CERT` / `DUXX_TLS_KEY` / `DUXX_TLS_CLIENT_CA`, and the
-`DUXX_MAX_*` protocol limits.
+`DUXX_AUTH_KEYS`, `DUXX_AUDIT_LOG`, and `DUXX_MAX_*` limits.
 
 ---
 
@@ -522,15 +527,17 @@ Env vars override defaults but lose to explicit CLI flags:
 | Durability | ✅ via `--storage dir:` | Pin `--storage dir:...`; hard-kill safe via cold-path rebuild |
 | Cross-restart decay | ✅ Phase 2.4 | Set per-store half-life via `recall_decayed` in code |
 | **Auth** | ✅ Phase 6.1 — token-based | Set `--token` / `DUXX_TOKEN` (≥ 16 chars). Clients issue `AUTH <token>` (RESP) or `authorization: Bearer <token>` (gRPC). |
+| **RBAC API keys** | ✅ RESP | `--auth-key principal:token:role[:tenant]` / `DUXX_AUTH_KEYS`. Roles are `read`, `write`, `admin`. |
+| **Audit logs** | ✅ RESP | `--audit-log PATH` / `DUXX_AUDIT_LOG` writes JSON-lines auth, denied, and mutating/admin command events. |
 | **Health probes** | ✅ Phase 6.1 | gRPC: `grpc.health.v1.Health/Check`. HTTP: `GET /health` on the metrics port. |
 | **Prometheus metrics** | ✅ Phase 6.1 | `--metrics-addr 0.0.0.0:9091` exposes `/metrics` (text format) + `/health` |
 | **Graceful shutdown** | ✅ Phase 6.1 | SIGINT/SIGTERM stops accepting new connections, drains for `--drain-secs` (default 30) before exiting. Rolling-deploy safe. |
 | **Native TLS** | ✅ Phase 6.2 | `--tls-cert PATH --tls-key PATH` on RESP and gRPC. rustls-backed. `redis-cli --tls` / `grpcurl` work. |
 | **mTLS (client cert auth)** | ✅ | Add `--tls-client-ca PATH` / `DUXX_TLS_CLIENT_CA` on RESP or gRPC. |
-| **Protocol resource limits** | ✅ | Configure RESP bulk, array, line, input-buffer, and nesting limits with CLI flags or `DUXX_MAX_*`. |
+| **Protocol resource limits** | ✅ | Configure RESP bulk, array, line, input-buffer, nesting, connection, and command-rate limits with CLI flags or `DUXX_MAX_*`. |
 | **Memory cap + eviction** | ✅ Phase 6.2 | `--max-memories N`. Lowest *effective* (decayed) importance row evicted on overflow. |
 | Multi-tenancy | ⚠ no isolation in process | One `--storage dir:./tenant-X` daemon per tenant for now |
-| RBAC | ✗ | Deferred to Phase 6.3+ |
+| Multi-tenant shared daemon | ⚠ core RESP only | Tenant-scoped `DUXX_AUTH_KEYS` namespace memory/session keys and cost filters for tenant-safe commands. Extended Phase 7 registries should still run per tenant until full row-level isolation lands. |
 | Sharding / replication | ✗ | Single node; replicate at the orchestration layer (Kubernetes) for now |
 | Backups | ✅ Snapshot CLI + Parquet export | Use `duxx-snapshot` for restoreable filesystem snapshots; use `duxx-export` for analytics/cold tier. |
 
@@ -546,8 +553,11 @@ duxx-server \
   --tls-key  /etc/letsencrypt/live/duxxdb.example.com/privkey.pem \
   --tls-client-ca /etc/duxx/client-ca.pem \
   --metrics-addr 127.0.0.1:9091 \
+  --audit-log /var/log/duxxdb/audit.jsonl \
   --max-memories 1000000 \
   --max-input-buffer-bytes 33554432 \
+  --max-connections 10000 \
+  --max-commands-per-sec 1000 \
   --drain-secs 60
 ```
 
@@ -645,6 +655,10 @@ the parquet file as any other artifact.
 For an internet-exposed deployment:
 
 1. `--tls-cert` + `--tls-key` (Let's Encrypt / cert-manager / your CA).
+2. `--tls-client-ca` when clients can hold certificates.
+3. `--token` for simple admin mode, or `DUXX_AUTH_KEYS` for
+   read/write/admin principals.
+4. `--audit-log /var/log/duxxdb/audit.jsonl`, shipped to your SIEM.
 2. `--token` (≥ 16 chars; rotate via env reload + restart).
 3. `--storage dir:/var/lib/duxxdb` for full persistence.
 4. `--max-memories N` so a runaway client can't OOM the box.

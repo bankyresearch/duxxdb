@@ -139,9 +139,12 @@ out of one codebase. Pure Rust, no GC pauses.
 
 #### Production hardening (Phase 6.1 + 6.2)
 - Token auth (`--token` / `DUXX_TOKEN`)
+- Role-based RESP API keys (`DUXX_AUTH_KEYS`) with read/write/admin roles
+- JSON-lines security audit log (`DUXX_AUDIT_LOG`)
 - **Native TLS** on RESP + gRPC (rustls)
 - **mTLS client verification** with `--tls-client-ca`
 - **Configurable RESP resource limits** (`DUXX_MAX_*`)
+- Connection and per-connection command-rate caps
 - Prometheus `/metrics` + `/health`
 - gRPC `grpc.health.v1.Health` protocol
 - Graceful shutdown drain

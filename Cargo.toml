@@ -20,6 +20,11 @@ members = [
     "crates/duxx-eval",
     "crates/duxx-replay",
     "crates/duxx-cost",
+    "crates/duxx-tenant",
+    "crates/duxx-docs",
+    "crates/duxx-token",
+    "crates/duxx-control",
+    "crates/duxx-cluster",
     "bindings/python",
 ]
 # bindings/node is intentionally NOT a workspace member: napi-build
@@ -121,6 +126,11 @@ duxx-datasets = { path = "crates/duxx-datasets", version = "0.2.2" }
 duxx-eval = { path = "crates/duxx-eval", version = "0.2.2" }
 duxx-replay = { path = "crates/duxx-replay", version = "0.2.2" }
 duxx-cost = { path = "crates/duxx-cost", version = "0.2.2" }
+duxx-tenant = { path = "crates/duxx-tenant", version = "0.2.2" }
+duxx-token = { path = "crates/duxx-token", version = "0.2.2" }
+duxx-control = { path = "crates/duxx-control", version = "0.2.2" }
+duxx-cluster = { path = "crates/duxx-cluster", version = "0.2.2" }
+duxx-docs = { path = "crates/duxx-docs", version = "0.2.2" }
 
 # HTTP client for OpenAI / Cohere embedders. rustls-tls = no OpenSSL native build,
 # blocking = sync API matches our embedder trait.
@@ -129,6 +139,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Durable storage backend. Pure Rust, ACID, MVCC, no FFI.
 redb = "2"
 bincode = "1.3"
+
+# Signed short-lived credentials (Phase B). HS256 + EdDSA via a maintained JWT
+# lib — never hand-rolled crypto. `ring` (already in the tree via rustls) does
+# the Ed25519 keypair generation.
+jsonwebtoken = "9"
+ring = "0.17"
 
 [profile.release]
 lto = "thin"

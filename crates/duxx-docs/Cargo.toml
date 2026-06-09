@@ -1,0 +1,20 @@
+[package]
+name = "duxx-docs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Document-intelligence layer for DuxxDB: ingest objects from any store (S3/MinIO/Supabase Storage/local), chunk + embed + index for hybrid retrieval with citations."
+
+[dependencies]
+duxx-core.workspace = true
+duxx-memory.workspace = true
+duxx-embed.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

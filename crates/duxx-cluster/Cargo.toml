@@ -1,0 +1,21 @@
+[package]
+name = "duxx-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+# DuxxDB Enterprise — source-available (NOT OSS); see ../../LICENSE-BSL.
+license = "BUSL-1.1"
+publish = false
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Replication scaffold for DuxxDB (Phase D): a sequenced change feed leaders append to and followers tail. Interfaces + in-memory impl + convergence tests — NOT production networking."
+
+[dependencies]
+duxx-storage = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

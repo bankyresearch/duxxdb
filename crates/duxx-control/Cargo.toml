@@ -1,0 +1,34 @@
+[package]
+name = "duxx-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+# DuxxDB Enterprise — source-available (NOT OSS); see ../../LICENSE-BSL.
+license = "BUSL-1.1"
+publish = false
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "DuxxDB managed-cloud control plane: orgs, projects, API keys, provisioning, and usage metering (Phase B kickoff)."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "duxx-control"
+path = "src/main.rs"
+
+[dependencies]
+duxx-token = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+# HTTP API (Phase B service).
+anyhow = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }

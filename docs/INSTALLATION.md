@@ -536,6 +536,8 @@ The most-used knobs:
 | Variable | CLI flag | Default | Notes |
 |---|---|---|---|
 | `DUXX_TOKEN` | `--token` | (none) | Required in production. Empty = no auth. |
+| `DUXX_AUTH_KEYS` | `--auth-key` | (off) | Comma-separated `principal:token:role[:tenant]` catalog for RESP RBAC. |
+| `DUXX_AUDIT_LOG` | `--audit-log` | (off) | JSON-lines security audit events. |
 | `DUXX_STORAGE` | `--storage` | `memory:_` | Use `dir:./path` for full persistence. |
 | `DUXX_EMBEDDER` | `--embedder` | `hash:32` | OpenAI / Cohere need an API key env. |
 | `DUXX_METRICS_ADDR` | `--metrics-addr` | (off) | `127.0.0.1:9100` is the convention. |
@@ -548,6 +550,8 @@ The most-used knobs:
 | `DUXX_MAX_ARRAY_ITEMS` | `--max-array-items` | `4096` | Max RESP array items. |
 | `DUXX_MAX_LINE_BYTES` | `--max-line-bytes` | `65536` | Max RESP line bytes before CRLF. |
 | `DUXX_MAX_NESTING_DEPTH` | `--max-nesting-depth` | `64` | Max RESP array nesting depth. |
+| `DUXX_MAX_CONNECTIONS` | `--max-connections` | (off) | Active connection cap. |
+| `DUXX_MAX_COMMANDS_PER_SEC` | `--max-commands-per-sec` | (off) | Per-connection command rate cap. |
 | — | `--addr` | `127.0.0.1:6379` | RESP listen address. |
 | — | `--drain-secs` | `30` | SIGTERM drain budget. |
 | `RUST_LOG` | — | `info` | Use `debug` for troubleshooting. |

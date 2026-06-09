@@ -222,6 +222,9 @@ Windows.
 - **Auth.** `--token TOKEN` / `DUXX_TOKEN` on `duxx-server` (RESP) and
   `duxx-grpc`; constant-time compare; RESP `NOAUTH` / `WRONGPASS` flow,
   gRPC `x-duxx-token` metadata via tonic Interceptor.
+- **RESP RBAC + audit.** `DUXX_AUTH_KEYS` adds read/write/admin API
+  keys with optional tenant scopes for tenant-safe core commands.
+  `DUXX_AUDIT_LOG` writes JSON-lines security events.
 - **Native TLS** (Phase 6.2). `--tls-cert PATH --tls-key PATH` /
   `DUXX_TLS_CERT` / `DUXX_TLS_KEY` on both daemons. Pure-Rust rustls;
   no OpenSSL dependency. RESP via tokio-rustls in the accept loop;
@@ -552,7 +555,7 @@ Full version: [ROADMAP.md](ROADMAP.md). Snapshot:
 | 7.4 | `duxx-eval` — eval runs + scorers + regression detection | Planned |
 | 7.5 | `duxx-replay` — deterministic agent replay | Planned |
 | 7.6 | `duxx-cost` — token + cost ledger with budgets | Planned |
-| 6.3+ | distributed mode, RBAC, OpenTelemetry, SIMD tuning | Future |
+| 6.3+ | distributed mode, full row-level security, OpenTelemetry, SIMD tuning | Future |
 | Lance | As alternate `Storage` impl | Designed; not blocking — redb covers durability |
 
 ---
@@ -561,10 +564,12 @@ Full version: [ROADMAP.md](ROADMAP.md). Snapshot:
 
 We're **public-ready** (v0.1). Honest list of what's still missing:
 
-1. **No per-key / per-agent RBAC.** One token grants full access to
-   all keys. Phase 6.3+.
-2. **No multi-tenant isolation** in a single process. Run one
-   `--storage dir:./tenant-X` daemon per tenant for now.
+1. **No full row-level security across every Phase 7 primitive.**
+   RESP role API keys protect command classes, and tenant-scoped keys
+   namespace memory/session/cost commands, but shared-daemon
+   multi-tenant use should stay on tenant-safe commands for now.
+2. **No complete multi-tenant isolation** in a single process. Run one
+   `--storage dir:./tenant-X` daemon per tenant for strict isolation.
 3. **Eviction reclaims rows but not index memory.** When the
    `--max-memories` cap evicts a row, the row store + duxx-memory
    row map drop it (so `recall` never returns it again), but the
@@ -585,7 +590,7 @@ We're **public-ready** (v0.1). Honest list of what's still missing:
 With native TLS, mTLS, auth, resource limits, and eviction, DuxxDB is
 suitable for single-tenant network exposure behind an operator-managed
 certificate. Multi-tenant SaaS deployment still wants Phase 6.3+
-(RBAC, tenant isolation, sharding).
+(full row-level security, tenant isolation, sharding).
 
 ---
 
