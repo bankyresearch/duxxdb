@@ -33,6 +33,7 @@ pub mod security;
 pub mod studio;
 pub mod tls;
 
+use duxx_cluster::{ChangeLog, Coordinator};
 use duxx_cost::{BudgetPeriod, CostEntry, CostFilter, CostLedger, GroupBy};
 use duxx_datasets::{DatasetRegistry, DatasetRow};
 use duxx_docs::DocumentStore;
@@ -45,7 +46,6 @@ use duxx_replay::{
     InvocationKind as ReplayInvocationKind, OverrideKind as ReplayOverrideKind, ReplayInvocation,
     ReplayMode, ReplayOverride, ReplayRegistry,
 };
-use duxx_cluster::{ChangeLog, Coordinator};
 use duxx_storage::Backend;
 use duxx_tenant::{Namespace, TenantRouter};
 
@@ -325,12 +325,12 @@ impl Server {
     /// `hnsw_rs` cannot grow past it, also the per-tenant memory **quota**.
     /// The default (unscoped) workspace is unaffected; configure its
     /// durability with `--storage` / `--phase7-storage` as before.
-    pub fn with_tenant_root(
-        mut self,
-        dir: impl Into<std::path::PathBuf>,
-        capacity: usize,
-    ) -> Self {
-        self.tenants = Arc::new(TenantRouter::with_root(self.embedder.clone(), capacity, dir));
+    pub fn with_tenant_root(mut self, dir: impl Into<std::path::PathBuf>, capacity: usize) -> Self {
+        self.tenants = Arc::new(TenantRouter::with_root(
+            self.embedder.clone(),
+            capacity,
+            dir,
+        ));
         self
     }
 
@@ -401,12 +401,8 @@ impl Server {
         } else {
             Some(change.namespace.clone())
         };
-        let principal = security::Principal::new(
-            "replication",
-            "replication",
-            security::Role::Admin,
-            tenant,
-        );
+        let principal =
+            security::Principal::new("replication", "replication", security::Role::Admin, tenant);
         let mut auth = security::AuthState::unauthenticated();
         if let Ok(p) = principal {
             auth.set_principal(p);
@@ -3648,7 +3644,14 @@ fn tenant_safe_command(command: &str) -> bool {
     if let Some((family, _sub)) = command.split_once('.') {
         return matches!(
             family,
-            "MEMORY" | "SESSION" | "TRACE" | "PROMPT" | "DATASET" | "EVAL" | "REPLAY" | "COST"
+            "MEMORY"
+                | "SESSION"
+                | "TRACE"
+                | "PROMPT"
+                | "DATASET"
+                | "EVAL"
+                | "REPLAY"
+                | "COST"
                 | "DOC"
         );
     }
@@ -3833,7 +3836,10 @@ mod tests {
         );
         match r {
             RespValue::Array(items) => {
-                assert!(!items.is_empty(), "follower must have the replicated memory")
+                assert!(
+                    !items.is_empty(),
+                    "follower must have the replicated memory"
+                )
             }
             other => panic!("expected array, got {other:?}"),
         }
@@ -3899,7 +3905,10 @@ mod tests {
 
         // Delete → 1, then search is empty.
         assert_eq!(
-            dispatch_array(&s, vec![RespValue::bulk("DOC.DELETE"), RespValue::bulk(doc_id)]),
+            dispatch_array(
+                &s,
+                vec![RespValue::bulk("DOC.DELETE"), RespValue::bulk(doc_id)]
+            ),
             RespValue::Integer(1)
         );
         assert!(matches!(
@@ -4306,7 +4315,10 @@ mod tests {
         );
         match leaked {
             Response::Reply(RespValue::Array(items)) => {
-                assert!(items.is_empty(), "LEAK: globex recalled acme's memory: {items:?}");
+                assert!(
+                    items.is_empty(),
+                    "LEAK: globex recalled acme's memory: {items:?}"
+                );
             }
             other => panic!("expected array, got {other:?}"),
         }
@@ -4349,42 +4361,53 @@ mod tests {
             );
             s.dispatch_with_auth_state(RespValue::Array(cmd), false, &mut auth)
         };
-        let denied = |r: &Response| {
-            matches!(r, Response::Reply(RespValue::Error(m)) if m.contains("NOPERM"))
-        };
+        let denied = |r: &Response| matches!(r, Response::Reply(RespValue::Error(m)) if m.contains("NOPERM"));
 
         // Evaluator: can RECALL (read) and EVAL.* (run_eval), but NOT REMEMBER
         // (write_memory) or DEL (delete_memory).
         assert!(!denied(&try_cmd(
             "evsecret",
-            vec![RespValue::bulk("RECALL"), RespValue::bulk("k"), RespValue::bulk("q")],
-        )));
-        assert!(denied(&try_cmd(
-            "evsecret",
             vec![
-                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("RECALL"),
                 RespValue::bulk("k"),
-                RespValue::bulk("nope"),
+                RespValue::bulk("q")
             ],
-        )), "evaluator must not write memory");
-        assert!(denied(&try_cmd(
-            "evsecret",
-            vec![RespValue::bulk("DEL"), RespValue::bulk("k")],
-        )), "evaluator must not delete memory");
+        )));
+        assert!(
+            denied(&try_cmd(
+                "evsecret",
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("k"),
+                    RespValue::bulk("nope"),
+                ],
+            )),
+            "evaluator must not write memory"
+        );
+        assert!(
+            denied(&try_cmd(
+                "evsecret",
+                vec![RespValue::bulk("DEL"), RespValue::bulk("k")],
+            )),
+            "evaluator must not delete memory"
+        );
 
         // Observer: read OK, any write denied.
         assert!(!denied(&try_cmd(
             "obsecret",
             vec![RespValue::bulk("GET"), RespValue::bulk("k")],
         )));
-        assert!(denied(&try_cmd(
-            "obsecret",
-            vec![
-                RespValue::bulk("REMEMBER"),
-                RespValue::bulk("k"),
-                RespValue::bulk("nope"),
-            ],
-        )), "observer must not write");
+        assert!(
+            denied(&try_cmd(
+                "obsecret",
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("k"),
+                    RespValue::bulk("nope"),
+                ],
+            )),
+            "observer must not write"
+        );
     }
 
     /// A2: tenant-scoped principals can now USE the Phase 7 registries
@@ -4659,8 +4682,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let claims =
-            duxx_token::Claims::new("k", "org1", "projA", "prod", "developer", now, 3600);
+        let claims = duxx_token::Claims::new("k", "org1", "projA", "prod", "developer", now, 3600);
         let jwt = duxx_token::sign_ed25519(&claims, &priv_der).unwrap();
 
         let mut auth = security::AuthState::unauthenticated();
@@ -4683,7 +4705,10 @@ mod tests {
             false,
             &mut auth2,
         );
-        assert!(!auth2.is_authed(), "token from a different key must be rejected");
+        assert!(
+            !auth2.is_authed(),
+            "token from a different key must be rejected"
+        );
     }
 
     /// Full A→B→C vertical: the control plane issues a workspace JWT, the data

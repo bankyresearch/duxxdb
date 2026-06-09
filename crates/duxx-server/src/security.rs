@@ -189,7 +189,10 @@ impl Capabilities {
             "REMEMBER" => self.write_memory,
             "DEL" => self.delete_memory,
             "PROMPT.PUT" | "PROMPT.TAG" | "PROMPT.UNTAG" => self.write_prompt,
-            "DATASET.CREATE" | "DATASET.ADD" | "DATASET.TAG" | "DATASET.UNTAG"
+            "DATASET.CREATE"
+            | "DATASET.ADD"
+            | "DATASET.TAG"
+            | "DATASET.UNTAG"
             | "DATASET.FROM_RECALL" => self.write_dataset,
             "EVAL.START" | "EVAL.SCORE" | "EVAL.COMPLETE" | "EVAL.FAIL" => self.run_eval,
             "TRACE.RECORD" | "TRACE.CLOSE" => self.write_trace,
@@ -541,7 +544,9 @@ pub struct AuditTrail {
 impl AuditTrail {
     pub fn new(cap: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(cap.min(1024)))),
+            inner: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+                cap.min(1024),
+            ))),
             cap: cap.max(1),
         }
     }
