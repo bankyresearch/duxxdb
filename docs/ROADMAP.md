@@ -212,6 +212,11 @@ sidecar to be exposed safely.
       `--tls-client-ca PATH` / `DUXX_TLS_CLIENT_CA`.
 - [x] **Configurable RESP resource limits** for bulk strings, arrays,
       line length, input buffers, and recursive nesting.
+- [x] **RESP RBAC, audit, and rate caps.** `DUXX_AUTH_KEYS` supports
+      read/write/admin principals, optional tenant scopes for
+      tenant-safe commands, `DUXX_AUDIT_LOG` emits JSON-lines security
+      events, and connection/command-rate caps protect exposed
+      listeners.
 - [x] **Row cap + importance-based eviction.**
       `--max-memories N` / `DUXX_MAX_MEMORIES` on `duxx-server`. Once
       exceeded, every `REMEMBER` evicts the row with the lowest
@@ -434,7 +439,8 @@ Tracked, not yet scheduled.
   reclaims index memory too — Phase 6.2 only reclaims row + storage
   bytes; the indices retain entries until restart.
 - Distributed / sharded mode.
-- Row-level security / RBAC.
+- Full row-level security across every Phase 7 registry and all
+  non-RESP surfaces.
 - Query cache.
 - OpenTelemetry tracing export.
 - SIMD tuning per architecture (AVX-512, ARM NEON).

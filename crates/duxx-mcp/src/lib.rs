@@ -8,7 +8,10 @@
 //! Implemented MCP methods:
 //! - `initialize`        — handshake
 //! - `tools/list`        — advertise our tool set
-//! - `tools/call`        — invoke a tool (`remember`, `recall`, `forget`)
+//! - `tools/call`        — invoke a tool. The agent hot-tier is exposed as
+//!   MCP tools: `remember` / `recall` / `forget` (memory), `session_set` /
+//!   `session_get` (per-conversation state), `tool_cache_put` /
+//!   `tool_cache_get` (exact + semantic tool-result cache), and `stats`.
 //! - `notifications/initialized` — accepted, ignored
 //! - `ping`              — health check
 //!
@@ -17,7 +20,7 @@
 //! plugs in a real provider via [`McpServer::with_embedder`].
 
 use duxx_embed::{Embedder, HashEmbedder};
-use duxx_memory::MemoryStore;
+use duxx_memory::{HitKind, MemoryStore, SessionStore, ToolCache};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -64,6 +67,8 @@ pub struct JsonRpcError {
 #[derive(Clone)]
 pub struct McpServer {
     store: MemoryStore,
+    sessions: SessionStore,
+    tools: ToolCache,
     embedder: Arc<dyn Embedder>,
     dim: usize,
 }
@@ -89,6 +94,8 @@ impl McpServer {
         let dim = embedder.dim();
         Self {
             store: MemoryStore::with_capacity(dim, 100_000),
+            sessions: SessionStore::new(),
+            tools: ToolCache::new(),
             embedder,
             dim,
         }
@@ -226,6 +233,65 @@ impl McpServer {
                     }
                 },
                 {
+                    "name": "forget",
+                    "description": "Delete a memory by its id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "integer", "description": "Memory id returned by remember." }
+                        },
+                        "required": ["id"]
+                    }
+                },
+                {
+                    "name": "session_set",
+                    "description": "Store per-conversation working state under a session id (sliding TTL).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string" },
+                            "value":      { "type": "string", "description": "Opaque value (e.g. JSON state)." }
+                        },
+                        "required": ["session_id", "value"]
+                    }
+                },
+                {
+                    "name": "session_get",
+                    "description": "Fetch per-conversation working state for a session id (null if absent/expired).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string" }
+                        },
+                        "required": ["session_id"]
+                    }
+                },
+                {
+                    "name": "tool_cache_put",
+                    "description": "Cache an expensive tool/LLM result keyed by (tool, args), for later exact or semantic reuse.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tool":   { "type": "string", "description": "Tool/function name." },
+                            "args":   { "type": "string", "description": "Canonical args string." },
+                            "output": { "type": "string", "description": "Result to cache." }
+                        },
+                        "required": ["tool", "args", "output"]
+                    }
+                },
+                {
+                    "name": "tool_cache_get",
+                    "description": "Look up a cached tool result. Returns an exact hit, or a semantic near-hit (cosine >= 0.95), or a miss.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tool": { "type": "string" },
+                            "args": { "type": "string" }
+                        },
+                        "required": ["tool", "args"]
+                    }
+                },
+                {
                     "name": "stats",
                     "description": "Return basic server stats: stored memory count, dim, version.",
                     "inputSchema": { "type": "object", "properties": {} }
@@ -247,6 +313,11 @@ impl McpServer {
         let body = match name {
             "remember" => self.tool_remember(&args)?,
             "recall" => self.tool_recall(&args)?,
+            "forget" => self.tool_forget(&args)?,
+            "session_set" => self.tool_session_set(&args)?,
+            "session_get" => self.tool_session_get(&args)?,
+            "tool_cache_put" => self.tool_cache_put(&args)?,
+            "tool_cache_get" => self.tool_cache_get(&args)?,
             "stats" => self.tool_stats(),
             other => {
                 return Err(JsonRpcError {
@@ -329,6 +400,95 @@ impl McpServer {
         Ok(json!({ "hits": serialized }))
     }
 
+    fn tool_forget(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
+        let id = args
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid_params("missing 'id'"))?;
+        Ok(json!({ "removed": self.store.forget(id) }))
+    }
+
+    fn tool_session_set(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
+        let sid = args
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'session_id'"))?;
+        let value = args
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'value'"))?;
+        self.sessions.put(sid.to_string(), value.as_bytes().to_vec());
+        Ok(json!({ "ok": true }))
+    }
+
+    fn tool_session_get(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
+        let sid = args
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'session_id'"))?;
+        let value = self
+            .sessions
+            .get(sid)
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
+        Ok(json!({ "value": value }))
+    }
+
+    fn tool_cache_put(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
+        let tool = args
+            .get("tool")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'tool'"))?;
+        let input = args
+            .get("args")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'args'"))?;
+        let output = args
+            .get("output")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'output'"))?;
+        let emb = self
+            .embedder
+            .embed(input)
+            .map_err(|e| internal(format!("embed: {e}")))?;
+        self.tools
+            .put(
+                tool.to_string(),
+                hash_str(input),
+                emb,
+                output.as_bytes().to_vec(),
+                std::time::Duration::from_secs(3600),
+            )
+            .map_err(|e| internal(e.to_string()))?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn tool_cache_get(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
+        let tool = args
+            .get("tool")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'tool'"))?;
+        let input = args
+            .get("args")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'args'"))?;
+        let emb = self
+            .embedder
+            .embed(input)
+            .map_err(|e| internal(format!("embed: {e}")))?;
+        Ok(match self.tools.get(tool, hash_str(input), &emb) {
+            Some(hit) => json!({
+                "hit": true,
+                "kind": match hit.kind {
+                    HitKind::Exact => "exact",
+                    HitKind::SemanticNearHit => "semantic_near_hit",
+                },
+                "similarity": hit.similarity,
+                "output": String::from_utf8_lossy(&hit.result),
+            }),
+            None => json!({ "hit": false }),
+        })
+    }
+
     fn tool_stats(&self) -> Value {
         json!({
             "memories":    self.store.len(),
@@ -344,6 +504,14 @@ impl Default for McpServer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Stable 64-bit hash of an args string, for the tool cache's exact-match index.
+fn hash_str(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 fn invalid_params(msg: impl Into<String>) -> JsonRpcError {
@@ -388,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_includes_three_tools() {
+    fn tools_list_advertises_the_agent_hot_tier() {
         let s = McpServer::new();
         let resp = run_one(&s, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         let names: Vec<&str> = resp["result"]["tools"]
@@ -397,9 +565,76 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"remember"));
-        assert!(names.contains(&"recall"));
-        assert!(names.contains(&"stats"));
+        for expected in [
+            "remember",
+            "recall",
+            "forget",
+            "session_set",
+            "session_get",
+            "tool_cache_put",
+            "tool_cache_get",
+            "stats",
+        ] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
+    }
+
+    fn call_tool(s: &McpServer, id: u32, name: &str, args: serde_json::Value) -> Value {
+        let req = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": args },
+        })
+        .to_string();
+        let resp = run_one(s, &req);
+        let body = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn session_set_then_get_round_trips() {
+        let s = McpServer::new();
+        call_tool(&s, 1, "session_set", json!({"session_id":"c1","value":"turn-buffer"}));
+        let got = call_tool(&s, 2, "session_get", json!({"session_id":"c1"}));
+        assert_eq!(got["value"], "turn-buffer");
+        let miss = call_tool(&s, 3, "session_get", json!({"session_id":"nope"}));
+        assert_eq!(miss["value"], Value::Null);
+    }
+
+    #[test]
+    fn tool_cache_put_then_get_is_an_exact_hit() {
+        let s = McpServer::new();
+        call_tool(
+            &s,
+            1,
+            "tool_cache_put",
+            json!({"tool":"web_search","args":"weather in paris","output":"18C, clear"}),
+        );
+        let hit = call_tool(
+            &s,
+            2,
+            "tool_cache_get",
+            json!({"tool":"web_search","args":"weather in paris"}),
+        );
+        assert_eq!(hit["hit"], true);
+        assert_eq!(hit["kind"], "exact");
+        assert_eq!(hit["output"], "18C, clear");
+
+        let miss = call_tool(
+            &s,
+            3,
+            "tool_cache_get",
+            json!({"tool":"web_search","args":"a totally unrelated query xyzzy"}),
+        );
+        assert_eq!(miss["hit"], false);
+    }
+
+    #[test]
+    fn forget_removes_a_memory() {
+        let s = McpServer::new();
+        let r = call_tool(&s, 1, "remember", json!({"key":"u","text":"delete me"}));
+        let id = r["id"].as_u64().unwrap();
+        let f = call_tool(&s, 2, "forget", json!({"id": id}));
+        assert_eq!(f["removed"], true);
     }
 
     #[test]

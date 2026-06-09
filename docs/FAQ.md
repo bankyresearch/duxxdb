@@ -90,9 +90,10 @@ are agent-friendly but not a Postgres replacement for joins, window
 functions, CTEs, etc. Use DuxxDB for the agent path, Postgres for the
 analytics / business path. See [coexistence pattern](INTEGRATION_GUIDE.md#coexistence-keep-postgres--add-duxxdb).
 
-❌ You need **per-key RBAC / row-level security**. DuxxDB supports
-mTLS transport authentication, but one bearer/AUTH token still grants
-full access inside a daemon.
+❌ You need **full row-level security across every Phase 7 primitive**.
+DuxxDB supports mTLS, RESP read/write/admin API keys, and tenant-scoped
+core memory/session/cost commands, but full registry-wide row-level
+isolation is still future work.
 
 ❌ You're indexing **billions of vectors** in a single table.
 hnsw_rs scales well, but at that point you're shopping for Milvus /
@@ -307,8 +308,9 @@ directly.
 ### mTLS / per-key RBAC?
 
 mTLS is available on RESP and gRPC with `--tls-client-ca` /
-`DUXX_TLS_CLIENT_CA`. Per-key RBAC and row-level security are still
-future work.
+`DUXX_TLS_CLIENT_CA`. RESP supports `DUXX_AUTH_KEYS` read/write/admin
+principals. Full row-level security across every Phase 7 registry is
+still future work.
 
 ### Sensitive data — PII, PHI?
 

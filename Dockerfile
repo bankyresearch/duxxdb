@@ -54,6 +54,7 @@ RUN cargo fetch
 # and offline snapshot/restore.
 RUN cargo build --release \
       -p duxx-server \
+      -p duxx-control \
       -p duxx-grpc \
       -p duxx-mcp \
       -p duxx-coldtier \
@@ -74,6 +75,7 @@ RUN apt-get update \
 
 # Bring all runtime binaries.
 COPY --from=builder /usr/src/duxxdb/target/release/duxx-server   /usr/local/bin/duxx-server
+COPY --from=builder /usr/src/duxxdb/target/release/duxx-control  /usr/local/bin/duxx-control
 COPY --from=builder /usr/src/duxxdb/target/release/duxx-grpc     /usr/local/bin/duxx-grpc
 COPY --from=builder /usr/src/duxxdb/target/release/duxx-mcp      /usr/local/bin/duxx-mcp
 COPY --from=builder /usr/src/duxxdb/target/release/duxx-export   /usr/local/bin/duxx-export
