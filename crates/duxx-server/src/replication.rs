@@ -36,8 +36,15 @@ pub fn pull_changes(log: &dyn ChangeLog, after_seq: u64) -> Value {
 
 /// Parse one change from the pull response.
 pub fn parse_change(v: &Value) -> Result<Change, String> {
-    let seq = v.get("seq").and_then(Value::as_u64).ok_or("change missing seq")?;
-    let namespace = v.get("namespace").and_then(Value::as_str).unwrap_or("").to_string();
+    let seq = v
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or("change missing seq")?;
+    let namespace = v
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let op = v
         .get("op")
         .and_then(Value::as_array)
@@ -144,7 +151,10 @@ pub async fn serve(server: Server, addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
-async fn handle(req: Request<Incoming>, server: Server) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle(
+    req: Request<Incoming>,
+    server: Server,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
@@ -163,7 +173,10 @@ async fn handle(req: Request<Incoming>, server: Server) -> Result<Response<Full<
         .and_then(|v| v.strip_prefix("Bearer "));
     match server.replication_token() {
         None => {
-            return Ok(reply(503, json!({ "error": "replication transport not configured" })));
+            return Ok(reply(
+                503,
+                json!({ "error": "replication transport not configured" }),
+            ));
         }
         Some(expected) if bearer == Some(expected) => {}
         Some(_) => return Ok(reply(401, json!({ "error": "invalid replication token" }))),
@@ -171,7 +184,12 @@ async fn handle(req: Request<Incoming>, server: Server) -> Result<Response<Full<
 
     let log = match server.replication_log() {
         Some(l) => l.clone(),
-        None => return Ok(reply(503, json!({ "error": "replication not enabled on this node" }))),
+        None => {
+            return Ok(reply(
+                503,
+                json!({ "error": "replication not enabled on this node" }),
+            ))
+        }
     };
 
     let body = req
@@ -262,7 +280,11 @@ mod tests {
 
     #[test]
     fn parse_change_round_trips() {
-        let c = Change { seq: 7, namespace: "org/p/prod".into(), op: vec![1, 2, 3, 255] };
+        let c = Change {
+            seq: 7,
+            namespace: "org/p/prod".into(),
+            op: vec![1, 2, 3, 255],
+        };
         let v = json!({ "seq": c.seq, "namespace": c.namespace, "op": c.op });
         assert_eq!(parse_change(&v).unwrap(), c);
     }

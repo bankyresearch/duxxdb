@@ -84,7 +84,10 @@ fn parse_env(s: &str) -> Result<Env, ApiResponse> {
         "dev" | "development" => Ok(Env::Dev),
         "staging" | "stage" => Ok(Env::Staging),
         "prod" | "production" => Ok(Env::Prod),
-        other => Err(error(400, format!("unknown env {other:?} (dev|staging|prod)"))),
+        other => Err(error(
+            400,
+            format!("unknown env {other:?} (dev|staging|prod)"),
+        )),
     }
 }
 
@@ -107,7 +110,10 @@ fn parse_mode(s: &str) -> Result<PlacementMode, ApiResponse> {
     match s.trim().to_ascii_lowercase().as_str() {
         "shared" => Ok(PlacementMode::Shared),
         "dedicated" => Ok(PlacementMode::Dedicated),
-        other => Err(error(400, format!("unknown mode {other:?} (shared|dedicated)"))),
+        other => Err(error(
+            400,
+            format!("unknown mode {other:?} (shared|dedicated)"),
+        )),
     }
 }
 
@@ -216,7 +222,10 @@ fn inner(
         // List projects in an org. POST-with-body keeps routing param-free.
         ("POST", "/v1/projects/list") => {
             let req: OrgRef = parse_body(body)?;
-            json(200, &serde_json::json!({ "projects": cp.projects_in_org(&req.org_id) }))
+            json(
+                200,
+                &serde_json::json!({ "projects": cp.projects_in_org(&req.org_id) }),
+            )
         }
 
         // List a project's keys, with secrets redacted.
@@ -285,9 +294,10 @@ fn inner(
             let req: InviteMember = parse_body(body)?;
             let role = parse_role(&req.role)?;
             match cp.invite_member(&req.org_id, &req.email, role) {
-                Ok((member, invite_token)) => {
-                    json(201, &serde_json::json!({ "member": member, "invite_token": invite_token }))
-                }
+                Ok((member, invite_token)) => json(
+                    201,
+                    &serde_json::json!({ "member": member, "invite_token": invite_token }),
+                ),
                 Err(e) => from_control(e),
             }
         }
@@ -302,12 +312,18 @@ fn inner(
 
         ("POST", "/v1/members/list") => {
             let req: OrgRef = parse_body(body)?;
-            json(200, &serde_json::json!({ "members": cp.list_members(&req.org_id) }))
+            json(
+                200,
+                &serde_json::json!({ "members": cp.list_members(&req.org_id) }),
+            )
         }
 
         ("POST", "/v1/members/remove") => {
             let req: MemberRef = parse_body(body)?;
-            json(200, &serde_json::json!({ "removed": cp.remove_member(&req.member_id) }))
+            json(
+                200,
+                &serde_json::json!({ "removed": cp.remove_member(&req.member_id) }),
+            )
         }
 
         ("POST", "/v1/placements") => {
@@ -474,7 +490,12 @@ mod tests {
             serde_json::json!({"project_id": project_id, "node":"n1:6380", "mode":"shared"}),
         );
         assert_eq!(s, 201);
-        let (s, entries) = call(&cp, "POST", "/v1/auth-entries", serde_json::json!({"node":"n1:6380"}));
+        let (s, entries) = call(
+            &cp,
+            "POST",
+            "/v1/auth-entries",
+            serde_json::json!({"node":"n1:6380"}),
+        );
         assert_eq!(s, 200);
         assert_eq!(entries["entries"].as_array().unwrap().len(), 1);
 

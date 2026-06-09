@@ -37,7 +37,9 @@ pub fn ingest_otlp_json(traces: &TraceStore, body: &[u8]) -> Result<usize, Strin
 }
 
 fn array(v: Option<&Value>) -> Vec<&Value> {
-    v.and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default()
+    v.and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default()
 }
 
 fn otlp_span_to_span(sp: &Value) -> Result<Span, String> {
@@ -56,7 +58,11 @@ fn otlp_span_to_span(sp: &Value) -> Result<Span, String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(String::from);
-    let name = sp.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = sp
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // OTLP SpanKind: 0 UNSPECIFIED, 1 INTERNAL, 2 SERVER, 3 CLIENT, 4 PRODUCER, 5 CONSUMER.
     let kind = match sp.get("kind").and_then(Value::as_i64).unwrap_or(0) {
         2 => SpanKind::Server,
@@ -119,7 +125,10 @@ fn otlp_anyvalue(v: &Value) -> Value {
     if let Some(i) = v.get("intValue") {
         // intValue is a string in proto3 JSON.
         if let Some(s) = i.as_str() {
-            return s.parse::<i64>().map(Value::from).unwrap_or_else(|_| json!(s));
+            return s
+                .parse::<i64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| json!(s));
         }
         return i.clone();
     }
@@ -262,7 +271,10 @@ pub async fn serve(server: Server, addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
-async fn handle(req: Request<Incoming>, server: Server) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle(
+    req: Request<Incoming>,
+    server: Server,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
@@ -302,7 +314,10 @@ fn workspace_for(
     bearer: Option<&str>,
 ) -> Result<std::sync::Arc<duxx_tenant::Workspace>, (u16, String)> {
     if server.jwt_secret.is_none() && server.jwt_public_key.is_none() {
-        return Err((503, "OTLP ingest requires --jwt-secret or --jwt-public-key".into()));
+        return Err((
+            503,
+            "OTLP ingest requires --jwt-secret or --jwt-public-key".into(),
+        ));
     }
     let token = bearer.ok_or((401u16, "missing Authorization: Bearer <jwt>".to_string()))?;
     let claims = server
@@ -381,8 +396,9 @@ mod tests {
         assert_eq!(sp["status"]["code"], 1);
         // attributes became OTLP key/value pairs again.
         let attrs = sp["attributes"].as_array().unwrap();
-        assert!(attrs.iter().any(|a| a["key"] == "model"
-            && a["value"]["stringValue"] == "gpt-4o"));
+        assert!(attrs
+            .iter()
+            .any(|a| a["key"] == "model" && a["value"]["stringValue"] == "gpt-4o"));
     }
 
     #[test]

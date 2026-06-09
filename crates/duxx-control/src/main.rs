@@ -29,7 +29,9 @@ fn main() {
             println!("duxx-control keygen DIR  write an Ed25519 keypair (ed25519.key/.pub) to DIR");
             println!("\nenv for `serve`:");
             println!("  DUXX_CONTROL_ED25519_KEY  path to an Ed25519 private DER (asymmetric, preferred)");
-            println!("  DUXX_CONTROL_JWT_SECRET   HS256 signing secret (fallback when no Ed25519 key)");
+            println!(
+                "  DUXX_CONTROL_JWT_SECRET   HS256 signing secret (fallback when no Ed25519 key)"
+            );
         }
         _ => demo(),
     }
@@ -39,8 +41,7 @@ fn main() {
 /// control plane), public DER → `DIR/ed25519.pub` (give to every data-plane
 /// node via `duxx-server --jwt-public-key`).
 fn keygen(dir: &str) {
-    let (private_der, public_der) =
-        duxx_control::generate_ed25519().expect("ed25519 keygen");
+    let (private_der, public_der) = duxx_control::generate_ed25519().expect("ed25519 keygen");
     std::fs::create_dir_all(dir).expect("create keygen dir");
     let priv_path = std::path::Path::new(dir).join("ed25519.key");
     let pub_path = std::path::Path::new(dir).join("ed25519.pub");
@@ -49,7 +50,10 @@ fn keygen(dir: &str) {
     println!("wrote private key -> {}", priv_path.display());
     println!("wrote public  key -> {}", pub_path.display());
     println!("\nrun the control plane with:");
-    println!("  $env:DUXX_CONTROL_ED25519_KEY=\"{}\"; duxx-control serve", priv_path.display());
+    println!(
+        "  $env:DUXX_CONTROL_ED25519_KEY=\"{}\"; duxx-control serve",
+        priv_path.display()
+    );
     println!("run each data-plane node with:");
     println!("  duxx-server --jwt-public-key {}", pub_path.display());
 }
@@ -88,7 +92,9 @@ fn demo() {
 
     // 1. Onboard an org and a project.
     let org = cp.create_org("Acme Inc").expect("create org");
-    let proj = cp.create_project(&org.id, "support-bot").expect("create project");
+    let proj = cp
+        .create_project(&org.id, "support-bot")
+        .expect("create project");
     println!("org     = {} ({})", org.name, org.id);
     println!("project = {} ({})", proj.name, proj.id);
 
@@ -131,7 +137,9 @@ fn demo() {
         Ok(jwt) => {
             println!("\nshort-lived workspace JWT for {} (900s):", svc.name);
             println!("  {jwt}");
-            println!("  (node started with: duxx-server --jwt-secret <shared-secret> --tenants-dir …)");
+            println!(
+                "  (node started with: duxx-server --jwt-secret <shared-secret> --tenants-dir …)"
+            );
         }
         Err(e) => println!("\n(jwt mint skipped: {e})"),
     }
