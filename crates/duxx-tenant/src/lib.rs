@@ -166,7 +166,11 @@ impl Namespace {
     /// * `org/project`     → env defaults to `prod`
     /// * `project`         → org defaults to `default`, env to `prod`
     pub fn parse(s: &str) -> Self {
-        let parts: Vec<&str> = s.split('/').map(str::trim).filter(|p| !p.is_empty()).collect();
+        let parts: Vec<&str> = s
+            .split('/')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
         match parts.as_slice() {
             [org, project, env] => Namespace::new(*org, *project, Env::parse(env)),
             [org, project] => Namespace::new(*org, *project, Env::Prod),
@@ -226,10 +230,9 @@ impl Role {
             // Full control.
             Owner | Admin => true,
             // Read/write data, no project destruction.
-            Developer | ServiceAccount => matches!(
-                cap,
-                ReadMemory | WriteMemory | DeleteMemory | SearchMemory
-            ),
+            Developer | ServiceAccount => {
+                matches!(cap, ReadMemory | WriteMemory | DeleteMemory | SearchMemory)
+            }
             // Can write/search (to run evals over memory) but not delete.
             Evaluator => matches!(cap, ReadMemory | SearchMemory | WriteMemory),
             // Read-only.
@@ -406,7 +409,10 @@ impl Workspace {
             // Source object bytes are served from `dir/objects`; chunks/index
             // are in-process. (The chunk index itself is not yet persisted —
             // a follow-up like the Phase 7 registries.)
-            docs: DocumentStore::new(Arc::new(LocalFsConnector::new(dir.join("objects"))), embedder),
+            docs: DocumentStore::new(
+                Arc::new(LocalFsConnector::new(dir.join("objects"))),
+                embedder,
+            ),
             ns,
         })
     }
@@ -543,17 +549,20 @@ impl TenantRouter {
     /// is not), so a single bad disk path can't crash the whole server.
     fn build_workspace(&self, ns: &Namespace) -> Workspace {
         match &self.root {
-            Some(root) => {
-                Workspace::open(ns.clone(), self.embedder.clone(), self.capacity, &ns.dir(root))
-                    .unwrap_or_else(|e| {
-                        tracing::error!(
-                            namespace = %ns,
-                            error = %e,
-                            "durable workspace open failed; serving in-memory (NOT durable) this run"
-                        );
-                        Workspace::new(ns.clone(), self.embedder.clone(), self.capacity)
-                    })
-            }
+            Some(root) => Workspace::open(
+                ns.clone(),
+                self.embedder.clone(),
+                self.capacity,
+                &ns.dir(root),
+            )
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    namespace = %ns,
+                    error = %e,
+                    "durable workspace open failed; serving in-memory (NOT durable) this run"
+                );
+                Workspace::new(ns.clone(), self.embedder.clone(), self.capacity)
+            }),
             None => Workspace::new(ns.clone(), self.embedder.clone(), self.capacity),
         }
     }
@@ -613,12 +622,7 @@ impl TenantRouter {
     // -- Capability-checked, namespace-routed operations --------------------
 
     /// Store a memory in the caller's workspace.
-    pub fn remember(
-        &self,
-        p: &Principal,
-        key: &str,
-        text: &str,
-    ) -> Result<u64, TenantError> {
+    pub fn remember(&self, p: &Principal, key: &str, text: &str) -> Result<u64, TenantError> {
         p.require(Capability::WriteMemory)?;
         let embedding = self.embedder.embed(text)?;
         let ws = self.workspace(&p.ns);
@@ -742,7 +746,8 @@ mod tests {
         let dev_p = dev("svc", "org_1", "proj_a", Env::Dev);
         let prod_p = dev("svc", "org_1", "proj_a", Env::Prod);
 
-        r.remember(&dev_p, "k", "dev-only scratch data lion").unwrap();
+        r.remember(&dev_p, "k", "dev-only scratch data lion")
+            .unwrap();
         let prod_hits = r.recall(&prod_p, "scratch lion", 10).unwrap();
         assert!(prod_hits.is_empty(), "dev data leaked into prod");
         assert_eq!(r.memory_len(&prod_p).unwrap(), 0);
@@ -866,8 +871,8 @@ mod tests {
     #[test]
     fn bounded_warm_cache_evicts_idle_but_persists() {
         let tmp = tempfile::tempdir().unwrap();
-        let r =
-            TenantRouter::with_root(Arc::new(HashEmbedder::new(32)), 256, tmp.path()).with_max_warm(1);
+        let r = TenantRouter::with_root(Arc::new(HashEmbedder::new(32)), 256, tmp.path())
+            .with_max_warm(1);
         let a = Principal::new("a", Namespace::new("org", "pa", Env::Prod), Role::Developer);
         let b = Principal::new("b", Namespace::new("org", "pb", Env::Prod), Role::Developer);
 
@@ -882,6 +887,10 @@ mod tests {
 
         // a was evicted from the warm cache but its data persisted — a
         // re-access reopens it from disk.
-        assert_eq!(r.memory_len(&a).unwrap(), 1, "a's data must survive eviction");
+        assert_eq!(
+            r.memory_len(&a).unwrap(),
+            1,
+            "a's data must survive eviction"
+        );
     }
 }

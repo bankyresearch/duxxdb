@@ -159,8 +159,7 @@ impl ChangeLog for RedbLog {
         let seq = *n + 1;
         // 8-byte big-endian key → lexicographic order == sequence order, so
         // `scan` returns changes already sorted.
-        let value =
-            bincode::serialize(&(namespace.to_string(), op)).expect("wal entry encode");
+        let value = bincode::serialize(&(namespace.to_string(), op)).expect("wal entry encode");
         self.backend
             .put(WAL_TABLE, &seq.to_be_bytes(), &value)
             .expect("wal put");
@@ -178,11 +177,7 @@ impl ChangeLog for RedbLog {
             .map(|(seq, v)| {
                 let (namespace, op): (String, Vec<u8>) =
                     bincode::deserialize(&v).unwrap_or_default();
-                Change {
-                    seq,
-                    namespace,
-                    op,
-                }
+                Change { seq, namespace, op }
             })
             .collect()
     }
@@ -686,7 +681,11 @@ mod tests {
         assert_eq!(la.term, 1);
         assert!(a.is_leader());
         let lb = b.campaign();
-        assert_eq!(lb.leader.as_deref(), Some("node-a"), "B must not steal leadership");
+        assert_eq!(
+            lb.leader.as_deref(),
+            Some("node-a"),
+            "B must not steal leadership"
+        );
         assert!(!b.is_leader());
 
         // A fails / steps down → B campaigns and wins term 2 (failover).
@@ -781,7 +780,11 @@ mod tests {
 
         // Snapshot covered up to seq 3 → compact them away.
         assert_eq!(log.compact(3), 3);
-        assert_eq!(log.earliest_seq(), 4, "earliest rises past the compaction point");
+        assert_eq!(
+            log.earliest_seq(),
+            4,
+            "earliest rises past the compaction point"
+        );
         assert_eq!(
             log.since(0).iter().map(|c| c.seq).collect::<Vec<_>>(),
             vec![4, 5]
@@ -794,9 +797,18 @@ mod tests {
     #[test]
     fn read_router_prefers_fresh_replicas() {
         let replicas = vec![
-            Replica { node_id: "r1".into(), applied_seq: 100 }, // lag 5  — fresh
-            Replica { node_id: "r2".into(), applied_seq: 40 },  // lag 65 — stale
-            Replica { node_id: "r3".into(), applied_seq: 103 }, // lag 2  — fresh
+            Replica {
+                node_id: "r1".into(),
+                applied_seq: 100,
+            }, // lag 5  — fresh
+            Replica {
+                node_id: "r2".into(),
+                applied_seq: 40,
+            }, // lag 65 — stale
+            Replica {
+                node_id: "r3".into(),
+                applied_seq: 103,
+            }, // lag 2  — fresh
         ];
         let leader_seq = 105;
         let mut router = ReadRouter::new();
@@ -804,7 +816,10 @@ mod tests {
         let picks: Vec<usize> = (0..4)
             .map(|_| router.pick_fresh(&replicas, leader_seq, 10).unwrap())
             .collect();
-        assert!(picks.iter().all(|&i| i == 0 || i == 2), "stale r2 must be skipped: {picks:?}");
+        assert!(
+            picks.iter().all(|&i| i == 0 || i == 2),
+            "stale r2 must be skipped: {picks:?}"
+        );
 
         // If ALL are stale, fall back to the freshest (r3 @ 103).
         let mut r2 = ReadRouter::new();

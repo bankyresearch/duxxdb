@@ -318,7 +318,10 @@ mod tests {
         // Populate projA's workspace through the normal RESP path.
         let mut auth = security::AuthState::unauthenticated();
         s.dispatch_with_auth_state(
-            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(jwt_a.clone())]),
+            RespValue::Array(vec![
+                RespValue::bulk("AUTH"),
+                RespValue::bulk(jwt_a.clone()),
+            ]),
             false,
             &mut auth,
         );
@@ -331,7 +334,10 @@ mod tests {
             false,
             &mut auth,
         );
-        assert!(matches!(put, DispatchResponse::Reply(RespValue::Integer(_))));
+        assert!(matches!(
+            put,
+            DispatchResponse::Reply(RespValue::Integer(_))
+        ));
 
         // Overview reflects projA's workspace.
         let r = route(&s, "GET", "/studio/overview", "", Some(&jwt_a));
@@ -366,7 +372,10 @@ mod tests {
         }
 
         // Traces require a trace_id; absent → 400, present → 200 (spans array).
-        assert_eq!(route(&s, "GET", "/studio/traces", "", Some(&jwt_a)).status, 400);
+        assert_eq!(
+            route(&s, "GET", "/studio/traces", "", Some(&jwt_a)).status,
+            400
+        );
         let r = route(&s, "GET", "/studio/traces", "trace_id=t1", Some(&jwt_a));
         assert_eq!(r.status, 200);
         let v: Value = serde_json::from_slice(&r.body).unwrap();
@@ -427,6 +436,9 @@ mod tests {
     fn studio_without_jwt_secret_is_unavailable() {
         // A server with no JWT secret cannot serve Studio (no way to auth).
         let s = Server::new();
-        assert_eq!(route(&s, "GET", "/studio/overview", "", Some("x")).status, 503);
+        assert_eq!(
+            route(&s, "GET", "/studio/overview", "", Some("x")).status,
+            503
+        );
     }
 }

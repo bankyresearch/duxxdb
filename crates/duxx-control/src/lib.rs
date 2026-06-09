@@ -347,7 +347,10 @@ impl Store for InMemoryStore {
     }
 
     fn insert_project(&self, project: Project) {
-        self.state.write().projects.insert(project.id.clone(), project);
+        self.state
+            .write()
+            .projects
+            .insert(project.id.clone(), project);
     }
     fn get_project(&self, id: &str) -> Option<Project> {
         self.state.read().projects.get(id).cloned()
@@ -410,7 +413,8 @@ impl Store for InMemoryStore {
         key.revoked = false;
         let updated = key.clone();
         st.by_secret.remove(&old);
-        st.by_secret.insert(new_secret.to_string(), key_id.to_string());
+        st.by_secret
+            .insert(new_secret.to_string(), key_id.to_string());
         Some(updated)
     }
 
@@ -468,7 +472,12 @@ impl Store for InMemoryStore {
         u.cost_usd += cost_usd;
     }
     fn get_usage(&self, project_id: &str) -> Usage {
-        self.state.read().usage.get(project_id).cloned().unwrap_or_default()
+        self.state
+            .read()
+            .usage
+            .get(project_id)
+            .cloned()
+            .unwrap_or_default()
     }
     fn all_usage(&self) -> Vec<(String, Usage)> {
         self.state
@@ -695,9 +704,13 @@ impl ControlPlane {
         );
         // Prefer asymmetric (EdDSA) when configured; else HS256.
         if let Some(ed) = &self.ed_private {
-            return duxx_token::sign_ed25519(&claims, ed).map_err(|e| ControlError::Token(e.to_string()));
+            return duxx_token::sign_ed25519(&claims, ed)
+                .map_err(|e| ControlError::Token(e.to_string()));
         }
-        let signing_key = self.signing_key.as_ref().ok_or(ControlError::NoSigningKey)?;
+        let signing_key = self
+            .signing_key
+            .as_ref()
+            .ok_or(ControlError::NoSigningKey)?;
         duxx_token::sign(&claims, signing_key).map_err(|e| ControlError::Token(e.to_string()))
     }
 
@@ -729,7 +742,8 @@ impl ControlPlane {
             status: MemberStatus::Invited,
         };
         let token = format!("inv_{}", Uuid::new_v4().simple());
-        self.store.insert_member(member.clone(), Some(token.clone()));
+        self.store
+            .insert_member(member.clone(), Some(token.clone()));
         Ok((member, token))
     }
 
@@ -800,7 +814,8 @@ impl ControlPlane {
     /// Record usage for a project (typically aggregated from the data plane's
     /// `CostLedger` per billing period).
     pub fn record_usage(&self, project_id: &str, tokens_in: u64, tokens_out: u64, cost_usd: f64) {
-        self.store.add_usage(project_id, tokens_in, tokens_out, cost_usd);
+        self.store
+            .add_usage(project_id, tokens_in, tokens_out, cost_usd);
     }
 
     pub fn usage(&self, project_id: &str) -> Usage {
@@ -839,7 +854,9 @@ mod tests {
             .unwrap();
 
         // The secret authenticates to the right namespace + role.
-        let p = cp.authenticate(&key.secret).expect("key should authenticate");
+        let p = cp
+            .authenticate(&key.secret)
+            .expect("key should authenticate");
         assert_eq!(p.org_id, org.id);
         assert_eq!(p.project_id, proj.id);
         assert_eq!(p.env, Env::Prod);
@@ -883,7 +900,10 @@ mod tests {
         // Rotate → old secret dead, new secret works.
         let rotated = cp.rotate_key(&key.id).unwrap();
         assert_ne!(rotated.secret, key.secret);
-        assert!(cp.authenticate(&key.secret).is_none(), "old secret must die");
+        assert!(
+            cp.authenticate(&key.secret).is_none(),
+            "old secret must die"
+        );
         assert!(cp.authenticate(&rotated.secret).is_some());
 
         // Revoke → new secret dead too.
@@ -906,7 +926,11 @@ mod tests {
 
         let entry = key.data_plane_entry().unwrap();
         let fields: Vec<&str> = entry.split(':').collect();
-        assert_eq!(fields.len(), 4, "must be principal:token:role:tenant: {entry}");
+        assert_eq!(
+            fields.len(),
+            4,
+            "must be principal:token:role:tenant: {entry}"
+        );
         assert_eq!(fields[0], key.id);
         assert_eq!(fields[1], key.secret);
         assert_eq!(fields[2], "observer");
@@ -928,8 +952,12 @@ mod tests {
         let org = cp.create_org("Acme").unwrap();
         let a = cp.create_project(&org.id, "a").unwrap();
         let b = cp.create_project(&org.id, "b").unwrap();
-        let ka = cp.issue_key(&a.id, Env::Prod, Role::Developer, "ka").unwrap();
-        let _kb = cp.issue_key(&b.id, Env::Prod, Role::Developer, "kb").unwrap();
+        let ka = cp
+            .issue_key(&a.id, Env::Prod, Role::Developer, "ka")
+            .unwrap();
+        let _kb = cp
+            .issue_key(&b.id, Env::Prod, Role::Developer, "kb")
+            .unwrap();
 
         cp.place_project(&a.id, "node-1:6380", PlacementMode::Shared)
             .unwrap();
@@ -959,7 +987,10 @@ mod tests {
         let active = cp.accept_invite(&token).unwrap();
         assert_eq!(active.id, m.id);
         assert_eq!(active.status, MemberStatus::Active);
-        assert!(cp.accept_invite(&token).is_err(), "invite token is single-use");
+        assert!(
+            cp.accept_invite(&token).is_err(),
+            "invite token is single-use"
+        );
 
         assert!(cp.remove_member(&m.id));
         assert!(cp.list_members(&org.id).is_empty());
