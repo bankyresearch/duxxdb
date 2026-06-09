@@ -24,7 +24,7 @@ Sources reviewed:
 | Wire compatibility | Redis and Memcached APIs | RESP subset, gRPC, MCP, Python, Node | Expand RESP compatibility only where it helps agent stacks |
 | AI primitives | Redis-compatible data structures plus vector search | Memory, tool cache, sessions, traces, prompts, datasets, evals, replay, costs | Add lifecycle, governance, and isolation around these primitives |
 | Scale model | Vertical multi-core first, HA replicas/operator/cloud | Single node with persistence | Add shard-per-core execution, replicas, and operator-managed failover |
-| Enterprise ops | Snapshots, replication, K8s operator, Prometheus, OTel | Prometheus, health, TLS/mTLS, token auth, configurable RESP limits, offline snapshot CLI, packaging | Add RBAC, OTel, live snapshots, HA controller |
+| Enterprise ops | Snapshots, replication, K8s operator, Prometheus, OTel | Prometheus, health, TLS/mTLS, token/RBAC auth, audit log, configurable RESP/rate limits, offline snapshot CLI, packaging | Add OTel, live snapshots, HA controller |
 
 ## Features To Add
 
@@ -43,9 +43,11 @@ Sources reviewed:
    - Keep token auth as a simple bootstrap mode.
 
 3. **RBAC and tenant isolation**
-   - Introduce principals, roles, and scoped API keys.
-   - Enforce tenant filters inside every primitive, not only the cost
-     ledger.
+   - Status: RESP supports role API keys with read/write/admin roles,
+     audit events, and tenant-scoped key namespacing for tenant-safe
+     memory/session/cost commands.
+   - Next: enforce tenant filters inside every Phase 7 primitive, not
+     only the tenant-safe RESP command set.
    - Add tests proving tenant A cannot read tenant B data through RESP,
      gRPC, Python bindings, subscriptions, export, or recall.
 

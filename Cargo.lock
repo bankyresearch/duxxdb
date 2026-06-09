@@ -849,6 +849,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "duxx-cluster"
+version = "0.2.2"
+dependencies = [
+ "bincode",
+ "duxx-storage",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "duxx-coldtier"
 version = "0.2.2"
 dependencies = [
@@ -867,6 +877,23 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "duxx-control"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "duxx-token",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -913,6 +940,17 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "duxx-docs"
+version = "0.2.2"
+dependencies = [
+ "duxx-core",
+ "duxx-embed",
+ "duxx-memory",
+ "parking_lot",
+ "tempfile",
 ]
 
 [[package]]
@@ -1068,10 +1106,14 @@ name = "duxx-server"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "bincode",
  "bytes",
+ "duxx-cluster",
+ "duxx-control",
  "duxx-core",
  "duxx-cost",
  "duxx-datasets",
+ "duxx-docs",
  "duxx-embed",
  "duxx-eval",
  "duxx-memory",
@@ -1079,12 +1121,15 @@ dependencies = [
  "duxx-reactive",
  "duxx-replay",
  "duxx-storage",
+ "duxx-tenant",
+ "duxx-token",
  "duxx-trace",
  "http-body-util",
  "hyper",
  "hyper-util",
  "prometheus",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -1111,6 +1156,37 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "duxx-tenant"
+version = "0.2.2"
+dependencies = [
+ "duxx-core",
+ "duxx-cost",
+ "duxx-datasets",
+ "duxx-docs",
+ "duxx-embed",
+ "duxx-eval",
+ "duxx-memory",
+ "duxx-prompts",
+ "duxx-replay",
+ "duxx-storage",
+ "duxx-trace",
+ "parking_lot",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "duxx-token"
+version = "0.2.2"
+dependencies = [
+ "jsonwebtoken",
+ "ring",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1898,6 +1974,21 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64",
+ "js-sys",
+ "pem",
+ "ring",
+ "serde",
+ "serde_json",
+ "simple_asn1",
 ]
 
 [[package]]
@@ -3153,6 +3244,18 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "simple_asn1"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "thiserror 2.0.18",
+ "time",
 ]
 
 [[package]]

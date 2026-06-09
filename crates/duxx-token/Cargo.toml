@@ -1,0 +1,17 @@
+[package]
+name = "duxx-token"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Signed short-lived workspace credentials (JWT) shared by the DuxxDB control plane and data plane."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+jsonwebtoken = { workspace = true }
+ring = { workspace = true }

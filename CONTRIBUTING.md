@@ -14,6 +14,7 @@ view, read [`docs/ROADMAP.md`](docs/ROADMAP.md).
 ## Table of contents
 
 - [Code of conduct](#code-of-conduct)
+- [Licensing (open-core)](#licensing-open-core)
 - [Picking what to work on](#picking-what-to-work-on)
 - [Development setup](#development-setup)
 - [Build & test](#build--test)
@@ -32,6 +33,24 @@ view, read [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 Participation is governed by the [Contributor Covenant](CODE_OF_CONDUCT.md).
 Be kind, assume good faith, give specific and actionable feedback.
+
+---
+
+## Licensing (open-core)
+
+DuxxDB is **open-core**. Two licenses live in this repo (see
+[LICENSING.md](LICENSING.md) for the full breakdown):
+
+| Tier | License | Crates |
+|---|---|---|
+| **Core** (single-node engine, primitives, server, bindings, docs layer) | **Apache-2.0** (OSS) | `duxx-core`, `duxx-storage`, `duxx-index`, `duxx-query`, `duxx-memory`, `duxx-reactive`, `duxx-embed`, `duxx-trace`, `duxx-prompts`, `duxx-datasets`, `duxx-eval`, `duxx-replay`, `duxx-cost`, `duxx-docs`, `duxx-token`, `duxx-coldtier`, `duxx-grpc`, `duxx-mcp` |
+| **Enterprise** (multi-tenancy, control plane, replication/HA, cloud) | **BUSL-1.1** (source-available, *not* OSS) | `duxx-tenant`, `duxx-control`, `duxx-cluster`, `frontend/` |
+
+- Contributions to **Core** crates are accepted under **Apache-2.0**.
+- Contributions to **Enterprise** crates are accepted under **BUSL-1.1**; by
+  submitting, you agree your contribution is licensed under it.
+- Enterprise crates set `publish = false` (never pushed to crates.io). Any crate
+  that *depends on* an Enterprise crate must also set `publish = false`.
 
 ---
 
@@ -252,8 +271,10 @@ should never re-implement logic that belongs in `duxx-memory`.
 1. Add the directory under `crates/`.
 2. Add it to the `[workspace] members =` list in the root `Cargo.toml`.
 3. Use `version.workspace = true` etc. for shared metadata.
-4. Add a `description` and `license = "Apache-2.0"` in your
-   `Cargo.toml` so it's `crates.io`-publishable.
+4. **License it per the open-core split** (see [LICENSING.md](LICENSING.md)):
+   - **Core** crate → `license = "Apache-2.0"` (crates.io-publishable).
+   - **Enterprise** crate → `license = "BUSL-1.1"` **and** `publish = false`.
+     Anything that *depends on* an Enterprise crate also needs `publish = false`.
 5. Drop a `lib.rs` with at least one `#[test]` so CI exercises it.
 
 ---

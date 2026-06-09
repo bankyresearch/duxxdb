@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "duxxdb-integrations"
+version = "0.1.0"
+description = "DuxxDB integrations for LangChain and LlamaIndex (RESP client + adapters)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "DuxxDB Contributors" }]
+keywords = ["duxxdb", "ai-agents", "vector", "memory", "langchain", "llama-index", "rag"]
+dependencies = ["redis>=5.0"]
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.3"]
+llama-index = ["llama-index-core>=0.11"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+
+[project.urls]
+Homepage = "https://github.com/duxxdb/duxxdb"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/duxxdb_integrations"]
+
+[tool.ruff]
+line-length = 100
