@@ -1,0 +1,42 @@
+DuxxDB Enterprise — Business Source License 1.1 (BUSL-1.1)
+==========================================================
+
+The following crates and directories are the "Licensed Work" and are
+licensed under the Business Source License 1.1 (SPDX: BUSL-1.1):
+
+  crates/duxx-tenant     (multi-tenancy & isolation)
+  crates/duxx-control    (control plane: orgs/projects/keys/members/billing)
+  crates/duxx-cluster    (replication / HA / clustering)
+  frontend/              (DuxxDB Cloud Console + Studio)
+
+Everything else in this repository is licensed under Apache-2.0 (see LICENSE).
+See LICENSING.md for the full open-core breakdown.
+
+License parameters
+------------------
+
+  Licensor:             DuxxDB Contributors
+  Licensed Work:        DuxxDB Enterprise (the crates/directories listed above).
+                        (c) 2026 DuxxDB Contributors.
+  Additional Use Grant: You may make production use of the Licensed Work,
+                        provided your use does not include offering the Licensed
+                        Work to third parties as a hosted, managed, or
+                        "as-a-service" product whose value derives primarily
+                        from the Licensed Work's functionality.
+  Change Date:          Four years from the date each version is first published.
+  Change License:       Apache License, Version 2.0
+
+For alternative/commercial licensing, contact the Licensor.
+
+Full license text
+------------------
+
+The full, canonical legal text of the Business Source License 1.1 is published
+by its authors and is NOT reproduced here. Obtain the authoritative text from:
+
+  https://mariadb.com/bsl11/
+
+To complete this file, append the official BSL 1.1 body below this line (for
+example: `curl -sL https://mariadb.com/bsl11/ -o /tmp/bsl.txt`, then paste the
+license body). The parameters above are the project-specific values that the
+BSL template requires.

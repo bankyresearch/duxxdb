@@ -51,6 +51,9 @@ class Duxxdb < Formula
         DUXX_METRICS_ADDR=127.0.0.1:9100
         # DUXX_TLS_CLIENT_CA=/path/to/client-ca.pem
         # DUXX_MAX_INPUT_BUFFER_BYTES=33554432
+        # DUXX_MAX_CONNECTIONS=10000
+        # DUXX_MAX_COMMANDS_PER_SEC=1000
+        # DUXX_AUDIT_LOG=#{var}/log/duxxdb-audit.jsonl
         RUST_LOG=info
       EOS
     end

@@ -7,6 +7,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+# Source is Apache-2.0, but the default build links the Enterprise (BUSL-1.1)
+# crates (duxx-tenant/cluster/control), so this is not crates.io-publishable.
+# Distributed as a binary/Docker image. A pure-OSS single-node build behind a
+# cargo feature is the path to making it publishable (see LICENSING.md).
+publish = false
 
 [lib]
 path = "src/lib.rs"
@@ -70,6 +75,11 @@ duxx-datasets.workspace = true
 duxx-eval.workspace = true
 duxx-replay.workspace = true
 duxx-cost.workspace = true
+duxx-docs.workspace = true
+duxx-tenant.workspace = true
+duxx-token.workspace = true
+duxx-cluster.workspace = true
+bincode.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -86,7 +96,10 @@ http-body-util.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true
+# End-to-end test: control plane mints a JWT the data plane + Studio accept.
+duxx-control.workspace = true

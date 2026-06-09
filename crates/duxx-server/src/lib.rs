@@ -26,11 +26,16 @@
 
 pub mod glob;
 pub mod metrics;
+pub mod otlp;
+pub mod replication;
 pub mod resp;
+pub mod security;
+pub mod studio;
 pub mod tls;
 
 use duxx_cost::{BudgetPeriod, CostEntry, CostFilter, CostLedger, GroupBy};
 use duxx_datasets::{DatasetRegistry, DatasetRow};
+use duxx_docs::DocumentStore;
 use duxx_embed::{Embedder, HashEmbedder};
 use duxx_eval::{EvalRegistry, EvalStart};
 use duxx_memory::{MemoryStore, SessionStore};
@@ -40,7 +45,18 @@ use duxx_replay::{
     InvocationKind as ReplayInvocationKind, OverrideKind as ReplayOverrideKind, ReplayInvocation,
     ReplayMode, ReplayOverride, ReplayRegistry,
 };
+use duxx_cluster::{ChangeLog, Coordinator};
 use duxx_storage::Backend;
+use duxx_tenant::{Namespace, TenantRouter};
+
+/// Replication wiring: the leader appends every successful mutation to `log`;
+/// followers tail it and apply via [`Server::apply_replicated`]. The
+/// `coordinator` gates leader-only logging (no split-brain double-writes).
+#[derive(Clone)]
+struct Replication {
+    log: Arc<dyn ChangeLog>,
+    coordinator: Arc<dyn Coordinator>,
+}
 use duxx_trace::{Span, SpanKind, SpanStatus, TraceSearch, TraceStore};
 use resp::RespValue;
 use std::sync::Arc;
@@ -72,15 +88,45 @@ type Phase7IndexDirs = (
 /// The server state — cheaply cloned (Arc internals).
 #[derive(Clone)]
 pub struct Server {
+    /// Default workspace memory store. Used by principals that carry NO
+    /// namespace (auth disabled, or admin keys without a tenant) — i.e. the
+    /// self-hosted single-tenant path. Tenant-scoped principals are routed
+    /// to a per-namespace store via [`Server::tenants`] instead.
     memory: MemoryStore,
+    /// Default workspace session store (see `memory`).
     sessions: SessionStore,
+    /// Phase A: per-namespace workspace router. A principal whose credential
+    /// carries a tenant is routed here, to an isolated `MemoryStore` +
+    /// `SessionStore` (own HNSW + tantivy index). This is what makes
+    /// `RECALL` leak-proof across tenants — the v0.2.2 key-prefix scheme
+    /// could not, because `MemoryStore::recall` searches the whole index.
+    /// `Arc` so every cheap `Server` clone shares one router.
+    tenants: Arc<TenantRouter>,
+    /// Optional HS256 secret for verifying control-plane-issued workspace
+    /// JWTs at `AUTH` time. When set, a presented token that verifies is
+    /// resolved to a tenant-scoped principal straight from its claims; a
+    /// non-JWT token still falls through to the static auth catalog.
+    jwt_secret: Option<Arc<Vec<u8>>>,
+    /// Optional Ed25519 **public** key (DER) for verifying asymmetric
+    /// control-plane JWTs. The node never holds the private key, so it cannot
+    /// mint tokens — the preferred production posture over a shared HS256
+    /// secret.
+    jwt_public_key: Option<Arc<Vec<u8>>>,
+    /// Bounded, per-tenant-queryable audit trail (surfaced by Studio's
+    /// `/studio/audit`). Always on; the file `audit` log is separate/optional.
+    audit_trail: security::AuditTrail,
+    /// Optional leader/follower replication. When set and this node is leader,
+    /// every successful mutation is appended to the change feed.
+    replication: Option<Replication>,
+    /// Shared cluster token authenticating node-to-node replication pulls
+    /// (`POST /replication/pull`). Distinct from client JWTs — this is internal.
+    repl_token: Option<Arc<String>>,
     embedder: Arc<dyn Embedder>,
     dim: usize,
-    /// When `Some`, every connection must `AUTH <token>` before any
-    /// other command (PING is always allowed). When `None`, the
-    /// server runs unauthenticated — fine for localhost dev, NOT
-    /// safe for any network-exposed deployment.
-    auth_token: Option<Arc<str>>,
+    /// Optional API-key catalog. When non-empty, every connection must
+    /// `AUTH <token>` before any non-PING command. An empty catalog
+    /// keeps localhost/demo mode unauthenticated.
+    auth: security::AuthCatalog,
     /// Active connection count for graceful-shutdown drain. Dropped
     /// to 0 by `serve_with_shutdown` on each conn close.
     active_conns: Arc<std::sync::atomic::AtomicUsize>,
@@ -90,6 +136,12 @@ pub struct Server {
     /// Runtime bounds for RESP frame parsing and per-connection input
     /// buffering.
     resp_limits: resp::RespLimits,
+    /// Optional JSON-lines security audit sink.
+    audit: Option<security::AuditLogger>,
+    /// Optional global active-connection cap.
+    max_connections: Option<usize>,
+    /// Optional per-connection command rate limit.
+    max_commands_per_sec: Option<u32>,
     /// When Some, the accept loop wraps each TcpStream in a rustls
     /// TlsStream before handing it to `handle_connection`. Phase 6.2.
     tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -116,6 +168,9 @@ pub struct Server {
     /// semantic clustering of expensive queries. Surfaced via the
     /// COST.* RESP commands.
     costs: CostLedger,
+    /// Document-intelligence layer: ingest objects (from any store) into
+    /// hybrid-searchable, citable chunks. Surfaced via DOC.* commands.
+    docs: DocumentStore,
 }
 
 impl std::fmt::Debug for Server {
@@ -143,15 +198,28 @@ impl Server {
         let evals = EvalRegistry::new(embedder.clone());
         let replays = ReplayRegistry::new();
         let costs = CostLedger::new(embedder.clone());
+        let docs = DocumentStore::new(
+            Arc::new(duxx_docs::LocalFsConnector::new(".")),
+            embedder.clone(),
+        );
         Self {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
+            tenants: Arc::new(TenantRouter::new(embedder.clone())),
+            jwt_secret: None,
+            jwt_public_key: None,
+            audit_trail: security::AuditTrail::new(1000),
+            replication: None,
+            repl_token: None,
             embedder,
             dim,
-            auth_token: None,
+            auth: security::AuthCatalog::default(),
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
             resp_limits: resp::RespLimits::default(),
+            audit: None,
+            max_connections: None,
+            max_commands_per_sec: None,
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
@@ -159,13 +227,21 @@ impl Server {
             evals,
             replays,
             costs,
+            docs,
         }
     }
 
     /// Require clients to issue `AUTH <token>` before any non-PING
     /// command. Pass `None` to disable auth (the default).
     pub fn with_auth(mut self, token: impl Into<Arc<str>>) -> Self {
-        self.auth_token = Some(token.into());
+        self.auth = security::AuthCatalog::from_shared_admin_token(token)
+            .expect("shared auth token is validated by CLI before Server::with_auth");
+        self
+    }
+
+    /// Configure multiple API keys with read/write/admin roles.
+    pub fn with_auth_catalog(mut self, catalog: security::AuthCatalog) -> Self {
+        self.auth = catalog;
         self
     }
 
@@ -180,6 +256,24 @@ impl Server {
     /// Override RESP parser and per-connection buffering limits.
     pub fn with_resp_limits(mut self, limits: resp::RespLimits) -> Self {
         self.resp_limits = limits;
+        self
+    }
+
+    /// Append JSON-lines security audit events to `path`.
+    pub fn with_audit_log(mut self, path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        self.audit = Some(security::AuditLogger::open(path)?);
+        Ok(self)
+    }
+
+    /// Reject newly accepted connections while this many are active.
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
+    /// Limit command throughput per connection.
+    pub fn with_command_rate_limit(mut self, per_sec: u32) -> Self {
+        self.max_commands_per_sec = Some(per_sec);
         self
     }
 
@@ -221,6 +315,135 @@ impl Server {
     /// Number of currently-open client connections.
     pub fn active_connections(&self) -> usize {
         self.active_conns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Persist tenant workspaces under `dir` (one subdirectory per
+    /// `org/project/env`). Without this, tenant-scoped data is in-memory only
+    /// and lost on restart.
+    ///
+    /// `capacity` is the per-workspace memory capacity — and, because
+    /// `hnsw_rs` cannot grow past it, also the per-tenant memory **quota**.
+    /// The default (unscoped) workspace is unaffected; configure its
+    /// durability with `--storage` / `--phase7-storage` as before.
+    pub fn with_tenant_root(
+        mut self,
+        dir: impl Into<std::path::PathBuf>,
+        capacity: usize,
+    ) -> Self {
+        self.tenants = Arc::new(TenantRouter::with_root(self.embedder.clone(), capacity, dir));
+        self
+    }
+
+    /// Accept control-plane-issued workspace JWTs at `AUTH`, verified with
+    /// this HS256 secret (shared with the control plane). A verifying token
+    /// resolves to a tenant-scoped principal from its claims
+    /// (`org/project/env` + role); a non-JWT token still uses the static auth
+    /// catalog. This is the signed-credential path that supersedes static
+    /// `--auth-key` catalog materialization.
+    pub fn with_jwt_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.jwt_secret = Some(Arc::new(secret.into()));
+        self
+    }
+
+    /// Accept **asymmetric** (Ed25519) control-plane JWTs, verified with this
+    /// public key (DER). The node holds only the public key — it cannot mint
+    /// tokens, so a node compromise can't forge credentials. Preferred over
+    /// `with_jwt_secret` for multi-node clouds.
+    pub fn with_jwt_public_key(mut self, public_der: impl Into<Vec<u8>>) -> Self {
+        self.jwt_public_key = Some(Arc::new(public_der.into()));
+        self
+    }
+
+    /// Enable leader/follower replication. When this node is the leader (per
+    /// `coordinator`), every successful mutation is appended to `log`; a
+    /// follower tails the log and applies changes via
+    /// [`Server::apply_replicated`]. See `duxx-cluster`.
+    pub fn with_replication(
+        mut self,
+        log: Arc<dyn ChangeLog>,
+        coordinator: Arc<dyn Coordinator>,
+    ) -> Self {
+        self.replication = Some(Replication { log, coordinator });
+        self
+    }
+
+    /// Shared token authenticating node-to-node replication pulls. Required to
+    /// serve the replication transport (`replication::serve`).
+    pub fn with_replication_token(mut self, token: impl Into<String>) -> Self {
+        self.repl_token = Some(Arc::new(token.into()));
+        self
+    }
+
+    /// Accessor for the replication change log (used by the transport module).
+    pub(crate) fn replication_log(&self) -> Option<&Arc<dyn ChangeLog>> {
+        self.replication.as_ref().map(|r| &r.log)
+    }
+
+    pub(crate) fn replication_token(&self) -> Option<&str> {
+        self.repl_token.as_deref().map(String::as_str)
+    }
+
+    /// Apply a replicated change on a follower: decode the logged command and
+    /// re-execute it against this node's stores, scoped to the change's
+    /// namespace. Idempotent re-logging is impossible — a follower is not the
+    /// leader, so the mutation it re-runs is not re-appended.
+    pub fn apply_replicated(&self, change: &duxx_cluster::Change) {
+        let args: Vec<Vec<u8>> = match bincode::deserialize(&change.op) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        if args.is_empty() {
+            return;
+        }
+        let value = RespValue::Array(args.into_iter().map(RespValue::BulkString).collect());
+        let tenant = if change.namespace.is_empty() {
+            None
+        } else {
+            Some(change.namespace.clone())
+        };
+        let principal = security::Principal::new(
+            "replication",
+            "replication",
+            security::Role::Admin,
+            tenant,
+        );
+        let mut auth = security::AuthState::unauthenticated();
+        if let Ok(p) = principal {
+            auth.set_principal(p);
+        }
+        let _ = self.dispatch_with_auth_state(value, false, &mut auth);
+    }
+
+    fn audit_event(
+        &self,
+        auth: &security::AuthState,
+        command: &str,
+        outcome: &str,
+        detail: Option<&str>,
+    ) {
+        // Always record to the queryable in-memory trail (Studio reads this).
+        self.audit_trail.record(security::AuditRecord {
+            ts_unix_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            principal: auth.principal_name().to_string(),
+            tenant: auth.tenant().map(str::to_string),
+            command: command.to_string(),
+            outcome: outcome.to_string(),
+        });
+        // Plus the optional durable JSON-lines file log.
+        if let Some(audit) = &self.audit {
+            audit.record(security::AuditEvent {
+                surface: "resp",
+                principal: auth.principal_name(),
+                tenant: auth.tenant(),
+                role: auth.role(),
+                command,
+                outcome,
+                detail,
+            });
+        }
     }
 
     /// Wire persistent storage under every Phase 7 primitive
@@ -356,15 +579,28 @@ impl Server {
         let evals = EvalRegistry::new(embedder.clone());
         let replays = ReplayRegistry::new();
         let costs = CostLedger::new(embedder.clone());
+        let docs = DocumentStore::new(
+            Arc::new(duxx_docs::LocalFsConnector::new(".")),
+            embedder.clone(),
+        );
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
+            tenants: Arc::new(TenantRouter::new(embedder.clone())),
+            jwt_secret: None,
+            jwt_public_key: None,
+            audit_trail: security::AuditTrail::new(1000),
+            replication: None,
+            repl_token: None,
             embedder,
             dim,
-            auth_token: None,
+            auth: security::AuthCatalog::default(),
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
             resp_limits: resp::RespLimits::default(),
+            audit: None,
+            max_connections: None,
+            max_commands_per_sec: None,
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
@@ -372,6 +608,7 @@ impl Server {
             evals,
             replays,
             costs,
+            docs,
         })
     }
 
@@ -389,15 +626,28 @@ impl Server {
         let evals = EvalRegistry::new(embedder.clone());
         let replays = ReplayRegistry::new();
         let costs = CostLedger::new(embedder.clone());
+        let docs = DocumentStore::new(
+            Arc::new(duxx_docs::LocalFsConnector::new(".")),
+            embedder.clone(),
+        );
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
+            tenants: Arc::new(TenantRouter::new(embedder.clone())),
+            jwt_secret: None,
+            jwt_public_key: None,
+            audit_trail: security::AuditTrail::new(1000),
+            replication: None,
+            repl_token: None,
             embedder,
             dim,
-            auth_token: None,
+            auth: security::AuthCatalog::default(),
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
             resp_limits: resp::RespLimits::default(),
+            audit: None,
+            max_connections: None,
+            max_commands_per_sec: None,
             tls_config: None,
             traces: TraceStore::new(),
             prompts,
@@ -405,6 +655,7 @@ impl Server {
             evals,
             replays,
             costs,
+            docs,
         })
     }
 
@@ -443,7 +694,8 @@ impl Server {
         let listener = TcpListener::bind(addr).await?;
         tracing::info!(
             addr = %addr,
-            auth = self.auth_token.is_some(),
+            auth = self.auth_required(),
+            jwt = self.jwt_secret.is_some(),
             tls = self.tls_config.is_some(),
             "duxx-server listening"
         );
@@ -451,6 +703,13 @@ impl Server {
         loop {
             let (socket, peer) = listener.accept().await?;
             tracing::debug!(?peer, "accepted");
+            if let Some(max) = self.max_connections {
+                if self.active_connections() >= max {
+                    tracing::warn!(?peer, max, "connection rejected: max connections reached");
+                    drop(socket);
+                    continue;
+                }
+            }
             let server = self.clone();
             self.active_conns
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -485,7 +744,8 @@ impl Server {
         let listener = TcpListener::bind(addr).await?;
         tracing::info!(
             addr = %addr,
-            auth = self.auth_token.is_some(),
+            auth = self.auth_required(),
+            jwt = self.jwt_secret.is_some(),
             tls = self.tls_config.is_some(),
             "duxx-server listening"
         );
@@ -500,6 +760,16 @@ impl Server {
                     let (socket, peer) = accept?;
                     tracing::debug!(?peer, "accepted");
                     let s = server.clone();
+                    if let Some(max) = s.max_connections {
+                        if counter.load(std::sync::atomic::Ordering::Relaxed) >= max {
+                            tracing::warn!(?peer, max, "connection rejected: max connections reached");
+                            if let Some(m) = &s.metrics {
+                                m.errors_total.with_label_values(&["conn_limit"]).inc();
+                            }
+                            drop(socket);
+                            continue;
+                        }
+                    }
                     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(m) = &s.metrics {
                         m.connections_total.inc();
@@ -561,9 +831,13 @@ impl Server {
         let mut out = Vec::with_capacity(1024);
         let mut state = SubState::default();
         let resp_limits = self.resp_limits;
-        // Pre-authed when no token is configured. Otherwise stays
-        // false until the client issues AUTH <token>.
-        let mut authed = self.auth_token.is_none();
+        let mut auth = if self.auth_required() {
+            security::AuthState::unauthenticated()
+        } else {
+            security::AuthState::disabled()
+        };
+        let mut rate_window = tokio::time::Instant::now();
+        let mut commands_in_window = 0u32;
 
         loop {
             // Drain any complete commands already in `buf`.
@@ -571,7 +845,31 @@ impl Server {
                 match resp::parse_with_limits(&mut buf, resp_limits) {
                     Ok(Some(v)) => {
                         out.clear();
-                        let action = self.dispatch_with_auth(v, state.is_subscribed(), &mut authed);
+                        if let Some(limit) = self.max_commands_per_sec {
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(rate_window) >= std::time::Duration::from_secs(1)
+                            {
+                                rate_window = now;
+                                commands_in_window = 0;
+                            }
+                            commands_in_window = commands_in_window.saturating_add(1);
+                            if commands_in_window > limit {
+                                self.audit_event(
+                                    &auth,
+                                    "RATE_LIMIT",
+                                    "denied",
+                                    Some("commands_per_sec"),
+                                );
+                                RespValue::Error(format!(
+                                    "ERR rate limit exceeded (max {limit} commands/sec)"
+                                ))
+                                .write_to(&mut out);
+                                socket.write_all(&out).await?;
+                                return Ok(());
+                            }
+                        }
+                        let action =
+                            self.dispatch_with_auth_state(v, state.is_subscribed(), &mut auth);
                         match action {
                             Response::Reply(value) => {
                                 value.write_to(&mut out);
@@ -656,6 +954,9 @@ impl Server {
                         recv = rx.recv() => {
                             match recv {
                                 Ok(event) => {
+                                    if !event_allowed_for_auth(&auth, &event) {
+                                        continue;
+                                    }
                                     let event_channel = event.channel();
                                     // Exact subscriptions: match channel exactly OR by table name
                                     // (so existing `SUBSCRIBE memory` keeps receiving keyed events).
@@ -720,32 +1021,96 @@ impl Server {
         subscribed: bool,
         authed: &mut bool,
     ) -> Response {
-        // Authentication gate: when a token is configured, only
+        let mut auth = if *authed {
+            security::AuthState::disabled()
+        } else {
+            security::AuthState::unauthenticated()
+        };
+        let response = self.dispatch_with_auth_state(value, subscribed, &mut auth);
+        *authed = auth.is_authed();
+        response
+    }
+
+    fn dispatch_with_auth_state(
+        &self,
+        value: RespValue,
+        subscribed: bool,
+        auth: &mut security::AuthState,
+    ) -> Response {
+        let command = command_name(&value).unwrap_or_default();
+
+        // Authentication gate: when a catalog is configured, only
         // PING / AUTH / QUIT / HELLO work pre-auth. Everything else
         // returns NOAUTH to match Redis convention.
-        if !*authed {
-            // Peek at the command name without consuming `value`.
-            let cmd_upper = match &value {
-                RespValue::Array(items) if !items.is_empty() => arg_string(&items[0])
-                    .map(|s| s.to_ascii_uppercase())
-                    .unwrap_or_default(),
-                _ => String::new(),
-            };
-            let allowed_pre_auth = matches!(cmd_upper.as_str(), "AUTH" | "PING" | "QUIT" | "HELLO");
+        if !auth.is_authed() {
+            let allowed_pre_auth = matches!(command.as_str(), "AUTH" | "PING" | "QUIT" | "HELLO");
             if !allowed_pre_auth {
+                self.audit_event(auth, &command, "denied", Some("unauthenticated"));
                 return Response::Reply(err("NOAUTH Authentication required."));
             }
         }
-        self.dispatch_with_sub_inner(value, subscribed, authed)
+
+        if auth.is_authed() && !auth.allow_command(&command) {
+            self.audit_event(auth, &command, "denied", Some("role"));
+            return Response::Reply(err(format!(
+                "NOPERM role '{}' cannot execute {command}",
+                auth.role().unwrap_or(security::Role::ReadOnly)
+            )));
+        }
+
+        if auth.tenant().is_some() && !tenant_safe_command(&command) {
+            self.audit_event(auth, &command, "denied", Some("tenant_scope"));
+            return Response::Reply(err(format!(
+                "NOPERM {command} is not available for tenant-scoped credentials"
+            )));
+        }
+
+        // Replication: capture the op for write commands *before* `value` is
+        // consumed by dispatch. Only encode when replication is configured and
+        // the command is a mutation (write-level).
+        let repl_op = if self.replication.is_some()
+            && security::required_role(&command) == security::Role::ReadWrite
+        {
+            Some(encode_command(&value))
+        } else {
+            None
+        };
+
+        // Route to the caller's isolated workspace when tenant-scoped. The
+        // view's primitive fields ARE the workspace's stores, so every
+        // handler (memory, session, and Phase 7) operates on the tenant's
+        // own data with no per-handler routing code.
+        let response = match self.workspace_view(auth) {
+            Some(view) => view.dispatch_with_sub_inner(value, subscribed, auth),
+            None => self.dispatch_with_sub_inner(value, subscribed, auth),
+        };
+
+        // Leader-only: append every successful mutation to the change feed.
+        if let (Some(op), Some(repl)) = (repl_op, &self.replication) {
+            if !response_is_error(&response) && repl.coordinator.is_leader() {
+                let ns = auth.tenant().unwrap_or("").to_string();
+                repl.log.append(&ns, op);
+            }
+        }
+
+        if security::is_audited_command(&command) {
+            let outcome = if response_is_error(&response) {
+                "error"
+            } else {
+                "ok"
+            };
+            self.audit_event(auth, &command, outcome, None);
+        }
+        response
     }
 
     fn dispatch_with_sub_inner(
         &self,
         value: RespValue,
         subscribed: bool,
-        authed: &mut bool,
+        auth: &mut security::AuthState,
     ) -> Response {
-        let args = match value {
+        let mut args = match value {
             RespValue::Array(items) => items,
             other => return Response::Reply(err(format!("ERR expected array, got {other:?}"))),
         };
@@ -769,10 +1134,22 @@ impl Server {
             }
         }
 
+        // When this runs on a tenant view (see `dispatch_with_auth_state`),
+        // every `self.<primitive>` is already the tenant's isolated store,
+        // so memory/session/Phase-7 isolation needs no arg rewriting. What
+        // remains here scopes the few commands NOT routed by the view:
+        // pub/sub channel names (per-workspace reactive buses are a
+        // follow-up) and `COST.*` arguments.
+        if let Some(tenant) = auth.tenant() {
+            if let Err(response) = apply_tenant_scope(&cmd, &mut args, tenant) {
+                return response;
+            }
+        }
+
         match cmd.as_str() {
             "PING" => self.cmd_ping(&args),
             "HELLO" => self.cmd_hello(&args),
-            "AUTH" => self.cmd_auth(&args, authed),
+            "AUTH" => self.cmd_auth(&args, auth),
             "COMMAND" => self.cmd_command(),
             "INFO" => self.cmd_info(),
             "QUIT" => Response::CloseAfter(simple("OK")),
@@ -781,6 +1158,10 @@ impl Server {
             "DEL" => self.cmd_del(&args),
             "REMEMBER" => self.cmd_remember(&args),
             "RECALL" => self.cmd_recall(&args),
+            "DOC.INGEST" => self.cmd_doc_ingest(&args),
+            "DOC.SEARCH" => self.cmd_doc_search(&args),
+            "DOC.LIST" => self.cmd_doc_list(),
+            "DOC.DELETE" => self.cmd_doc_delete(&args),
             "SUBSCRIBE" => self.cmd_subscribe(&args),
             "UNSUBSCRIBE" => self.cmd_unsubscribe(&args),
             "PSUBSCRIBE" => self.cmd_psubscribe(&args),
@@ -854,9 +1235,10 @@ impl Server {
         }
     }
 
-    fn cmd_auth(&self, args: &[RespValue], authed: &mut bool) -> Response {
+    fn cmd_auth(&self, args: &[RespValue], auth: &mut security::AuthState) -> Response {
         // Redis AUTH is `AUTH <password>` or `AUTH <user> <password>`.
-        // We accept both shapes and ignore the user part (single-tenant).
+        // We accept both shapes. In catalog mode, the optional user
+        // remains informational; tokens identify principals.
         let token = match args.len() {
             2 => arg_string(&args[1]),
             3 => arg_string(&args[2]),
@@ -866,20 +1248,102 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR AUTH token must be a string")),
         };
-        match &self.auth_token {
-            None => Response::Reply(err("ERR Client sent AUTH, but no password is set")),
-            Some(expected) => {
-                if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-                    *authed = true;
+
+        // 1. Control-plane workspace JWT. Try asymmetric (Ed25519 public key)
+        //    first, then symmetric (HS256 secret). A token that verifies is
+        //    resolved straight from its claims; one that isn't a valid JWT for
+        //    us falls through to the static catalog.
+        let claims = self
+            .jwt_public_key
+            .as_ref()
+            .and_then(|pk| duxx_token::verify_ed25519(token, pk).ok())
+            .or_else(|| {
+                self.jwt_secret
+                    .as_ref()
+                    .and_then(|s| duxx_token::verify(token, s).ok())
+            });
+        if let Some(claims) = claims {
+            return match self.principal_from_claims(&claims) {
+                Ok(principal) => {
+                    auth.set_principal(principal);
                     Response::Reply(simple("OK"))
-                } else {
-                    Response::Reply(err("WRONGPASS invalid token"))
                 }
+                Err(e) => Response::Reply(err(format!("WRONGPASS {e}"))),
+            };
+        }
+
+        // 2. Static auth catalog.
+        if !self.auth.is_required() {
+            return Response::Reply(err("ERR Client sent AUTH, but no password is set"));
+        }
+        match self.auth.authenticate(token) {
+            Some(principal) => {
+                auth.set_principal(principal);
+                Response::Reply(simple("OK"))
             }
+            None => Response::Reply(err("WRONGPASS invalid token")),
         }
     }
 
+    /// Whether clients must `AUTH` before issuing commands: true if a static
+    /// catalog OR a JWT verification secret is configured.
+    fn auth_required(&self) -> bool {
+        self.auth.is_required() || self.jwt_secret.is_some() || self.jwt_public_key.is_some()
+    }
+
+    /// Build a tenant-scoped principal from verified JWT claims. The tenant
+    /// field is `org/project/env` (which the workspace view parses into an
+    /// isolated namespace); the role string maps via the same parser as
+    /// `--auth-key`.
+    fn principal_from_claims(
+        &self,
+        claims: &duxx_token::Claims,
+    ) -> anyhow::Result<security::Principal> {
+        let role: security::Role = claims.role.parse()?;
+        // `sub` (the key id) doubles as the principal name and the token slot
+        // (the latter is unused once the principal is set on the connection).
+        let mut principal = security::Principal::new(
+            claims.sub.clone(),
+            claims.sub.clone(),
+            role,
+            Some(claims.tenant()),
+        )?;
+        // Fine-grained capabilities from the claim's role name.
+        principal.caps = security::Capabilities::for_role_str(&claims.role);
+        Ok(principal)
+    }
+
     // ----- command handlers ------------------------------------------------
+
+    /// Build a per-request view of this server whose agent primitives point
+    /// at the caller's isolated [`duxx_tenant::Workspace`].
+    ///
+    /// * Returns `None` for an **unscoped** principal (admin / auth-off):
+    ///   dispatch runs against the default workspace (`self`).
+    /// * For a **tenant-scoped** principal it returns a shallow `Server`
+    ///   clone — every field is `Arc`-backed, so the clone is cheap — with
+    ///   `memory`, `sessions`, `traces`, `prompts`, `datasets`, `evals`,
+    ///   `replays`, and `costs` swapped for the workspace's own stores.
+    ///
+    /// Because the view IS a `Server`, every command handler transparently
+    /// operates on the tenant's stores via `self.<primitive>` with no
+    /// per-handler routing code — memory, sessions, AND the Phase 7
+    /// registries are all isolated by the same mechanism.
+    fn workspace_view(&self, auth: &security::AuthState) -> Option<Server> {
+        let tenant = auth.tenant()?;
+        let ws = self.tenants.workspace(&Namespace::parse(tenant));
+        let mut view = self.clone();
+        view.memory = ws.memory().clone();
+        view.sessions = ws.sessions().clone();
+        view.traces = ws.traces().clone();
+        view.prompts = ws.prompts().clone();
+        view.datasets = ws.datasets().clone();
+        view.evals = ws.evals().clone();
+        view.replays = ws.replays().clone();
+        view.costs = ws.costs().clone();
+        view.docs = ws.docs().clone();
+        Some(view)
+    }
 
     fn cmd_ping(&self, args: &[RespValue]) -> Response {
         if args.len() == 1 {
@@ -1187,6 +1651,103 @@ impl Server {
             })
             .collect();
         Response::Reply(RespValue::Array(arr))
+    }
+
+    // ---------------------------------------------------------------- DOC.* (documents)
+
+    /// `DOC.INGEST uri content_type text...` — index pre-extracted document
+    /// text (chunk → embed → hybrid-index). Returns `[doc_id, version, chunks]`.
+    fn cmd_doc_ingest(&self, args: &[RespValue]) -> Response {
+        if args.len() < 4 {
+            return Response::Reply(err("ERR DOC.INGEST expects: uri content_type text..."));
+        }
+        let uri = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR uri must be a string")),
+        };
+        let content_type = match arg_string(&args[2]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR content_type must be a string")),
+        };
+        let text = args[3..]
+            .iter()
+            .filter_map(|v| arg_string(v).map(str::to_string))
+            .collect::<Vec<_>>()
+            .join(" ");
+        match self.docs.ingest_text(uri, content_type, &text) {
+            Ok(doc) => Response::Reply(RespValue::Array(vec![
+                RespValue::bulk(doc.id),
+                RespValue::Integer(doc.version as i64),
+                RespValue::Integer(doc.chunk_ids.len() as i64),
+            ])),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `DOC.SEARCH query [k]` — hybrid search over ingested chunks. Each hit is
+    /// `[text, score, source_uri, version, chunk_index]` (a citation).
+    fn cmd_doc_search(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err("ERR DOC.SEARCH expects: query [k]"));
+        }
+        let query = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR query must be a string")),
+        };
+        let k = args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10);
+        match self.docs.search(query, k) {
+            Ok(hits) => {
+                let arr = hits
+                    .into_iter()
+                    .map(|h| {
+                        RespValue::Array(vec![
+                            RespValue::bulk(h.text),
+                            RespValue::bulk(format!("{:.6}", h.score)),
+                            RespValue::bulk(h.citation.uri),
+                            RespValue::Integer(h.citation.version as i64),
+                            RespValue::Integer(h.citation.chunk_index as i64),
+                        ])
+                    })
+                    .collect();
+                Response::Reply(RespValue::Array(arr))
+            }
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `DOC.LIST` — `[doc_id, uri, content_type, version, chunks]` per document.
+    fn cmd_doc_list(&self) -> Response {
+        let arr = self
+            .docs
+            .list_documents()
+            .into_iter()
+            .map(|d| {
+                RespValue::Array(vec![
+                    RespValue::bulk(d.id),
+                    RespValue::bulk(d.uri),
+                    RespValue::bulk(d.content_type),
+                    RespValue::Integer(d.version as i64),
+                    RespValue::Integer(d.chunk_ids.len() as i64),
+                ])
+            })
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `DOC.DELETE doc_id` — drop a document's chunks from the index.
+    fn cmd_doc_delete(&self, args: &[RespValue]) -> Response {
+        let doc_id = match args.get(1).and_then(arg_string) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR DOC.DELETE expects: doc_id")),
+        };
+        match self.docs.delete(doc_id, false) {
+            Ok(removed) => Response::Reply(RespValue::Integer(if removed { 1 } else { 0 })),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
     }
 
     // ---------------------------------------------------------------- Phase 7.1: TRACE.*
@@ -3039,17 +3600,155 @@ fn err(s: impl Into<String>) -> RespValue {
 }
 
 /// Constant-time byte comparison — keeps token validation immune to
-/// timing side-channel attacks. Pulled in here rather than via the
-/// `subtle` crate to keep the dep tree small.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+fn command_name(value: &RespValue) -> Option<String> {
+    match value {
+        RespValue::Array(items) if !items.is_empty() => {
+            arg_string(&items[0]).map(|s| s.to_ascii_uppercase())
+        }
+        _ => None,
     }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+}
+
+/// Encode a RESP command (array of args) as `bincode(Vec<Vec<u8>>)` for the
+/// replication change feed. `apply_replicated` decodes it back.
+fn encode_command(value: &RespValue) -> Vec<u8> {
+    let args: Vec<Vec<u8>> = match value {
+        RespValue::Array(items) => items.iter().map(resp_arg_bytes).collect(),
+        other => vec![resp_arg_bytes(other)],
+    };
+    bincode::serialize(&args).unwrap_or_default()
+}
+
+fn resp_arg_bytes(v: &RespValue) -> Vec<u8> {
+    match v {
+        RespValue::BulkString(b) => b.clone(),
+        RespValue::SimpleString(s) => s.clone().into_bytes(),
+        RespValue::Integer(i) => i.to_string().into_bytes(),
+        _ => Vec::new(),
     }
-    diff == 0
+}
+
+fn response_is_error(response: &Response) -> bool {
+    matches!(
+        response,
+        Response::Reply(RespValue::Error(_)) | Response::CloseAfter(RespValue::Error(_))
+    )
+}
+
+/// Whether a tenant-scoped credential may run `command`.
+///
+/// Since A2, the per-namespace workspace view (`Server::workspace_view`)
+/// routes every agent primitive — memory, session, AND the Phase 7
+/// registries — to the tenant's isolated stores. So all of those families
+/// are now tenant-safe (previously Phase 7 was blocked entirely). Sub-command
+/// families are matched by their `FAMILY.` prefix so new sub-commands are
+/// covered automatically. Role checks (`required_role`) still apply on top,
+/// so e.g. a read-only tenant key still cannot `PROMPT.PUT`.
+fn tenant_safe_command(command: &str) -> bool {
+    if let Some((family, _sub)) = command.split_once('.') {
+        return matches!(
+            family,
+            "MEMORY" | "SESSION" | "TRACE" | "PROMPT" | "DATASET" | "EVAL" | "REPLAY" | "COST"
+                | "DOC"
+        );
+    }
+    matches!(
+        command,
+        "PING"
+            | "HELLO"
+            | "COMMAND"
+            | "INFO"
+            | "QUIT"
+            | "AUTH"
+            | "SET"
+            | "GET"
+            | "DEL"
+            | "REMEMBER"
+            | "RECALL"
+            | "SUBSCRIBE"
+            | "UNSUBSCRIBE"
+            | "PSUBSCRIBE"
+            | "PUNSUBSCRIBE"
+    )
+}
+
+/// Tenant arg-scoping for commands that are NOT routed to a per-namespace
+/// workspace.
+///
+/// Memory + session commands (`SET/GET/DEL/REMEMBER/RECALL`) are no longer
+/// here: they are isolated structurally by routing to the tenant's own
+/// [`duxx_tenant::Workspace`] (see `Server::stores_for`), which fixes the
+/// v0.2.2 recall leak that key-prefixing could not.
+///
+/// What remains:
+/// * pub/sub channels — still namespaced by prefix (per-workspace reactive
+///   buses are a follow-up; until then prefixing keeps channels separated).
+/// * `COST.*` — the cost ledger is a single tenant-aware store, so the
+///   tenant is injected/forced into the relevant argument or filter.
+fn apply_tenant_scope(cmd: &str, args: &mut Vec<RespValue>, tenant: &str) -> Result<(), Response> {
+    match cmd {
+        "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" => {
+            prefix_channel_arg(args, 1, tenant)
+        }
+        "COST.RECORD" | "COST.TOTAL" | "COST.GET_BUDGET" | "COST.STATUS" => {
+            set_arg(args, 1, tenant.to_string())
+        }
+        "COST.QUERY" | "COST.CLUSTER_EXPENSIVE" => ensure_cost_filter(args, 1, tenant),
+        "COST.AGGREGATE" => ensure_cost_filter(args, 2, tenant),
+        _ => Ok(()),
+    }
+}
+
+fn prefix_channel_arg(args: &mut [RespValue], idx: usize, tenant: &str) -> Result<(), Response> {
+    let Some(value) = args.get(idx).and_then(arg_string) else {
+        return Ok(());
+    };
+    let scoped = if let Some(key) = value.strip_prefix("memory.") {
+        if key.starts_with(&format!("{tenant}:")) {
+            value.to_string()
+        } else {
+            format!("memory.{tenant}:{key}")
+        }
+    } else {
+        value.to_string()
+    };
+    set_arg(args, idx, scoped)
+}
+
+fn set_arg(args: &mut [RespValue], idx: usize, value: String) -> Result<(), Response> {
+    if let Some(slot) = args.get_mut(idx) {
+        *slot = RespValue::bulk(value);
+    }
+    Ok(())
+}
+
+fn ensure_cost_filter(args: &mut Vec<RespValue>, idx: usize, tenant: &str) -> Result<(), Response> {
+    while args.len() <= idx {
+        args.push(RespValue::bulk("-"));
+    }
+    let raw = args.get(idx).and_then(arg_string).unwrap_or("-");
+    let mut value = match raw {
+        "-" | "" => serde_json::json!({}),
+        json => match serde_json::from_str::<serde_json::Value>(json) {
+            Ok(v) => v,
+            Err(e) => return Err(Response::Reply(err(format!("ERR filter_json: {e}")))),
+        },
+    };
+    if !value.is_object() {
+        return Err(Response::Reply(err("ERR filter_json must be an object")));
+    }
+    value["tenant"] = serde_json::Value::String(tenant.to_string());
+    set_arg(args, idx, value.to_string())
+}
+
+fn event_allowed_for_auth(auth: &security::AuthState, event: &ChangeEvent) -> bool {
+    let Some(tenant) = auth.tenant() else {
+        return true;
+    };
+    let Some(key) = event.key.as_deref() else {
+        return true;
+    };
+    key.starts_with(&format!("{tenant}:"))
 }
 
 fn arg_string(v: &RespValue) -> Option<&str> {
@@ -3081,6 +3780,132 @@ mod tests {
         let s = Server::new();
         let r = dispatch_array(&s, vec![RespValue::bulk("PING")]);
         assert_eq!(r, simple("PONG"));
+    }
+
+    /// Gap 2: a leader appends every successful mutation to the change feed; a
+    /// fresh follower tails it, applies the ops, and converges — reads are not
+    /// replicated.
+    #[test]
+    fn replication_leader_logs_and_follower_converges() {
+        use duxx_cluster::{ChangeLog, Follower, MemoryLog, StaticCoordinator};
+        use std::sync::Arc;
+
+        let log = Arc::new(MemoryLog::new());
+        let leader = Server::new()
+            .with_replication(log.clone(), Arc::new(StaticCoordinator::solo("leader")));
+
+        // A write on the leader is logged.
+        dispatch_array(
+            &leader,
+            vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("replicate me falcon"),
+            ],
+        );
+        assert_eq!(log.latest_seq(), 1, "leader must log the mutation");
+
+        // A read is NOT logged.
+        dispatch_array(
+            &leader,
+            vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("falcon"),
+            ],
+        );
+        assert_eq!(log.latest_seq(), 1, "reads must not be replicated");
+
+        // A fresh follower applies the change feed and converges.
+        let follower = Server::new();
+        let mut f = Follower::new();
+        let applied = f.catch_up(&*log, |c| follower.apply_replicated(c));
+        assert_eq!(applied, 1);
+
+        let r = dispatch_array(
+            &follower,
+            vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("falcon"),
+                RespValue::bulk("5"),
+            ],
+        );
+        match r {
+            RespValue::Array(items) => {
+                assert!(!items.is_empty(), "follower must have the replicated memory")
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    /// Document layer: DOC.INGEST → DOC.SEARCH (with citation) → DOC.LIST →
+    /// DOC.DELETE, over the workspace-isolated DocumentStore.
+    #[test]
+    fn doc_ingest_search_cite_and_delete() {
+        let s = Server::new();
+        let bulk_str = |v: &RespValue| match v {
+            RespValue::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+            _ => panic!("expected bulk string"),
+        };
+
+        // Ingest → [doc_id, version, chunk_count].
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("DOC.INGEST"),
+                RespValue::bulk("s3://kb/france.md"),
+                RespValue::bulk("text/markdown"),
+                RespValue::bulk("The capital of France is Paris. The Seine flows through it."),
+            ],
+        );
+        let doc_id = match r {
+            RespValue::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[1], RespValue::Integer(1)); // version 1
+                bulk_str(&items[0])
+            }
+            other => panic!("expected array, got {other:?}"),
+        };
+
+        // Search → first hit carries the source citation.
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("DOC.SEARCH"),
+                RespValue::bulk("capital of France"),
+                RespValue::bulk("5"),
+            ],
+        );
+        match r {
+            RespValue::Array(items) => {
+                assert!(!items.is_empty());
+                if let RespValue::Array(hit) = &items[0] {
+                    // [text, score, uri, version, chunk_index]
+                    assert!(bulk_str(&hit[0]).contains("Paris"));
+                    assert_eq!(bulk_str(&hit[2]), "s3://kb/france.md");
+                } else {
+                    panic!("hit is not an array");
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // List → one document.
+        assert!(matches!(
+            dispatch_array(&s, vec![RespValue::bulk("DOC.LIST")]),
+            RespValue::Array(ref i) if i.len() == 1
+        ));
+
+        // Delete → 1, then search is empty.
+        assert_eq!(
+            dispatch_array(&s, vec![RespValue::bulk("DOC.DELETE"), RespValue::bulk(doc_id)]),
+            RespValue::Integer(1)
+        );
+        assert!(matches!(
+            dispatch_array(&s, vec![RespValue::bulk("DOC.SEARCH"), RespValue::bulk("Paris")]),
+            RespValue::Array(ref i) if i.is_empty()
+        ));
     }
 
     #[test]
@@ -3340,6 +4165,623 @@ mod tests {
     }
 
     #[test]
+    fn read_only_principal_cannot_write() {
+        let catalog = security::AuthCatalog::parse_entries(["reader:readsecret:read"]).unwrap();
+        let s = Server::new().with_auth_catalog(catalog);
+        let mut auth = security::AuthState::unauthenticated();
+        let r = s.dispatch_with_auth_state(
+            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk("readsecret")]),
+            false,
+            &mut auth,
+        );
+        assert!(matches!(r, Response::Reply(RespValue::SimpleString(_))));
+
+        let r = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("SET"),
+                RespValue::bulk("k"),
+                RespValue::bulk("v"),
+            ]),
+            false,
+            &mut auth,
+        );
+        match r {
+            Response::Reply(RespValue::Error(msg)) => assert!(msg.contains("NOPERM")),
+            other => panic!("expected NOPERM, got {other:?}"),
+        }
+    }
+
+    /// A tenant-scoped principal is routed to its own isolated workspace.
+    /// Its session writes round-trip for itself, never touch the default
+    /// workspace, and are invisible to other tenants. (Replaces the old
+    /// key-prefix assertion — routing is now the isolation mechanism.)
+    #[test]
+    fn tenant_scoped_principal_routes_to_isolated_workspace() {
+        let catalog = security::AuthCatalog::parse_entries([
+            "acme-writer:acmesecret:write:acme",
+            "globex-writer:globexsecret:write:globex",
+        ])
+        .unwrap();
+        let s = Server::new().with_auth_catalog(catalog);
+
+        let authed = |token: &str| {
+            let mut auth = security::AuthState::unauthenticated();
+            s.dispatch_with_auth_state(
+                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
+                false,
+                &mut auth,
+            );
+            auth
+        };
+
+        // acme writes a session value.
+        let mut acme = authed("acmesecret");
+        let r = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("SET"),
+                RespValue::bulk("session"),
+                RespValue::bulk("acme-value"),
+            ]),
+            false,
+            &mut acme,
+        );
+        assert!(matches!(r, Response::Reply(RespValue::SimpleString(_))));
+
+        // It round-trips for acme (routed to acme's own workspace).
+        let got = s.dispatch_with_auth_state(
+            RespValue::Array(vec![RespValue::bulk("GET"), RespValue::bulk("session")]),
+            false,
+            &mut acme,
+        );
+        match got {
+            Response::Reply(RespValue::BulkString(b)) => assert_eq!(b, b"acme-value"),
+            other => panic!("expected acme-value, got {other:?}"),
+        }
+
+        // The DEFAULT workspace never saw it — no key-prefix leakage.
+        assert_eq!(s.sessions().get("session"), None);
+        assert_eq!(s.sessions().get("acme:session"), None);
+
+        // A different tenant cannot read acme's session.
+        let mut globex = authed("globexsecret");
+        let other = s.dispatch_with_auth_state(
+            RespValue::Array(vec![RespValue::bulk("GET"), RespValue::bulk("session")]),
+            false,
+            &mut globex,
+        );
+        match other {
+            Response::Reply(RespValue::Null) => {}
+            o => panic!("expected null (no cross-tenant read), got {o:?}"),
+        }
+    }
+
+    /// THE leak fix, at the server level: `RECALL` cannot cross tenants.
+    /// In v0.2.2 this leaked because `MemoryStore::recall` ignores the key
+    /// and searches the whole shared index; per-workspace routing fixes it.
+    #[test]
+    fn tenant_recall_is_isolated_across_workspaces() {
+        let catalog = security::AuthCatalog::parse_entries([
+            "a:asecret:write:acme",
+            "b:bsecret:write:globex",
+        ])
+        .unwrap();
+        let s = Server::new().with_auth_catalog(catalog);
+
+        let authed = |token: &str| {
+            let mut auth = security::AuthState::unauthenticated();
+            s.dispatch_with_auth_state(
+                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
+                false,
+                &mut auth,
+            );
+            auth
+        };
+
+        // acme remembers a secret.
+        let mut acme = authed("asecret");
+        s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("alice"),
+                RespValue::bulk("secret"),
+                RespValue::bulk("wallet"),
+                RespValue::bulk("zebra"),
+            ]),
+            false,
+            &mut acme,
+        );
+
+        // globex recalls overlapping terms → must get NOTHING.
+        let mut globex = authed("bsecret");
+        let leaked = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("wallet zebra secret"),
+                RespValue::bulk("10"),
+            ]),
+            false,
+            &mut globex,
+        );
+        match leaked {
+            Response::Reply(RespValue::Array(items)) => {
+                assert!(items.is_empty(), "LEAK: globex recalled acme's memory: {items:?}");
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // acme can still recall its own memory.
+        let mine = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("wallet zebra"),
+                RespValue::bulk("10"),
+            ]),
+            false,
+            &mut acme,
+        );
+        match mine {
+            Response::Reply(RespValue::Array(items)) => assert_eq!(items.len(), 1),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    /// A3 (finish): fine-grained capabilities restrict richer roles beyond
+    /// their coarse level — an Evaluator may score evals but not delete or
+    /// overwrite memory; an Observer is read-only.
+    #[test]
+    fn fine_grained_capabilities_restrict_rich_roles() {
+        let catalog = security::AuthCatalog::parse_entries([
+            "ev:evsecret:evaluator:acme",
+            "ob:obsecret:observer:acme",
+        ])
+        .unwrap();
+        let s = Server::new().with_auth_catalog(catalog);
+
+        let try_cmd = |token: &str, cmd: Vec<RespValue>| {
+            let mut auth = security::AuthState::unauthenticated();
+            s.dispatch_with_auth_state(
+                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
+                false,
+                &mut auth,
+            );
+            s.dispatch_with_auth_state(RespValue::Array(cmd), false, &mut auth)
+        };
+        let denied = |r: &Response| {
+            matches!(r, Response::Reply(RespValue::Error(m)) if m.contains("NOPERM"))
+        };
+
+        // Evaluator: can RECALL (read) and EVAL.* (run_eval), but NOT REMEMBER
+        // (write_memory) or DEL (delete_memory).
+        assert!(!denied(&try_cmd(
+            "evsecret",
+            vec![RespValue::bulk("RECALL"), RespValue::bulk("k"), RespValue::bulk("q")],
+        )));
+        assert!(denied(&try_cmd(
+            "evsecret",
+            vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("k"),
+                RespValue::bulk("nope"),
+            ],
+        )), "evaluator must not write memory");
+        assert!(denied(&try_cmd(
+            "evsecret",
+            vec![RespValue::bulk("DEL"), RespValue::bulk("k")],
+        )), "evaluator must not delete memory");
+
+        // Observer: read OK, any write denied.
+        assert!(!denied(&try_cmd(
+            "obsecret",
+            vec![RespValue::bulk("GET"), RespValue::bulk("k")],
+        )));
+        assert!(denied(&try_cmd(
+            "obsecret",
+            vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("k"),
+                RespValue::bulk("nope"),
+            ],
+        )), "observer must not write");
+    }
+
+    /// A2: tenant-scoped principals can now USE the Phase 7 registries
+    /// (previously blocked entirely), and each tenant's registry is isolated.
+    #[test]
+    fn tenant_can_use_phase7_prompts_and_is_isolated() {
+        let catalog = security::AuthCatalog::parse_entries([
+            "a:asecret:write:acme",
+            "b:bsecret:write:globex",
+        ])
+        .unwrap();
+        let s = Server::new().with_auth_catalog(catalog);
+
+        let authed = |token: &str| {
+            let mut auth = security::AuthState::unauthenticated();
+            s.dispatch_with_auth_state(
+                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
+                false,
+                &mut auth,
+            );
+            auth
+        };
+
+        // acme stores a prompt — previously rejected with NOPERM for
+        // tenant-scoped creds; now routed to acme's own registry.
+        let mut acme = authed("asecret");
+        let put = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("PROMPT.PUT"),
+                RespValue::bulk("greeting"),
+                RespValue::bulk("hello from acme"),
+            ]),
+            false,
+            &mut acme,
+        );
+        match put {
+            Response::Reply(RespValue::Integer(v)) => assert_eq!(v, 1),
+            other => panic!("PROMPT.PUT should be allowed and return a version, got {other:?}"),
+        }
+
+        // acme reads it back from its own workspace.
+        let mine = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("PROMPT.GET"),
+                RespValue::bulk("greeting"),
+            ]),
+            false,
+            &mut acme,
+        );
+        assert!(
+            matches!(mine, Response::Reply(RespValue::BulkString(_))),
+            "acme should read its own prompt, got {mine:?}"
+        );
+
+        // globex cannot see acme's prompt — isolated registry.
+        let mut globex = authed("bsecret");
+        let other = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("PROMPT.GET"),
+                RespValue::bulk("greeting"),
+            ]),
+            false,
+            &mut globex,
+        );
+        assert!(
+            matches!(other, Response::Reply(RespValue::Null)),
+            "globex must NOT see acme's prompt, got {other:?}"
+        );
+    }
+
+    /// A4 end-to-end: tenant data written through one server is recalled by a
+    /// fresh server sharing the same `--tenants-dir`.
+    #[test]
+    fn tenant_data_is_durable_across_server_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let catalog = security::AuthCatalog::parse_entries(["a:asecret:write:acme"]).unwrap();
+
+        let authed = |s: &Server, token: &str| {
+            let mut auth = security::AuthState::unauthenticated();
+            s.dispatch_with_auth_state(
+                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
+                false,
+                &mut auth,
+            );
+            auth
+        };
+
+        {
+            let s = Server::new()
+                .with_auth_catalog(catalog.clone())
+                .with_tenant_root(root, 512);
+            let mut acme = authed(&s, "asecret");
+            s.dispatch_with_auth_state(
+                RespValue::Array(vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("u1"),
+                    RespValue::bulk("alice"),
+                    RespValue::bulk("durable"),
+                    RespValue::bulk("wallet"),
+                    RespValue::bulk("zebra"),
+                ]),
+                false,
+                &mut acme,
+            );
+        } // server dropped → tenant workspace flushed to disk
+
+        // Fresh server, same workspaces dir.
+        let s2 = Server::new()
+            .with_auth_catalog(catalog)
+            .with_tenant_root(root, 512);
+        let mut acme2 = authed(&s2, "asecret");
+        let r = s2.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("wallet zebra"),
+                RespValue::bulk("5"),
+            ]),
+            false,
+            &mut acme2,
+        );
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert!(
+                    !items.is_empty(),
+                    "persisted tenant memory should be recalled after restart"
+                );
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    /// Phase B contract: the control-plane credential format — `org/project/env`
+    /// in the tenant field, with a capability-model role name (`developer`) —
+    /// routes to distinct isolated workspaces on the data plane.
+    #[test]
+    fn control_plane_org_project_env_credentials_isolate() {
+        let catalog = security::AuthCatalog::parse_entries([
+            "key_a:sk_a:developer:org1/projA/prod",
+            "key_b:sk_b:developer:org1/projB/prod",
+        ])
+        .unwrap();
+        let s = Server::new().with_auth_catalog(catalog);
+
+        let authed = |token: &str| {
+            let mut auth = security::AuthState::unauthenticated();
+            s.dispatch_with_auth_state(
+                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
+                false,
+                &mut auth,
+            );
+            auth
+        };
+
+        let mut a = authed("sk_a");
+        s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("projA secret falcon"),
+            ]),
+            false,
+            &mut a,
+        );
+
+        // projB cannot recall projA's memory.
+        let mut b = authed("sk_b");
+        let r = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("secret falcon"),
+                RespValue::bulk("10"),
+            ]),
+            false,
+            &mut b,
+        );
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert!(
+                    items.is_empty(),
+                    "projB must not see projA's memory: {items:?}"
+                );
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    /// Phase B (signed path): a control-plane-issued JWT authenticates, its
+    /// claims resolve the tenant, and two projects' tokens stay isolated. A
+    /// bogus token is rejected.
+    #[test]
+    fn jwt_auth_resolves_tenant_from_claims_and_isolates() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secret = b"shared-hs256-secret-cp-and-node".to_vec();
+        let s = Server::new().with_jwt_secret(secret.clone());
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Stand in for `ControlPlane::mint_jwt` — same crate, same claims.
+        let mint = |proj: &str| {
+            let claims =
+                duxx_token::Claims::new("key_x", "org1", proj, "prod", "developer", now, 3600);
+            duxx_token::sign(&claims, &secret).unwrap()
+        };
+        let authed = |jwt: &str| {
+            let mut auth = security::AuthState::unauthenticated();
+            let r = s.dispatch_with_auth_state(
+                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(jwt)]),
+                false,
+                &mut auth,
+            );
+            (auth, r)
+        };
+
+        // Valid JWT for projA → authenticates and writes.
+        let (mut a, ra) = authed(&mint("projA"));
+        assert!(
+            matches!(ra, Response::Reply(RespValue::SimpleString(_))),
+            "JWT AUTH should succeed, got {ra:?}"
+        );
+        s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("projA secret owl"),
+            ]),
+            false,
+            &mut a,
+        );
+
+        // projB's JWT cannot recall projA's memory.
+        let (mut b, _) = authed(&mint("projB"));
+        let r = s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("secret owl"),
+                RespValue::bulk("10"),
+            ]),
+            false,
+            &mut b,
+        );
+        match r {
+            Response::Reply(RespValue::Array(items)) => {
+                assert!(items.is_empty(), "projB must not see projA: {items:?}")
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // A non-JWT / tampered token is rejected.
+        let (bad, rb) = authed("not.a.valid.jwt");
+        assert!(!bad.is_authed(), "garbage token must not authenticate");
+        assert!(
+            matches!(rb, Response::Reply(RespValue::Error(_))),
+            "bad token must error, got {rb:?}"
+        );
+    }
+
+    /// Asymmetric path: a node holding only the Ed25519 **public** key accepts
+    /// a control-plane-signed JWT, and rejects one signed by a different key.
+    #[test]
+    fn ed25519_jwt_auth_works_with_public_key_only() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let (priv_der, pub_der) = duxx_token::generate_ed25519().unwrap();
+        // The node is given ONLY the public key — it can verify, not mint.
+        let s = Server::new().with_jwt_public_key(pub_der);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims =
+            duxx_token::Claims::new("k", "org1", "projA", "prod", "developer", now, 3600);
+        let jwt = duxx_token::sign_ed25519(&claims, &priv_der).unwrap();
+
+        let mut auth = security::AuthState::unauthenticated();
+        let r = s.dispatch_with_auth_state(
+            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(jwt)]),
+            false,
+            &mut auth,
+        );
+        assert!(
+            matches!(r, Response::Reply(RespValue::SimpleString(_))),
+            "EdDSA JWT should authenticate, got {r:?}"
+        );
+
+        // A token signed by a DIFFERENT private key must be rejected.
+        let (other_priv, _) = duxx_token::generate_ed25519().unwrap();
+        let forged = duxx_token::sign_ed25519(&claims, &other_priv).unwrap();
+        let mut auth2 = security::AuthState::unauthenticated();
+        s.dispatch_with_auth_state(
+            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(forged)]),
+            false,
+            &mut auth2,
+        );
+        assert!(!auth2.is_authed(), "token from a different key must be rejected");
+    }
+
+    /// Full A→B→C vertical: the control plane issues a workspace JWT, the data
+    /// plane verifies it and writes to the isolated workspace, and the Studio
+    /// read-API serves that exact workspace back — all wired by the same
+    /// shared secret and credential claims.
+    #[test]
+    fn end_to_end_control_plane_to_data_plane_to_studio() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secret = b"end-to-end-shared-hs256-secret".to_vec();
+
+        // (B) Control plane: org → project → key → short-lived JWT.
+        let cp = duxx_control::ControlPlane::with_signing_key(secret.clone());
+        let org = cp.create_org("Acme").unwrap();
+        let proj = cp.create_project(&org.id, "bot").unwrap();
+        let key = cp
+            .issue_key(
+                &proj.id,
+                duxx_control::Env::Prod,
+                duxx_control::Role::Developer,
+                "agent",
+            )
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let jwt = cp.mint_jwt(&key.secret, now, 900).unwrap();
+        let expected_tenant = format!("{}/{}/prod", org.id, proj.id);
+
+        // (A) Data plane: verify the JWT at AUTH, then write to the workspace.
+        let s = Server::new().with_jwt_secret(secret.clone());
+        let mut auth = security::AuthState::unauthenticated();
+        let r = s.dispatch_with_auth_state(
+            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(jwt.clone())]),
+            false,
+            &mut auth,
+        );
+        assert!(
+            matches!(r, Response::Reply(RespValue::SimpleString(_))),
+            "control-plane JWT should authenticate on the data plane, got {r:?}"
+        );
+        s.dispatch_with_auth_state(
+            RespValue::Array(vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("end to end falcon memory"),
+            ]),
+            false,
+            &mut auth,
+        );
+
+        // (C) Studio: read that exact workspace back via the same JWT.
+        let r = crate::studio::route(&s, "GET", "/studio/overview", "", Some(&jwt));
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["tenant"], expected_tenant);
+        assert_eq!(v["memory_count"], 1);
+
+        let r = crate::studio::route(&s, "GET", "/studio/memory", "q=falcon&k=5", Some(&jwt));
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert!(
+            !v["hits"].as_array().unwrap().is_empty(),
+            "Studio should recall the memory written via the control-plane JWT"
+        );
+    }
+
+    #[test]
+    fn audit_log_records_auth_and_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let s = Server::new().with_auth("auditsecret123456");
+        let s = s.with_audit_log(&path).unwrap();
+        let mut authed = false;
+        s.dispatch_with_auth(
+            RespValue::Array(vec![
+                RespValue::bulk("AUTH"),
+                RespValue::bulk("auditsecret123456"),
+            ]),
+            false,
+            &mut authed,
+        );
+        s.dispatch_with_auth(
+            RespValue::Array(vec![
+                RespValue::bulk("SET"),
+                RespValue::bulk("k"),
+                RespValue::bulk("v"),
+            ]),
+            false,
+            &mut authed,
+        );
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(body.contains("\"command\":\"AUTH\""), "{body}");
+        assert!(body.contains("\"command\":\"SET\""), "{body}");
+        assert!(body.contains("\"principal\":\"admin\""), "{body}");
+    }
+
+    #[test]
     fn ping_allowed_pre_auth() {
         let s = Server::new().with_auth("s3cret");
         let mut authed = false;
@@ -3356,10 +4798,10 @@ mod tests {
 
     #[test]
     fn constant_time_eq_basic() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(constant_time_eq(b"", b""));
+        assert!(security::constant_time_eq(b"abc", b"abc"));
+        assert!(!security::constant_time_eq(b"abc", b"abd"));
+        assert!(!security::constant_time_eq(b"abc", b"ab"));
+        assert!(security::constant_time_eq(b"", b""));
     }
 
     #[test]

@@ -1,0 +1,32 @@
+[package]
+name = "duxx-tenant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+# DuxxDB Enterprise — source-available (NOT OSS); see ../../LICENSE-BSL.
+license = "BUSL-1.1"
+publish = false
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Multi-tenant workspace routing and capability RBAC for DuxxDB (reference prototype)."
+
+[dependencies]
+duxx-core.workspace = true
+duxx-storage.workspace = true
+duxx-memory.workspace = true
+duxx-embed.workspace = true
+duxx-trace.workspace = true
+duxx-prompts.workspace = true
+duxx-datasets.workspace = true
+duxx-eval.workspace = true
+duxx-replay.workspace = true
+duxx-cost.workspace = true
+duxx-docs.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
