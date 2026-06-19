@@ -32,6 +32,16 @@ pub use tool_cache::{HitKind, ToolCache, ToolCacheHit, DEFAULT_NEAR_HIT_THRESHOL
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Default tombstone ratio (`tombstones / live`) at which `remember`
+/// auto-triggers a [`MemoryStore::compact`]. See [`MemoryStore::set_auto_compact_ratio`].
+pub const DEFAULT_AUTO_COMPACT_RATIO: f32 = 0.20;
+
+/// Don't auto-compact below this live-row count. Compaction is O(n); on a
+/// tiny store the rebuild cost dwarfs the recall it buys back, and a single
+/// eviction would otherwise blow past the ratio and thrash. Explicit
+/// [`MemoryStore::compact`] is unaffected by this floor.
+const AUTO_COMPACT_MIN_LIVE: usize = 64;
+
 /// A single stored memory.
 #[derive(Debug, Clone)]
 pub struct Memory {
@@ -107,6 +117,11 @@ struct Inner {
     evict_half_life: RwLock<Duration>,
     /// Number of rows evicted by the cap so far. Useful for metrics.
     evictions_total: std::sync::atomic::AtomicU64,
+    /// Number of graph compactions performed so far (manual + auto).
+    compactions_total: std::sync::atomic::AtomicU64,
+    /// Tombstone ratio at which `remember` auto-triggers `compact`.
+    /// `None` disables auto-compaction. Default [`DEFAULT_AUTO_COMPACT_RATIO`].
+    auto_compact_ratio: RwLock<Option<f32>>,
 }
 
 impl Drop for Inner {
@@ -175,6 +190,8 @@ impl MemoryStore {
                 max_rows: RwLock::new(None),
                 evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
                 evictions_total: std::sync::atomic::AtomicU64::new(0),
+                compactions_total: std::sync::atomic::AtomicU64::new(0),
+                auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
             }),
         }
     }
@@ -248,6 +265,8 @@ impl MemoryStore {
             max_rows: RwLock::new(None),
             evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
             evictions_total: std::sync::atomic::AtomicU64::new(0),
+            compactions_total: std::sync::atomic::AtomicU64::new(0),
+            auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
         });
         tracing::info!(memories = n, "loaded memories from storage");
         Ok(MemoryStore { inner })
@@ -295,6 +314,44 @@ impl MemoryStore {
         self.inner
             .evictions_total
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total number of graph compactions performed since process start
+    /// (manual [`MemoryStore::compact`] + auto-triggered).
+    pub fn compactions_total(&self) -> u64 {
+        self.inner
+            .compactions_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current tombstone ratio: `(indexed - live) / live`.
+    ///
+    /// `forget`/eviction drop a row from `by_id` but leave its node in the
+    /// HNSW graph (and its postings in tantivy) — those stale entries are
+    /// tombstones. The ratio is how many tombstones the vector graph carries
+    /// per live row; it climbs with deletions and resets to `0` after
+    /// [`MemoryStore::compact`]. Returns `0.0` for an empty store.
+    pub fn tombstone_ratio(&self) -> f32 {
+        let live = self.inner.by_id.read().len();
+        if live == 0 {
+            return 0.0;
+        }
+        let indexed = self.inner.vector_index.read().len();
+        indexed.saturating_sub(live) as f32 / live as f32
+    }
+
+    /// Set the tombstone ratio at which `remember` auto-triggers a
+    /// compaction. `None` disables auto-compaction (explicit
+    /// [`MemoryStore::compact`] still works). Default
+    /// [`DEFAULT_AUTO_COMPACT_RATIO`] (0.20). Values `<= 0.0` are treated
+    /// as "disabled".
+    pub fn set_auto_compact_ratio(&self, ratio: Option<f32>) {
+        *self.inner.auto_compact_ratio.write() = ratio;
+    }
+
+    /// The configured auto-compaction tombstone ratio (`None` = disabled).
+    pub fn auto_compact_ratio(&self) -> Option<f32> {
+        *self.inner.auto_compact_ratio.read()
     }
 
     /// Drop one row by id from the row map and durable storage.
@@ -354,6 +411,83 @@ impl MemoryStore {
         let to_evict = len_now - cap;
         for (id, _score) in scored.into_iter().take(to_evict) {
             self.forget(id);
+        }
+    }
+
+    /// Rebuild the vector + text indices from the surviving rows, dropping
+    /// every tombstone left behind by `forget`/eviction.
+    ///
+    /// Why this exists: `hnsw_rs` has no in-place delete, so forgotten rows
+    /// stay nodes in the navigable graph. `recall` filters them out via
+    /// `by_id` (so results are always *correct*), but the deleted nodes are
+    /// still traversed during search and burn the candidate budget — recall
+    /// *quality* rots in exactly the regions you've deleted from most. Rebuild
+    /// is the supported repair: a fresh graph over the survivors, swapped in
+    /// atomically, with tantivy rebuilt to match.
+    ///
+    /// Returns the number of tombstones reclaimed (`indexed - live` before the
+    /// rebuild). Cheap when there are none. Takes write locks on both indices
+    /// for the duration; concurrent `recall`/`remember` block until it
+    /// finishes. Locks are acquired in `remember`'s order (vector → text) so
+    /// the two can't deadlock.
+    pub fn compact(&self) -> Result<usize> {
+        // Acquire the index write locks first (same order remember() uses),
+        // then read by_id. Holding both index locks across the rebuild stops
+        // a concurrent remember from inserting a row we'd then lose.
+        let mut v = self.inner.vector_index.write();
+        let mut t = self.inner.text_index.write();
+
+        let before_indexed = v.len();
+        let mut survivors_vec: Vec<(u64, Vec<f32>)> = Vec::new();
+        let mut survivors_text: Vec<(u64, String)> = Vec::new();
+        {
+            let by_id = self.inner.by_id.read();
+            survivors_vec.reserve(by_id.len());
+            survivors_text.reserve(by_id.len());
+            for m in by_id.values() {
+                survivors_vec.push((m.id, m.embedding.clone()));
+                survivors_text.push((m.id, m.text.clone()));
+            }
+        }
+        let live = survivors_vec.len();
+        let reclaimed = before_indexed.saturating_sub(live);
+
+        v.rebuild(&survivors_vec)?;
+        t.rebuild(&survivors_text)?;
+
+        // Persist the freshly compacted indices when durable, so a later
+        // reopen sees the compacted form rather than re-loading tombstones.
+        if self.inner.storage.is_some() {
+            if let Err(e) = v.dump() {
+                tracing::warn!(error = %e, "compact: hnsw dump failed");
+            }
+            // tantivy already committed inside rebuild(); flush is a no-op.
+        }
+        drop(v);
+        drop(t);
+
+        self.inner
+            .compactions_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(live, reclaimed, "memory compaction complete");
+        Ok(reclaimed)
+    }
+
+    /// Auto-trigger compaction if the tombstone ratio has crossed the
+    /// configured threshold. Called at the end of `remember`. No-op when
+    /// auto-compaction is disabled or the store is below the size floor.
+    fn maybe_auto_compact(&self) {
+        let threshold = match *self.inner.auto_compact_ratio.read() {
+            Some(t) if t > 0.0 => t,
+            _ => return,
+        };
+        if self.inner.by_id.read().len() < AUTO_COMPACT_MIN_LIVE {
+            return;
+        }
+        if self.tombstone_ratio() >= threshold {
+            if let Err(e) = self.compact() {
+                tracing::warn!(error = %e, "auto-compaction failed");
+            }
         }
     }
 
@@ -425,6 +559,10 @@ impl MemoryStore {
         // Phase 6.2: enforce the optional row cap. Cheap when no cap
         // is configured (single read of an Option<usize>).
         self.enforce_cap();
+        // P0: if eviction (or prior forgets) left enough tombstones in the
+        // graph, rebuild it now so recall quality doesn't rot. No-op unless
+        // the tombstone ratio crossed the configured threshold.
+        self.maybe_auto_compact();
         Ok(id)
     }
 
@@ -521,6 +659,8 @@ impl MemoryStore {
             max_rows: RwLock::new(None),
             evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
             evictions_total: std::sync::atomic::AtomicU64::new(0),
+            compactions_total: std::sync::atomic::AtomicU64::new(0),
+            auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
         });
         Ok(MemoryStore { inner })
     }
@@ -690,6 +830,176 @@ mod tests {
         for h in &hits {
             assert_ne!(h.memory.id, 1, "evicted row leaked into recall");
         }
+    }
+
+    // -------- P0: deletion-safe recall (graph compaction) --------
+
+    #[test]
+    fn compact_drops_tombstones_and_preserves_recall() {
+        const DIM: usize = 16;
+        let s = MemoryStore::new(DIM);
+        s.set_auto_compact_ratio(None); // exercise manual compact in isolation
+
+        let mut ids = Vec::new();
+        for i in 0..40 {
+            let t = format!("memory number {i} about topic {}", i % 7);
+            ids.push(s.remember("u", t.clone(), embed(&t, DIM)).unwrap());
+        }
+        assert_eq!(s.len(), 40);
+
+        // Forget the first 20.
+        for id in ids.iter().take(20) {
+            assert!(s.forget(*id));
+        }
+        assert_eq!(s.len(), 20);
+        // The graph still carries all 40 nodes — 20 are tombstones.
+        assert_eq!(s.inner.vector_index.read().len(), 40);
+        assert!(s.tombstone_ratio() > 0.9, "ratio={}", s.tombstone_ratio());
+
+        let reclaimed = s.compact().unwrap();
+        assert_eq!(reclaimed, 20, "20 tombstones reclaimed");
+        assert_eq!(
+            s.inner.vector_index.read().len(),
+            20,
+            "graph rebuilt to survivors only"
+        );
+        assert_eq!(
+            s.inner.text_index.read().len(),
+            20,
+            "tantivy rebuilt to survivors only"
+        );
+        assert_eq!(s.tombstone_ratio(), 0.0);
+        assert_eq!(s.compactions_total(), 1);
+
+        // A survivor is still recallable; no forgotten row can surface.
+        let survivor = ids[25];
+        let m = s.inner.by_id.read().get(&survivor).cloned().unwrap();
+        let hits = s.recall("u", &m.text, &m.embedding, 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.memory.id == survivor),
+            "survivor must be recallable after compaction"
+        );
+        for h in &hits {
+            assert!(
+                !ids[..20].contains(&h.memory.id),
+                "forgotten row {} leaked into recall",
+                h.memory.id
+            );
+        }
+    }
+
+    /// Acceptance for P0: after forgetting half the corpus and compacting,
+    /// recall@10 must be within 3% of a freshly-built index over the same
+    /// survivors. We measure *self-recall* (can the store retrieve the exact
+    /// document you query it with?) by content, so it's comparable across two
+    /// stores that assign different internal ids.
+    #[test]
+    fn recall_after_churn_within_3pct_of_fresh_survivor_index() {
+        const DIM: usize = 32;
+        const N: usize = 1_000;
+        let topics = [
+            "refund order delivery shipping",
+            "weather forecast tomorrow rain",
+            "login password account security",
+            "billing invoice payment receipt",
+            "product feature request feedback",
+            "support agent chat human",
+            "tracking number package status",
+            "discount promo coupon sale",
+        ];
+        let doc = |i: usize| format!("doc {i} about {} item code {}", topics[i % topics.len()], i);
+
+        // Self-recall@k by content: fraction of probes whose own text is in
+        // the top-k results when queried with that text + embedding.
+        fn self_recall(s: &MemoryStore, probes: &[(String, Vec<f32>)], k: usize) -> f32 {
+            let mut hit = 0usize;
+            for (text, emb) in probes {
+                let hits = s.recall("u", text, emb, k).unwrap();
+                if hits.iter().any(|h| &h.memory.text == text) {
+                    hit += 1;
+                }
+            }
+            hit as f32 / probes.len() as f32
+        }
+
+        // Churned store: insert N, then forget every other row (50%).
+        let churned = MemoryStore::with_capacity(DIM, N * 2);
+        churned.set_auto_compact_ratio(None); // compact explicitly below
+        let mut ids = Vec::with_capacity(N);
+        for i in 0..N {
+            let t = doc(i);
+            ids.push((i, churned.remember("u", t.clone(), embed(&t, DIM)).unwrap()));
+        }
+        for (i, id) in &ids {
+            if i % 2 == 0 {
+                churned.forget(*id);
+            }
+        }
+        let survivors: Vec<usize> = ids.iter().map(|(i, _)| *i).filter(|i| i % 2 == 1).collect();
+        assert_eq!(churned.len(), survivors.len());
+
+        // Fresh store over exactly the survivors.
+        let fresh = MemoryStore::with_capacity(DIM, N * 2);
+        fresh.set_auto_compact_ratio(None);
+        for i in &survivors {
+            let t = doc(*i);
+            fresh.remember("u", t.clone(), embed(&t, DIM)).unwrap();
+        }
+
+        // Probe set: first 50 survivors, queried by their own text+embedding.
+        let probes: Vec<(String, Vec<f32>)> = survivors
+            .iter()
+            .take(50)
+            .map(|i| {
+                let t = doc(*i);
+                let e = embed(&t, DIM);
+                (t, e)
+            })
+            .collect();
+
+        let fresh_recall = self_recall(&fresh, &probes, 10);
+
+        // Compact the churned store, then re-measure.
+        let reclaimed = churned.compact().unwrap();
+        assert_eq!(reclaimed, N - survivors.len(), "half the corpus reclaimed");
+        assert_eq!(
+            churned.inner.vector_index.read().len(),
+            survivors.len(),
+            "graph physically rebuilt to survivors only"
+        );
+        let compacted_recall = self_recall(&churned, &probes, 10);
+
+        assert!(
+            (fresh_recall - compacted_recall).abs() <= 0.03,
+            "post-compact recall {compacted_recall} must be within 3% of fresh {fresh_recall}"
+        );
+    }
+
+    #[test]
+    fn auto_compaction_fires_when_tombstones_exceed_threshold() {
+        const DIM: usize = 16;
+        let s = MemoryStore::new(DIM);
+        s.set_max_rows(Some(100));
+        // Near-zero half-life so eviction always drops the oldest row.
+        s.set_eviction_half_life(std::time::Duration::from_micros(1));
+        s.set_auto_compact_ratio(Some(0.20));
+
+        // 100 fill the cap; the next 30 each evict one, so tombstones build
+        // up until the 0.20 ratio trips a rebuild that resets them.
+        for i in 0..130 {
+            let t = format!("doc {i} topic {}", i % 9);
+            s.remember("u", t.clone(), embed(&t, DIM)).unwrap();
+        }
+        assert_eq!(s.len(), 100, "cap holds the live count");
+        assert!(
+            s.compactions_total() >= 1,
+            "auto-compaction should have fired at the threshold"
+        );
+        assert!(
+            s.tombstone_ratio() < 0.20,
+            "ratio should be reset below threshold, got {}",
+            s.tombstone_ratio()
+        );
     }
 
     #[cfg(feature = "redb-store")]

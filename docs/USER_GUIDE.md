@@ -400,6 +400,38 @@ For periodic export, drive `duxx-export` from cron / systemd timer:
 0 * * * *  /usr/local/bin/duxx-export --storage dir:/var/lib/duxx --out /var/cold/$(date +\%Y\%m\%d-\%H).parquet --dim 1536
 ```
 
+### 3.6 Compaction (deletion-safe recall)
+
+Forgetting and cap-eviction remove a row from results immediately, but the
+underlying HNSW graph has no in-place delete — the forgotten vector stays a
+node that search still traverses. Let enough pile up and recall *quality*
+degrades in exactly the regions you've deleted from most. **Compaction**
+rebuilds the vector + BM25 indices from the surviving rows, dropping every
+tombstone, and restores recall to a freshly-built index.
+
+It runs automatically: once the tombstone ratio `(indexed - live) / live`
+crosses a threshold (default `0.20`), the next `remember` triggers a rebuild.
+You can also trigger it explicitly, and observe it.
+
+```bash
+# RESP — returns the number of tombstones reclaimed.
+> COMPACT
+(integer) 4096
+```
+
+```python
+# Python wheel
+store.set_auto_compact_ratio(0.20)   # default; pass None to disable
+store.forget(some_id)
+reclaimed = store.compact()          # explicit rebuild
+print(store.tombstone_ratio(), store.compactions_total())
+```
+
+The MCP `compact` tool and the gRPC `Compact` RPC expose the same operation.
+Observability: the metrics endpoint exports `duxx_resp_memory_compactions`
+(count) and `duxx_resp_memory_tombstone_ratio` (gauge) — a sawtooth on the
+ratio is auto-compaction doing its job.
+
 ---
 
 ## 4. Configuration
@@ -536,6 +568,7 @@ Env vars override defaults but lose to explicit CLI flags:
 | **mTLS (client cert auth)** | ✅ | Add `--tls-client-ca PATH` / `DUXX_TLS_CLIENT_CA` on RESP or gRPC. |
 | **Protocol resource limits** | ✅ | Configure RESP bulk, array, line, input-buffer, nesting, connection, and command-rate limits with CLI flags or `DUXX_MAX_*`. |
 | **Memory cap + eviction** | ✅ Phase 6.2 | `--max-memories N`. Lowest *effective* (decayed) importance row evicted on overflow. |
+| **Deletion-safe recall (compaction)** | ✅ | Auto-rebuilds the HNSW + BM25 indices when the tombstone ratio crosses 0.20 (configurable); also `COMPACT` (RESP), `compact()` (Python/MCP/gRPC). Metrics: `duxx_resp_memory_compactions`, `duxx_resp_memory_tombstone_ratio`. |
 | Multi-tenancy | ⚠ no isolation in process | One `--storage dir:./tenant-X` daemon per tenant for now |
 | Multi-tenant shared daemon | ⚠ core RESP only | Tenant-scoped `DUXX_AUTH_KEYS` namespace memory/session keys and cost filters for tenant-safe commands. Extended Phase 7 registries should still run per tenant until full row-level isolation lands. |
 | Sharding / replication | ✗ | Single node; replicate at the orchestration layer (Kubernetes) for now |
