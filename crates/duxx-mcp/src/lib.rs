@@ -244,6 +244,11 @@ impl McpServer {
                     }
                 },
                 {
+                    "name": "compact",
+                    "description": "Rebuild the memory index from surviving rows, dropping tombstones left by forget/eviction. Restores recall quality. Returns rows reclaimed.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
                     "name": "session_set",
                     "description": "Store per-conversation working state under a session id (sliding TTL).",
                     "inputSchema": {
@@ -314,6 +319,7 @@ impl McpServer {
             "remember" => self.tool_remember(&args)?,
             "recall" => self.tool_recall(&args)?,
             "forget" => self.tool_forget(&args)?,
+            "compact" => self.tool_compact()?,
             "session_set" => self.tool_session_set(&args)?,
             "session_get" => self.tool_session_get(&args)?,
             "tool_cache_put" => self.tool_cache_put(&args)?,
@@ -406,6 +412,14 @@ impl McpServer {
             .and_then(Value::as_u64)
             .ok_or_else(|| invalid_params("missing 'id'"))?;
         Ok(json!({ "removed": self.store.forget(id) }))
+    }
+
+    fn tool_compact(&self) -> std::result::Result<Value, JsonRpcError> {
+        let reclaimed = self.store.compact().map_err(|e| internal(e.to_string()))?;
+        Ok(json!({
+            "reclaimed": reclaimed,
+            "tombstone_ratio": self.store.tombstone_ratio(),
+        }))
     }
 
     fn tool_session_set(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
@@ -570,6 +584,7 @@ mod tests {
             "remember",
             "recall",
             "forget",
+            "compact",
             "session_set",
             "session_get",
             "tool_cache_put",
@@ -578,6 +593,32 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+    }
+
+    #[test]
+    fn compact_tool_returns_reclaimed_count() {
+        let s = McpServer::new();
+        s.store().set_auto_compact_ratio(None);
+        s.store().set_max_rows(Some(2));
+        s.store()
+            .set_eviction_half_life(std::time::Duration::from_micros(1));
+        for i in 0..5 {
+            run_one(
+                &s,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"remember","arguments":{{"key":"u","text":"note {i}"}}}}}}"#
+                ),
+            );
+        }
+        // 5 inserts at cap 2 → 3 evictions → 3 tombstones to reclaim.
+        let resp = run_one(
+            &s,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compact","arguments":{}}}"#,
+        );
+        let body: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["reclaimed"], 3);
+        assert_eq!(body["tombstone_ratio"], 0.0);
     }
 
     fn call_tool(s: &McpServer, id: u32, name: &str, args: serde_json::Value) -> Value {

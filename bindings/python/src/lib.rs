@@ -167,6 +167,45 @@ impl MemoryStore {
         self.inner.evictions_total()
     }
 
+    /// Rebuild the vector + text indices from the surviving rows, dropping
+    /// every tombstone left behind by `forget`/eviction. Restores recall
+    /// quality that degrades as deleted HNSW nodes accumulate. Returns the
+    /// number of tombstones reclaimed. New in duxxdb v0.3.1.
+    ///
+    /// >>> store.forget(some_id)
+    /// >>> store.compact()   # rebuilds the graph over survivors
+    fn compact(&self) -> PyResult<usize> {
+        self.inner
+            .compact()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Current tombstone ratio: ``(indexed - live) / live``. Climbs with
+    /// `forget`/eviction, resets to 0 after `compact`. New in duxxdb v0.3.1.
+    fn tombstone_ratio(&self) -> f32 {
+        self.inner.tombstone_ratio()
+    }
+
+    /// Total number of compactions (manual + auto) since process start.
+    /// New in duxxdb v0.3.1.
+    fn compactions_total(&self) -> u64 {
+        self.inner.compactions_total()
+    }
+
+    /// Set the tombstone ratio at which `remember` auto-triggers a
+    /// `compact`. Pass ``None`` to disable auto-compaction (default 0.20).
+    /// New in duxxdb v0.3.1.
+    #[pyo3(signature = (ratio = None))]
+    fn set_auto_compact_ratio(&self, ratio: Option<f32>) {
+        self.inner.set_auto_compact_ratio(ratio);
+    }
+
+    /// The configured auto-compaction ratio, or ``None`` if disabled.
+    /// New in duxxdb v0.3.1.
+    fn auto_compact_ratio(&self) -> Option<f32> {
+        self.inner.auto_compact_ratio()
+    }
+
     /// Whether this store is backed by durable on-disk storage.
     /// New in duxxdb v0.1.1.
     fn is_persistent(&self) -> bool {

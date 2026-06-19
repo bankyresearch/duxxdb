@@ -29,8 +29,9 @@ pub mod pb {
 pub use pb::duxx::v1 as proto;
 use proto::duxx_server::{Duxx, DuxxServer};
 use proto::{
-    ChangeEvent, MemoryHit, PingRequest, PingResponse, RecallRequest, RecallResponse,
-    RememberRequest, RememberResponse, StatsRequest, StatsResponse, SubscribeRequest,
+    ChangeEvent, CompactRequest, CompactResponse, MemoryHit, PingRequest, PingResponse,
+    RecallRequest, RecallResponse, RememberRequest, RememberResponse, StatsRequest, StatsResponse,
+    SubscribeRequest,
 };
 
 pub const SERVER_NAME: &str = "duxxdb-grpc";
@@ -331,6 +332,20 @@ impl Duxx for DuxxService {
         Ok(Response::new(RecallResponse { hits: pb_hits }))
     }
 
+    async fn compact(
+        &self,
+        _request: Request<CompactRequest>,
+    ) -> Result<Response<CompactResponse>, Status> {
+        let reclaimed = self
+            .memory
+            .compact()
+            .map_err(|e| Status::internal(format!("compact: {e}")))?;
+        Ok(Response::new(CompactResponse {
+            reclaimed: reclaimed as u64,
+            tombstone_ratio: self.memory.tombstone_ratio(),
+        }))
+    }
+
     type SubscribeStream = SubscribeStream;
 
     async fn subscribe(
@@ -498,5 +513,31 @@ mod tests {
             .hits;
         assert!(!hits.is_empty());
         assert!(hits[0].text.to_lowercase().contains("wallet"));
+    }
+
+    #[tokio::test]
+    async fn compact_via_grpc_reclaims_tombstones() {
+        let svc = DuxxService::new();
+        svc.memory.set_auto_compact_ratio(None);
+        svc.memory.set_max_rows(Some(2));
+        svc.memory
+            .set_eviction_half_life(std::time::Duration::from_micros(1));
+        for i in 0..5 {
+            svc.remember(Request::new(RememberRequest {
+                key: "u".into(),
+                text: format!("note {i}"),
+                embedding: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+        // 5 inserts at cap 2 → 3 evictions → 3 tombstones reclaimed.
+        let resp = svc
+            .compact(Request::new(CompactRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.reclaimed, 3);
+        assert_eq!(resp.tombstone_ratio, 0.0);
     }
 }
