@@ -193,7 +193,7 @@ impl MemoryStore {
 }
 
 /// One recall result.
-#[pyclass(name = "MemoryHit", module = "duxxdb._native")]
+#[pyclass(name = "MemoryHit", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct MemoryHit {
     #[pyo3(get)]
@@ -283,7 +283,7 @@ impl ToolCache {
 }
 
 /// Cache hit returned by `ToolCache.get`.
-#[pyclass(name = "ToolCacheHit", module = "duxxdb._native")]
+#[pyclass(name = "ToolCacheHit", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct ToolCacheHit {
     /// Either `"exact"` or `"semantic_near_hit"`.
@@ -357,7 +357,7 @@ impl SessionStore {
 // ---------------------------------------------------------------------------
 
 /// One persisted prompt. Returned by every `PromptRegistry` lookup.
-#[pyclass(name = "Prompt", module = "duxxdb._native")]
+#[pyclass(name = "Prompt", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct Prompt {
     #[pyo3(get)]
@@ -382,7 +382,7 @@ impl Prompt {
     /// (`dict`, `list`, `str`, …) that `json.loads(...)` would give
     /// you. Always evaluated lazily on attribute access.
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.metadata_json)
     }
 
@@ -413,7 +413,7 @@ impl Prompt {
 
 /// One hit from `PromptRegistry.search`. Wraps a `Prompt` with the
 /// cosine similarity score in `[0, 1]`.
-#[pyclass(name = "PromptHit", module = "duxxdb._native")]
+#[pyclass(name = "PromptHit", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct PromptHit {
     #[pyo3(get)]
@@ -616,7 +616,7 @@ fn py_to_json(py: Python<'_>, obj: Option<&Bound<'_, PyAny>>) -> PyResult<serde_
 /// Round-trip the other direction. We store the metadata JSON as
 /// a string in [`Prompt`] and only inflate it when the user
 /// touches the attribute.
-fn json_str_to_py(py: Python<'_>, json: &str) -> PyResult<PyObject> {
+fn json_str_to_py(py: Python<'_>, json: &str) -> PyResult<Py<PyAny>> {
     let json_mod = py.import("json")?;
     let loads = json_mod.getattr("loads")?;
     Ok(loads.call1((json,))?.unbind())
@@ -627,7 +627,7 @@ fn json_str_to_py(py: Python<'_>, json: &str) -> PyResult<PyObject> {
 // ---------------------------------------------------------------------------
 
 /// One recorded LLM/tool cost row. Returned by every ledger lookup.
-#[pyclass(name = "CostEntry", module = "duxxdb._native")]
+#[pyclass(name = "CostEntry", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct CostEntryPy {
     #[pyo3(get)]
@@ -660,7 +660,7 @@ struct CostEntryPy {
 #[pymethods]
 impl CostEntryPy {
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.metadata_json)
     }
 
@@ -694,7 +694,7 @@ impl CostEntryPy {
 }
 
 /// One per-tenant spending cap.
-#[pyclass(name = "Budget", module = "duxxdb._native")]
+#[pyclass(name = "Budget", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct BudgetPy {
     #[pyo3(get)]
@@ -715,7 +715,7 @@ struct BudgetPy {
 #[pymethods]
 impl BudgetPy {
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.metadata_json)
     }
 
@@ -1017,7 +1017,7 @@ impl CostLedger {
 // DatasetRegistry (Phase 7.3, v0.2.1)
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "DatasetRow", module = "duxxdb._native")]
+#[pyclass(name = "DatasetRow", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct DatasetRowPy {
     #[pyo3(get)]
@@ -1033,11 +1033,11 @@ struct DatasetRowPy {
 #[pymethods]
 impl DatasetRowPy {
     #[getter]
-    fn data(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.data_json)
     }
     #[getter]
-    fn annotations(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn annotations(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.annotations_json)
     }
     fn __repr__(&self) -> String {
@@ -1063,7 +1063,7 @@ impl DatasetRowPy {
     }
 }
 
-#[pyclass(name = "Dataset", module = "duxxdb._native")]
+#[pyclass(name = "Dataset", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct DatasetPy {
     #[pyo3(get)]
@@ -1083,11 +1083,11 @@ struct DatasetPy {
 #[pymethods]
 impl DatasetPy {
     #[getter]
-    fn schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.schema_json)
     }
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.metadata_json)
     }
     fn __repr__(&self) -> String {
@@ -1310,7 +1310,7 @@ impl DatasetRegistry {
 // EvalRegistry (Phase 7.4, v0.2.1)
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "EvalSummary", module = "duxxdb._native")]
+#[pyclass(name = "EvalSummary", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct EvalSummaryPy {
     #[pyo3(get)]
@@ -1356,7 +1356,7 @@ impl EvalSummaryPy {
     }
 }
 
-#[pyclass(name = "EvalRun", module = "duxxdb._native")]
+#[pyclass(name = "EvalRun", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct EvalRunPy {
     #[pyo3(get)]
@@ -1390,7 +1390,7 @@ struct EvalRunPy {
 #[pymethods]
 impl EvalRunPy {
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.metadata_json)
     }
     fn __repr__(&self) -> String {
@@ -1431,7 +1431,7 @@ impl EvalRunPy {
     }
 }
 
-#[pyclass(name = "EvalScore", module = "duxxdb._native")]
+#[pyclass(name = "EvalScore", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct EvalScorePy {
     #[pyo3(get)]
@@ -1450,7 +1450,7 @@ struct EvalScorePy {
 #[pymethods]
 impl EvalScorePy {
     #[getter]
-    fn notes(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn notes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.notes_json)
     }
     fn __repr__(&self) -> String {
@@ -1640,7 +1640,11 @@ impl EvalRegistry {
 // ReplayRegistry (Phase 7.5, v0.2.1)
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "ReplayInvocation", module = "duxxdb._native")]
+#[pyclass(
+    name = "ReplayInvocation",
+    module = "duxxdb._native",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 struct ReplayInvocationPy {
     #[pyo3(get)]
@@ -1666,18 +1670,18 @@ struct ReplayInvocationPy {
 #[pymethods]
 impl ReplayInvocationPy {
     #[getter]
-    fn input(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn input(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.input_json)
     }
     #[getter]
-    fn output(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn output(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match &self.output_json {
             Some(s) => Ok(Some(json_str_to_py(py, s)?)),
             None => Ok(None),
         }
     }
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.metadata_json)
     }
     fn __repr__(&self) -> String {
@@ -1724,7 +1728,7 @@ impl ReplayInvocationPy {
     }
 }
 
-#[pyclass(name = "ReplaySession", module = "duxxdb._native")]
+#[pyclass(name = "ReplaySession", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct ReplaySessionPy {
     #[pyo3(get)]
@@ -1763,7 +1767,7 @@ impl ReplaySessionPy {
     }
 }
 
-#[pyclass(name = "ReplayRun", module = "duxxdb._native")]
+#[pyclass(name = "ReplayRun", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct ReplayRunPy {
     #[pyo3(get)]
@@ -1790,7 +1794,7 @@ struct ReplayRunPy {
 #[pymethods]
 impl ReplayRunPy {
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.metadata_json)
     }
     fn __repr__(&self) -> String {
@@ -2004,7 +2008,7 @@ impl ReplayRegistry {
 // TraceStore (Phase 7.1, v0.2.1)
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "Span", module = "duxxdb._native")]
+#[pyclass(name = "Span", module = "duxxdb._native", skip_from_py_object)]
 #[derive(Clone)]
 struct SpanPy {
     #[pyo3(get)]
@@ -2034,7 +2038,7 @@ struct SpanPy {
 #[pymethods]
 impl SpanPy {
     #[getter]
-    fn attributes(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn attributes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_str_to_py(py, &self.attributes_json)
     }
     fn __repr__(&self) -> String {
