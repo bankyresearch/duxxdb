@@ -739,9 +739,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -849,16 +849,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "duxx-cluster"
-version = "0.3.0"
-dependencies = [
- "bincode",
- "duxx-storage",
- "serde",
- "tempfile",
-]
-
-[[package]]
 name = "duxx-coldtier"
 version = "0.3.0"
 dependencies = [
@@ -877,23 +867,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "duxx-control"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "duxx-token",
- "http-body-util",
- "hyper",
- "hyper-util",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -1106,10 +1079,7 @@ name = "duxx-server"
 version = "0.3.0"
 dependencies = [
  "anyhow",
- "bincode",
  "bytes",
- "duxx-cluster",
- "duxx-control",
  "duxx-core",
  "duxx-cost",
  "duxx-datasets",
@@ -1121,15 +1091,12 @@ dependencies = [
  "duxx-reactive",
  "duxx-replay",
  "duxx-storage",
- "duxx-tenant",
- "duxx-token",
  "duxx-trace",
  "http-body-util",
  "hyper",
  "hyper-util",
  "prometheus",
  "rcgen",
- "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -1156,27 +1123,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "duxx-tenant"
-version = "0.3.0"
-dependencies = [
- "duxx-core",
- "duxx-cost",
- "duxx-datasets",
- "duxx-docs",
- "duxx-embed",
- "duxx-eval",
- "duxx-memory",
- "duxx-prompts",
- "duxx-replay",
- "duxx-storage",
- "duxx-trace",
- "parking_lot",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]

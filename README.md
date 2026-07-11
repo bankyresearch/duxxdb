@@ -38,11 +38,14 @@ DuxxDB just spoke RESP — `redis-cli`, `valkey-cli`, `redis-rs`,
 [Quickstart](#quickstart) for Python, gRPC, or MCP.
 
 > **Status:** self-hosted beta — feature-complete through Phase 7
-> with auth, native TLS, health, Prometheus, graceful shutdown,
+> with auth + RBAC, native TLS, health, Prometheus, graceful shutdown,
 > persistence, mTLS client verification, configurable protocol limits,
-> offline snapshot/restore, and importance-based eviction.
-> Enterprise-grade multi-tenant isolation, RBAC, and clustering remain
-> roadmap items. See the [Roadmap](docs/ROADMAP.md).
+> offline snapshot/restore, importance-based eviction, and deletion-safe
+> recall (graph compaction). See the [Roadmap](docs/ROADMAP.md).
+>
+> Multi-tenancy, the control plane, replication/HA, and the Cloud Console
+> live in **DuxxDB Cloud** (a separate managed-services product); this repo
+> is the Apache-2.0 single-node engine. See [LICENSING.md](LICENSING.md).
 
 ---
 
