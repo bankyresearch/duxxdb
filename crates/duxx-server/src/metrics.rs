@@ -17,6 +17,8 @@
 //! - `duxx_resp_active_connections`    — currently-open TCP connections
 //! - `duxx_resp_memory_count`          — memories in the store
 //! - `duxx_resp_session_count`         — sessions tracked
+//! - `duxx_resp_memory_compactions`    — graph compactions (manual + auto)
+//! - `duxx_resp_memory_tombstone_ratio`— (indexed - live) / live
 //!
 //! Histograms:
 //! - `duxx_resp_command_duration_seconds{cmd}` — per-command latency
@@ -27,9 +29,10 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_counter_with_registry, register_int_gauge_with_registry, Encoder, HistogramVec,
-    IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
+    register_gauge_with_registry, register_histogram_vec_with_registry,
+    register_int_counter_vec_with_registry, register_int_counter_with_registry,
+    register_int_gauge_with_registry, Encoder, Gauge, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, Registry, TextEncoder,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,6 +51,13 @@ pub struct Metrics {
     pub recalls_total: IntCounter,
     pub memory_count: IntGauge,
     pub session_count: IntGauge,
+    /// Compactions performed by the memory store (manual + auto-triggered).
+    /// Mirrors `MemoryStore::compactions_total`.
+    pub memory_compactions: IntGauge,
+    /// Current tombstone ratio of the memory store `(indexed - live) / live`.
+    /// Rises with forget/eviction, drops to ~0 after a compaction — so a
+    /// sawtooth here is auto-compaction working as intended.
+    pub memory_tombstone_ratio: Gauge,
 }
 
 impl Metrics {
@@ -113,6 +123,18 @@ impl Metrics {
             registry
         )
         .unwrap();
+        let memory_compactions = register_int_gauge_with_registry!(
+            "duxx_resp_memory_compactions",
+            "Memory-store graph compactions performed (manual + auto)",
+            registry
+        )
+        .unwrap();
+        let memory_tombstone_ratio = register_gauge_with_registry!(
+            "duxx_resp_memory_tombstone_ratio",
+            "Memory-store tombstone ratio (indexed - live) / live",
+            registry
+        )
+        .unwrap();
 
         Self {
             registry,
@@ -125,6 +147,8 @@ impl Metrics {
             recalls_total,
             memory_count,
             session_count,
+            memory_compactions,
+            memory_tombstone_ratio,
         }
     }
 }

@@ -149,5 +149,70 @@ fn bench_bulk_insert(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_recall, bench_insert, bench_bulk_insert);
+/// P0: recall latency on a deletion-churned index, before vs after
+/// `compact()`. Forgetting leaves tombstone nodes in the HNSW graph that
+/// search still traverses (burning the candidate budget); compaction rebuilds
+/// the graph over survivors. This bench shows the latency the rebuild buys
+/// back. The recall *quality* side of the story (post-compact recall@10 within
+/// 3% of a fresh survivor index) is asserted by the
+/// `recall_after_churn_within_3pct_of_fresh_survivor_index` test in
+/// `duxx-memory`.
+fn bench_recall_after_churn(c: &mut Criterion) {
+    let query_text = "refund delivery issue";
+    let query_vec = embed(query_text);
+    const N: usize = 10_000;
+
+    let mut group = c.benchmark_group("recall_after_churn");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(1));
+
+    // Build N docs (ids are 1..=N), then forget the odd ids (~50%) so the
+    // graph carries ~5000 tombstones. Disable auto-compaction so we control
+    // exactly when the rebuild happens.
+    let store = build_store(N);
+    store.set_auto_compact_ratio(None);
+    for id in (1..=N as u64).step_by(2) {
+        store.forget(id);
+    }
+
+    // (a) Recall while the graph is full of tombstones.
+    group.bench_with_input(BenchmarkId::new("churned", N), &N, |b, _| {
+        b.iter(|| {
+            let hits = store
+                .recall(
+                    "user_42",
+                    black_box(query_text),
+                    black_box(&query_vec),
+                    black_box(10),
+                )
+                .unwrap();
+            black_box(hits);
+        });
+    });
+
+    // (b) Recall after compacting the tombstones away.
+    store.compact().unwrap();
+    group.bench_with_input(BenchmarkId::new("compacted", N), &N, |b, _| {
+        b.iter(|| {
+            let hits = store
+                .recall(
+                    "user_42",
+                    black_box(query_text),
+                    black_box(&query_vec),
+                    black_box(10),
+                )
+                .unwrap();
+            black_box(hits);
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_recall,
+    bench_insert,
+    bench_bulk_insert,
+    bench_recall_after_churn
+);
 criterion_main!(benches);
