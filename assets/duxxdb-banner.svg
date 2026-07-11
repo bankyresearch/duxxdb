@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 340" role="img" aria-label="DuxxDB — the database built for AI agents">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="0.55" stop-color="#241b6b"/>
+      <stop offset="1" stop-color="#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#818cf8" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#818cf8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="340" rx="24" fill="url(#bg)"/>
+  <circle cx="1030" cy="170" r="240" fill="url(#glow)"/>
+
+  <!-- Retrieval-graph motif (HNSW-ish nodes + edges) -->
+  <g stroke="url(#accent)" stroke-width="1.6" opacity="0.55">
+    <line x1="965" y1="86" x2="1075" y2="140"/>
+    <line x1="1075" y1="140" x2="1015" y2="232"/>
+    <line x1="1015" y1="232" x2="905" y2="196"/>
+    <line x1="905" y1="196" x2="965" y2="86"/>
+    <line x1="1075" y1="140" x2="1170" y2="96"/>
+    <line x1="1075" y1="140" x2="1165" y2="220"/>
+    <line x1="1015" y1="232" x2="1110" y2="278"/>
+    <line x1="905" y1="196" x2="965" y2="86"/>
+  </g>
+  <g fill="#0b1020" stroke="url(#accent)" stroke-width="2.4">
+    <circle cx="965"  cy="86"  r="12"/>
+    <circle cx="905"  cy="196" r="10"/>
+    <circle cx="1015" cy="232" r="10"/>
+    <circle cx="1170" cy="96"  r="9"/>
+    <circle cx="1165" cy="220" r="9"/>
+    <circle cx="1110" cy="278" r="8"/>
+  </g>
+  <circle cx="1075" cy="140" r="18" fill="url(#accent)"/>
+
+  <!-- Wordmark -->
+  <text x="90" y="150" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="92" font-weight="800" fill="#ffffff" letter-spacing="-2">Duxx<tspan fill="#22d3ee">DB</tspan></text>
+
+  <!-- Tagline -->
+  <text x="94" y="206" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="30" font-weight="500" fill="#c7d2fe">The database built for AI agents.</text>
+
+  <!-- Feature chips -->
+  <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="19" font-weight="600">
+    <g transform="translate(94,244)">
+      <rect x="0" y="0" width="196" height="40" rx="20" fill="#ffffff" opacity="0.08"/>
+      <text x="20" y="26" fill="#e0e7ff">Vector + BM25 + SQL</text>
+    </g>
+    <g transform="translate(302,244)">
+      <rect x="0" y="0" width="150" height="40" rx="20" fill="#ffffff" opacity="0.08"/>
+      <text x="20" y="26" fill="#e0e7ff">Agent memory</text>
+    </g>
+    <g transform="translate(464,244)">
+      <rect x="0" y="0" width="196" height="40" rx="20" fill="#ffffff" opacity="0.08"/>
+      <text x="20" y="26" fill="#e0e7ff">RESP · gRPC · MCP</text>
+    </g>
+  </g>
+</svg>
