@@ -1,8 +1,8 @@
 <div align="center">
 
-# DuxxDB
+<img src="assets/duxxdb-banner.svg" alt="DuxxDB — the database built for AI agents" width="860">
 
-**The database built for AI agents.**
+<h1></h1>
 
 Hybrid retrieval (vector + BM25 + structured), agent-native primitives
 (`MEMORY` / `TOOL_CACHE` / `SESSION`), and embedded-or-server deployment
@@ -289,7 +289,7 @@ grpcurl -plaintext -d '{"key":"alice","query":"wallet","k":5}' \
           hybrid)     hnsw_rs       memory         Cohere
 ```
 
-12 Rust crates, all Apache 2.0. Full design: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+21 Rust crates, all Apache 2.0. Full design: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 ---
 
@@ -352,7 +352,7 @@ patterns: [docs/PROJECT_OVERVIEW.md § 8](docs/PROJECT_OVERVIEW.md#8-competitive
 
 ```
 duxxdb/
-├── Cargo.toml                 workspace root (12 crates)
+├── Cargo.toml                 workspace root (21 crates)
 ├── Dockerfile                 multi-stage, multi-arch image
 ├── packaging/                 Postgres-style installers
 │   ├── docker/                docker-compose.yml + .env.example + prometheus.yml
@@ -364,11 +364,19 @@ duxxdb/
 ├── crates/
 │   ├── duxx-core/             Schema · Value · Error
 │   ├── duxx-storage/          Storage trait + redb / memory backends
-│   ├── duxx-index/            tantivy BM25 + hnsw_rs HNSW
+│   ├── duxx-index/            tantivy BM25 + hnsw_rs HNSW (+ compaction)
 │   ├── duxx-query/            RRF, hybrid recall
-│   ├── duxx-memory/           MEMORY / TOOL_CACHE / SESSION + decay
+│   ├── duxx-memory/           MEMORY / TOOL_CACHE / SESSION + decay + compact
 │   ├── duxx-reactive/         ChangeBus pub/sub
 │   ├── duxx-embed/            hash + OpenAI + Cohere embedders
+│   ├── duxx-trace/            agent trace store (Phase 7.1)
+│   ├── duxx-prompts/          versioned prompt registry (Phase 7.2)
+│   ├── duxx-datasets/         versioned eval datasets (Phase 7.3)
+│   ├── duxx-eval/             eval runs + regressions (Phase 7.4)
+│   ├── duxx-replay/           deterministic agent replay (Phase 7.5)
+│   ├── duxx-cost/             token + cost ledger (Phase 7.6)
+│   ├── duxx-docs/             document-intelligence layer (ingest→cite)
+│   ├── duxx-token/            signed short-lived credentials (JWT)
 │   ├── duxx-server/           RESP2/3 daemon + auth + Prometheus
 │   ├── duxx-mcp/              MCP stdio JSON-RPC server
 │   ├── duxx-grpc/             tonic gRPC daemon (streaming Subscribe)
@@ -411,10 +419,17 @@ Please report vulnerabilities **privately** via the process in
 
 ## License
 
-[Apache License 2.0](LICENSE). No proprietary "open core" tax.
+**[Apache License 2.0](LICENSE)** — the entire engine in this repository is
+permissively licensed. Use it, embed it, self-host it, even run it as a service.
+No per-seat fees, no feature gates, no key that expires.
 
-Third-party dependency notices required for distribution are maintained
-in [NOTICE](NOTICE).
+DuxxDB is **open-core**: the optional managed-services layer — multi-tenancy,
+control plane, replication/HA, and the Cloud Console + Studio — is a separate
+source-available product, **DuxxDB Cloud**. Nothing in this repo depends on it,
+and it never will. See **[LICENSING.md](LICENSING.md)**.
+
+Third-party dependency notices required for distribution are maintained in
+[NOTICE](NOTICE).
 
 ---
 

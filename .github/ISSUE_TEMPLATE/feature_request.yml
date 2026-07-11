@@ -1,0 +1,45 @@
+name: 💡 Feature request
+description: Suggest an idea or improvement
+title: "[feat]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Check the [Roadmap](https://github.com/bankyresearch/duxxdb/blob/master/docs/ROADMAP.md)
+        and [existing issues](https://github.com/bankyresearch/duxxdb/issues) first — it may already be planned.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The use case or pain point. "As an agent developer, I want … so that …"
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What should DuxxDB do? A command, API, config flag, behavior change?
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface(s)?
+      multiple: true
+      options:
+        - RESP
+        - gRPC
+        - MCP
+        - Python
+        - Node / TypeScript
+        - Embedded Rust
+        - Server / ops
+        - Docs
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, workarounds, or how other databases handle this.

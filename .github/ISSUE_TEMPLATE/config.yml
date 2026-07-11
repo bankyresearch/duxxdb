@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & Discussions
+    url: https://github.com/bankyresearch/duxxdb/discussions
+    about: Ask a question, share what you built, or discuss an idea before filing an issue.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/bankyresearch/duxxdb/security/policy
+    about: Please report vulnerabilities privately — do not open a public issue.
+  - name: 📚 Documentation
+    url: https://github.com/bankyresearch/duxxdb/tree/master/docs
+    about: Installation, user guide, architecture, integration, and FAQ.

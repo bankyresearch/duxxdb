@@ -1,0 +1,65 @@
+name: 🐛 Bug report
+description: Something isn't working as documented
+title: "[bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please search
+        [existing issues](https://github.com/bankyresearch/duxxdb/issues) first.
+        For a suspected **security vulnerability**, do NOT open an issue — follow
+        [SECURITY.md](https://github.com/bankyresearch/duxxdb/blob/master/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: DuxxDB version
+      description: Release tag, container tag, commit SHA, or `pip show duxxdb` version.
+      placeholder: "v0.3.0 / ghcr.io/...:latest / commit abc1234"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface?
+      options:
+        - RESP (redis-cli / redis client)
+        - gRPC
+        - MCP (Claude / Cline / agent)
+        - Python wheel
+        - Node / TypeScript
+        - Embedded Rust crate
+        - Server / ops (auth, TLS, metrics, snapshot)
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      placeholder: "Ubuntu 24.04 x86_64 / macOS 14 arm64 / Windows 11 / Docker"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal, self-contained sequence. Include the exact commands.
+      placeholder: |
+        1. `docker run -p 6379:6379 ghcr.io/bankyresearch/duxxdb:latest`
+        2. `redis-cli -p 6379 REMEMBER alice "hello"`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / output
+      description: Server logs, client errors, stack traces. Automatically formatted as code.
+      render: shell
