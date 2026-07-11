@@ -14,6 +14,11 @@ service Duxx {
     // Top-k hybrid recall (vector + BM25, RRF-fused).
     rpc Recall(RecallRequest) returns (RecallResponse);
 
+    // Rebuild the index from surviving rows, dropping tombstones left by
+    // forgotten/evicted rows. Restores recall quality. Returns the number
+    // of tombstones reclaimed and the post-compaction tombstone ratio.
+    rpc Compact(CompactRequest) returns (CompactResponse);
+
     // Subscribe to memory change events. Server streams a ChangeEvent
     // for every `remember` call whose channel matches the (optional)
     // glob pattern. An empty pattern matches all events.
@@ -78,6 +83,13 @@ message ChangeEvent {
         UPDATE = 2;
         DELETE = 3;
     }
+}
+
+message CompactRequest {}
+
+message CompactResponse {
+    uint64 reclaimed = 1;
+    float tombstone_ratio = 2;
 }
 
 message StatsRequest {}

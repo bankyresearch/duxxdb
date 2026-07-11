@@ -772,6 +772,8 @@ impl Server {
                         m.active_connections.inc();
                         m.memory_count.set(s.memory.len() as i64);
                         m.session_count.set(s.sessions.len() as i64);
+                        m.memory_compactions.set(s.memory.compactions_total() as i64);
+                        m.memory_tombstone_ratio.set(s.memory.tombstone_ratio() as f64);
                     }
                     let c = counter.clone();
                     let m = s.metrics.clone();
@@ -1154,6 +1156,7 @@ impl Server {
             "DEL" => self.cmd_del(&args),
             "REMEMBER" => self.cmd_remember(&args),
             "RECALL" => self.cmd_recall(&args),
+            "COMPACT" => self.cmd_compact(),
             "DOC.INGEST" => self.cmd_doc_ingest(&args),
             "DOC.SEARCH" => self.cmd_doc_search(&args),
             "DOC.LIST" => self.cmd_doc_list(),
@@ -1380,6 +1383,7 @@ impl Server {
             "DEL",
             "REMEMBER",
             "RECALL",
+            "COMPACT",
             "SUBSCRIBE",
             "UNSUBSCRIBE",
             "PSUBSCRIBE",
@@ -1531,6 +1535,24 @@ impl Server {
         }
         match self.memory.remember(key, text, emb) {
             Ok(id) => Response::Reply(RespValue::Integer(id as i64)),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `COMPACT` — rebuild the memory indices from surviving rows, dropping
+    /// tombstones left by `DEL`/eviction. Returns the number of tombstones
+    /// reclaimed. Operates on the caller's tenant workspace.
+    fn cmd_compact(&self) -> Response {
+        match self.memory.compact() {
+            Ok(reclaimed) => {
+                if let Some(m) = &self.metrics {
+                    m.memory_compactions
+                        .set(self.memory.compactions_total() as i64);
+                    m.memory_tombstone_ratio
+                        .set(self.memory.tombstone_ratio() as f64);
+                }
+                Response::Reply(RespValue::Integer(reclaimed as i64))
+            }
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
     }
@@ -3783,6 +3805,41 @@ mod tests {
         let s = Server::new();
         let r = dispatch_array(&s, vec![RespValue::bulk("PING")]);
         assert_eq!(r, simple("PONG"));
+    }
+
+    /// P0: `COMPACT` over RESP rebuilds the memory index, returning the number
+    /// of tombstones reclaimed. We force tombstones with a row cap so eviction
+    /// leaves stale graph nodes, then compact them away.
+    #[test]
+    fn compact_command_reclaims_evicted_tombstones() {
+        let s = Server::new();
+        s.memory().set_auto_compact_ratio(None); // compact only via the command
+        s.memory().set_max_rows(Some(3));
+        s.memory()
+            .set_eviction_half_life(std::time::Duration::from_micros(1));
+
+        // 6 inserts at cap 3 → 3 evictions → 3 tombstones in the index.
+        for i in 0..6 {
+            let r = dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("u1"),
+                    RespValue::bulk(format!("memory number {i}")),
+                ],
+            );
+            assert!(matches!(r, RespValue::Integer(_)), "REMEMBER #{i} -> {r:?}");
+        }
+
+        let r = dispatch_array(&s, vec![RespValue::bulk("COMPACT")]);
+        assert_eq!(
+            r,
+            RespValue::Integer(3),
+            "COMPACT should reclaim the 3 evicted rows"
+        );
+        // Idempotent: nothing left to reclaim.
+        let r2 = dispatch_array(&s, vec![RespValue::bulk("COMPACT")]);
+        assert_eq!(r2, RespValue::Integer(0));
     }
 
     /// Gap 2: a leader appends every successful mutation to the change feed; a

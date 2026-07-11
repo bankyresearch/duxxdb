@@ -45,6 +45,9 @@ const META_FILE: &str = "duxx_hnsw.meta.json";
 /// rebuild from the row store.
 pub struct VectorIndex {
     dim: usize,
+    /// Pre-allocated element capacity. `hnsw_rs` cannot grow past it, so
+    /// [`VectorIndex::rebuild`] reuses this when allocating the fresh graph.
+    capacity: usize,
     inner: RwLock<HnswInner>,
     persist_dir: Option<PathBuf>,
 }
@@ -75,6 +78,7 @@ impl VectorIndex {
         let hnsw = Hnsw::new(M, capacity, MAX_LAYERS, EF_CONSTRUCTION, DistCosine);
         Self {
             dim,
+            capacity,
             inner: RwLock::new(HnswInner {
                 hnsw,
                 next_internal: 0,
@@ -141,6 +145,7 @@ impl VectorIndex {
 
         Ok(Self {
             dim,
+            capacity,
             inner: RwLock::new(inner),
             persist_dir: Some(dir),
         })
@@ -204,6 +209,44 @@ impl VectorIndex {
         // hnsw_rs copies the slice contents internally on insert.
         inner.hnsw.insert((&vec, internal));
         Ok(())
+    }
+
+    /// Rebuild the graph from scratch over exactly `survivors`, dropping
+    /// every point not listed.
+    ///
+    /// `hnsw_rs` has no in-place delete: a "deleted" point stays a node in
+    /// the navigable graph forever, and once enough accumulate they degrade
+    /// recall (deleted nodes are visited during search but never returned,
+    /// wasting the candidate budget). The supported fix is to build a fresh
+    /// graph over the survivors and atomically swap it in — that's this
+    /// method. The id-map is rewritten compactly so `next_internal` equals
+    /// the survivor count and no tombstones remain.
+    ///
+    /// Returns the number of points in the rebuilt graph (`survivors.len()`).
+    /// The new graph reuses the configured capacity (grown to fit the
+    /// survivor count if it somehow exceeds it).
+    pub fn rebuild(&mut self, survivors: &[(u64, Vec<f32>)]) -> Result<usize> {
+        for (id, v) in survivors {
+            if v.len() != self.dim {
+                return Err(Error::Index(format!(
+                    "rebuild: id={id} vector dim mismatch: expected {}, got {}",
+                    self.dim,
+                    v.len()
+                )));
+            }
+        }
+        let capacity = self.capacity.max(survivors.len()).max(1);
+        let fresh = Hnsw::new(M, capacity, MAX_LAYERS, EF_CONSTRUCTION, DistCosine);
+        let mut id_map = Vec::with_capacity(survivors.len());
+        for (internal, (id, v)) in survivors.iter().enumerate() {
+            id_map.push(*id);
+            fresh.insert((v, internal));
+        }
+        let mut inner = self.inner.write();
+        inner.hnsw = fresh;
+        inner.next_internal = survivors.len();
+        inner.id_map = id_map;
+        Ok(survivors.len())
     }
 
     /// Top-`k` ids by cosine similarity, descending.
@@ -332,6 +375,39 @@ mod tests {
         idx.insert(1, vec![1.0, 0.0]).unwrap();
         idx.insert(2, vec![0.0, 1.0]).unwrap();
         assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn rebuild_drops_tombstones_and_keeps_survivors() {
+        let mut idx = VectorIndex::new(3);
+        idx.insert(1, vec![1.0, 0.0, 0.0]).unwrap();
+        idx.insert(2, vec![0.0, 1.0, 0.0]).unwrap();
+        idx.insert(3, vec![0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(idx.len(), 3);
+
+        // Rebuild over only the survivors {1, 3}; id 2 is dropped.
+        let survivors = vec![(1u64, vec![1.0, 0.0, 0.0]), (3u64, vec![0.0, 0.0, 1.0])];
+        let n = idx.rebuild(&survivors).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(idx.len(), 2, "id_map must be compacted to survivors");
+
+        // Survivor 1 is still found top-1 for its own vector; dropped id 2
+        // can never appear in results.
+        let hits = idx.search(&[1.0, 0.0, 0.0], 3);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, 1);
+        assert!(
+            hits.iter().all(|(id, _)| *id != 2),
+            "dropped id must not appear: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn rebuild_rejects_dim_mismatch() {
+        let mut idx = VectorIndex::new(3);
+        idx.insert(1, vec![1.0, 0.0, 0.0]).unwrap();
+        let bad = vec![(1u64, vec![1.0, 0.0])];
+        assert!(matches!(idx.rebuild(&bad), Err(Error::Index(_))));
     }
 
     #[test]

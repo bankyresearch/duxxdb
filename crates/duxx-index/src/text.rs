@@ -114,6 +114,37 @@ impl TextIndex {
         Ok(())
     }
 
+    /// Rebuild the index over exactly `survivors`, dropping every other
+    /// document. Counterpart to `VectorIndex::rebuild` — called by
+    /// `MemoryStore::compact` so the BM25 postings stop referencing
+    /// forgotten rows. Works on both in-RAM and disk-backed indices
+    /// (it deletes all docs and re-adds the survivors in one commit, so a
+    /// disk-backed directory is reused rather than orphaned).
+    pub fn rebuild(&mut self, survivors: &[(u64, String)]) -> Result<()> {
+        let mut w = self.writer.lock();
+        // Flush any batched-but-uncommitted inserts into segments first, so
+        // `delete_all_documents` (which only targets committed docs) actually
+        // removes them. Without this, pending docs survive the rebuild.
+        w.commit()
+            .map_err(|e| Error::Index(format!("commit (flush pending): {e}")))?;
+        w.delete_all_documents()
+            .map_err(|e| Error::Index(format!("delete_all_documents: {e}")))?;
+        for (id, text) in survivors {
+            w.add_document(doc!(self.id_field => *id, self.text_field => text.clone()))
+                .map_err(|e| Error::Index(format!("add_document: {e}")))?;
+        }
+        // Single commit applies the delete (to the pre-delete docs) and the
+        // survivor adds (higher opstamp, so they're kept).
+        w.commit()
+            .map_err(|e| Error::Index(format!("commit: {e}")))?;
+        drop(w);
+        self.pending.store(0, Ordering::SeqCst);
+        self.reader
+            .reload()
+            .map_err(|e| Error::Index(format!("reader reload: {e}")))?;
+        Ok(())
+    }
+
     /// Force-commit any pending writes. Idempotent.
     pub fn flush(&self) -> Result<()> {
         if self.pending.load(Ordering::SeqCst) == 0 {
@@ -264,6 +295,23 @@ mod tests {
         }
         idx.flush().unwrap();
         assert_eq!(idx.len(), 50);
+    }
+
+    #[test]
+    fn rebuild_drops_documents_not_in_survivors() {
+        let mut idx = TextIndex::new();
+        idx.insert(1, "refund my order".into()).unwrap();
+        idx.insert(2, "weather today".into()).unwrap();
+        idx.insert(3, "refund the payment".into()).unwrap();
+        assert_eq!(idx.len(), 3);
+
+        // Keep only {1}. Docs 2 and 3 are dropped from the postings.
+        idx.rebuild(&[(1u64, "refund my order".to_string())])
+            .unwrap();
+        assert_eq!(idx.len(), 1);
+        let hits = idx.search("refund", 10);
+        assert_eq!(hits.len(), 1, "only survivor 1 should match refund");
+        assert_eq!(hits[0].0, 1);
     }
 
     #[test]
