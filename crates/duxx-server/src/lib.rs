@@ -26,14 +26,10 @@
 
 pub mod glob;
 pub mod metrics;
-pub mod otlp;
-pub mod replication;
 pub mod resp;
 pub mod security;
-pub mod studio;
 pub mod tls;
 
-use duxx_cluster::{ChangeLog, Coordinator};
 use duxx_cost::{BudgetPeriod, CostEntry, CostFilter, CostLedger, GroupBy};
 use duxx_datasets::{DatasetRegistry, DatasetRow};
 use duxx_docs::DocumentStore;
@@ -47,16 +43,6 @@ use duxx_replay::{
     ReplayMode, ReplayOverride, ReplayRegistry,
 };
 use duxx_storage::Backend;
-use duxx_tenant::{Namespace, TenantRouter};
-
-/// Replication wiring: the leader appends every successful mutation to `log`;
-/// followers tail it and apply via [`Server::apply_replicated`]. The
-/// `coordinator` gates leader-only logging (no split-brain double-writes).
-#[derive(Clone)]
-struct Replication {
-    log: Arc<dyn ChangeLog>,
-    coordinator: Arc<dyn Coordinator>,
-}
 use duxx_trace::{Span, SpanKind, SpanStatus, TraceSearch, TraceStore};
 use resp::RespValue;
 use std::sync::Arc;
@@ -88,39 +74,13 @@ type Phase7IndexDirs = (
 /// The server state — cheaply cloned (Arc internals).
 #[derive(Clone)]
 pub struct Server {
-    /// Default workspace memory store. Used by principals that carry NO
-    /// namespace (auth disabled, or admin keys without a tenant) — i.e. the
-    /// self-hosted single-tenant path. Tenant-scoped principals are routed
-    /// to a per-namespace store via [`Server::tenants`] instead.
+    /// The memory store — long-term semantic memory with hybrid recall.
     memory: MemoryStore,
-    /// Default workspace session store (see `memory`).
+    /// Session store — hot KV with sliding TTL for per-conversation state.
     sessions: SessionStore,
-    /// Phase A: per-namespace workspace router. A principal whose credential
-    /// carries a tenant is routed here, to an isolated `MemoryStore` +
-    /// `SessionStore` (own HNSW + tantivy index). This is what makes
-    /// `RECALL` leak-proof across tenants — the v0.2.2 key-prefix scheme
-    /// could not, because `MemoryStore::recall` searches the whole index.
-    /// `Arc` so every cheap `Server` clone shares one router.
-    tenants: Arc<TenantRouter>,
-    /// Optional HS256 secret for verifying control-plane-issued workspace
-    /// JWTs at `AUTH` time. When set, a presented token that verifies is
-    /// resolved to a tenant-scoped principal straight from its claims; a
-    /// non-JWT token still falls through to the static auth catalog.
-    jwt_secret: Option<Arc<Vec<u8>>>,
-    /// Optional Ed25519 **public** key (DER) for verifying asymmetric
-    /// control-plane JWTs. The node never holds the private key, so it cannot
-    /// mint tokens — the preferred production posture over a shared HS256
-    /// secret.
-    jwt_public_key: Option<Arc<Vec<u8>>>,
-    /// Bounded, per-tenant-queryable audit trail (surfaced by Studio's
-    /// `/studio/audit`). Always on; the file `audit` log is separate/optional.
+    /// Bounded, in-memory audit trail of recent commands. Always on; the
+    /// file `audit` log is separate/optional.
     audit_trail: security::AuditTrail,
-    /// Optional leader/follower replication. When set and this node is leader,
-    /// every successful mutation is appended to the change feed.
-    replication: Option<Replication>,
-    /// Shared cluster token authenticating node-to-node replication pulls
-    /// (`POST /replication/pull`). Distinct from client JWTs — this is internal.
-    repl_token: Option<Arc<String>>,
     embedder: Arc<dyn Embedder>,
     dim: usize,
     /// Optional API-key catalog. When non-empty, every connection must
@@ -205,12 +165,7 @@ impl Server {
         Self {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
-            tenants: Arc::new(TenantRouter::new(embedder.clone())),
-            jwt_secret: None,
-            jwt_public_key: None,
             audit_trail: security::AuditTrail::new(1000),
-            replication: None,
-            repl_token: None,
             embedder,
             dim,
             auth: security::AuthCatalog::default(),
@@ -315,99 +270,6 @@ impl Server {
     /// Number of currently-open client connections.
     pub fn active_connections(&self) -> usize {
         self.active_conns.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Persist tenant workspaces under `dir` (one subdirectory per
-    /// `org/project/env`). Without this, tenant-scoped data is in-memory only
-    /// and lost on restart.
-    ///
-    /// `capacity` is the per-workspace memory capacity — and, because
-    /// `hnsw_rs` cannot grow past it, also the per-tenant memory **quota**.
-    /// The default (unscoped) workspace is unaffected; configure its
-    /// durability with `--storage` / `--phase7-storage` as before.
-    pub fn with_tenant_root(mut self, dir: impl Into<std::path::PathBuf>, capacity: usize) -> Self {
-        self.tenants = Arc::new(TenantRouter::with_root(
-            self.embedder.clone(),
-            capacity,
-            dir,
-        ));
-        self
-    }
-
-    /// Accept control-plane-issued workspace JWTs at `AUTH`, verified with
-    /// this HS256 secret (shared with the control plane). A verifying token
-    /// resolves to a tenant-scoped principal from its claims
-    /// (`org/project/env` + role); a non-JWT token still uses the static auth
-    /// catalog. This is the signed-credential path that supersedes static
-    /// `--auth-key` catalog materialization.
-    pub fn with_jwt_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
-        self.jwt_secret = Some(Arc::new(secret.into()));
-        self
-    }
-
-    /// Accept **asymmetric** (Ed25519) control-plane JWTs, verified with this
-    /// public key (DER). The node holds only the public key — it cannot mint
-    /// tokens, so a node compromise can't forge credentials. Preferred over
-    /// `with_jwt_secret` for multi-node clouds.
-    pub fn with_jwt_public_key(mut self, public_der: impl Into<Vec<u8>>) -> Self {
-        self.jwt_public_key = Some(Arc::new(public_der.into()));
-        self
-    }
-
-    /// Enable leader/follower replication. When this node is the leader (per
-    /// `coordinator`), every successful mutation is appended to `log`; a
-    /// follower tails the log and applies changes via
-    /// [`Server::apply_replicated`]. See `duxx-cluster`.
-    pub fn with_replication(
-        mut self,
-        log: Arc<dyn ChangeLog>,
-        coordinator: Arc<dyn Coordinator>,
-    ) -> Self {
-        self.replication = Some(Replication { log, coordinator });
-        self
-    }
-
-    /// Shared token authenticating node-to-node replication pulls. Required to
-    /// serve the replication transport (`replication::serve`).
-    pub fn with_replication_token(mut self, token: impl Into<String>) -> Self {
-        self.repl_token = Some(Arc::new(token.into()));
-        self
-    }
-
-    /// Accessor for the replication change log (used by the transport module).
-    pub(crate) fn replication_log(&self) -> Option<&Arc<dyn ChangeLog>> {
-        self.replication.as_ref().map(|r| &r.log)
-    }
-
-    pub(crate) fn replication_token(&self) -> Option<&str> {
-        self.repl_token.as_deref().map(String::as_str)
-    }
-
-    /// Apply a replicated change on a follower: decode the logged command and
-    /// re-execute it against this node's stores, scoped to the change's
-    /// namespace. Idempotent re-logging is impossible — a follower is not the
-    /// leader, so the mutation it re-runs is not re-appended.
-    pub fn apply_replicated(&self, change: &duxx_cluster::Change) {
-        let args: Vec<Vec<u8>> = match bincode::deserialize(&change.op) {
-            Ok(a) => a,
-            Err(_) => return,
-        };
-        if args.is_empty() {
-            return;
-        }
-        let value = RespValue::Array(args.into_iter().map(RespValue::BulkString).collect());
-        let tenant = if change.namespace.is_empty() {
-            None
-        } else {
-            Some(change.namespace.clone())
-        };
-        let principal =
-            security::Principal::new("replication", "replication", security::Role::Admin, tenant);
-        let mut auth = security::AuthState::unauthenticated();
-        if let Ok(p) = principal {
-            auth.set_principal(p);
-        }
-        let _ = self.dispatch_with_auth_state(value, false, &mut auth);
     }
 
     fn audit_event(
@@ -582,12 +444,7 @@ impl Server {
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
-            tenants: Arc::new(TenantRouter::new(embedder.clone())),
-            jwt_secret: None,
-            jwt_public_key: None,
             audit_trail: security::AuditTrail::new(1000),
-            replication: None,
-            repl_token: None,
             embedder,
             dim,
             auth: security::AuthCatalog::default(),
@@ -629,12 +486,7 @@ impl Server {
         Ok(Self {
             memory,
             sessions: SessionStore::new(),
-            tenants: Arc::new(TenantRouter::new(embedder.clone())),
-            jwt_secret: None,
-            jwt_public_key: None,
             audit_trail: security::AuditTrail::new(1000),
-            replication: None,
-            repl_token: None,
             embedder,
             dim,
             auth: security::AuthCatalog::default(),
@@ -691,7 +543,6 @@ impl Server {
         tracing::info!(
             addr = %addr,
             auth = self.auth_required(),
-            jwt = self.jwt_secret.is_some(),
             tls = self.tls_config.is_some(),
             "duxx-server listening"
         );
@@ -741,7 +592,6 @@ impl Server {
         tracing::info!(
             addr = %addr,
             auth = self.auth_required(),
-            jwt = self.jwt_secret.is_some(),
             tls = self.tls_config.is_some(),
             "duxx-server listening"
         );
@@ -952,9 +802,6 @@ impl Server {
                         recv = rx.recv() => {
                             match recv {
                                 Ok(event) => {
-                                    if !event_allowed_for_auth(&auth, &event) {
-                                        continue;
-                                    }
                                     let event_channel = event.channel();
                                     // Exact subscriptions: match channel exactly OR by table name
                                     // (so existing `SUBSCRIBE memory` keeps receiving keyed events).
@@ -1056,40 +903,7 @@ impl Server {
             )));
         }
 
-        if auth.tenant().is_some() && !tenant_safe_command(&command) {
-            self.audit_event(auth, &command, "denied", Some("tenant_scope"));
-            return Response::Reply(err(format!(
-                "NOPERM {command} is not available for tenant-scoped credentials"
-            )));
-        }
-
-        // Replication: capture the op for write commands *before* `value` is
-        // consumed by dispatch. Only encode when replication is configured and
-        // the command is a mutation (write-level).
-        let repl_op = if self.replication.is_some()
-            && security::required_role(&command) == security::Role::ReadWrite
-        {
-            Some(encode_command(&value))
-        } else {
-            None
-        };
-
-        // Route to the caller's isolated workspace when tenant-scoped. The
-        // view's primitive fields ARE the workspace's stores, so every
-        // handler (memory, session, and Phase 7) operates on the tenant's
-        // own data with no per-handler routing code.
-        let response = match self.workspace_view(auth) {
-            Some(view) => view.dispatch_with_sub_inner(value, subscribed, auth),
-            None => self.dispatch_with_sub_inner(value, subscribed, auth),
-        };
-
-        // Leader-only: append every successful mutation to the change feed.
-        if let (Some(op), Some(repl)) = (repl_op, &self.replication) {
-            if !response_is_error(&response) && repl.coordinator.is_leader() {
-                let ns = auth.tenant().unwrap_or("").to_string();
-                repl.log.append(&ns, op);
-            }
-        }
+        let response = self.dispatch_with_sub_inner(value, subscribed, auth);
 
         if security::is_audited_command(&command) {
             let outcome = if response_is_error(&response) {
@@ -1108,7 +922,7 @@ impl Server {
         subscribed: bool,
         auth: &mut security::AuthState,
     ) -> Response {
-        let mut args = match value {
+        let args = match value {
             RespValue::Array(items) => items,
             other => return Response::Reply(err(format!("ERR expected array, got {other:?}"))),
         };
@@ -1129,18 +943,6 @@ impl Server {
                         "ERR can't execute '{other}' in subscribe mode"
                     )));
                 }
-            }
-        }
-
-        // When this runs on a tenant view (see `dispatch_with_auth_state`),
-        // every `self.<primitive>` is already the tenant's isolated store,
-        // so memory/session/Phase-7 isolation needs no arg rewriting. What
-        // remains here scopes the few commands NOT routed by the view:
-        // pub/sub channel names (per-workspace reactive buses are a
-        // follow-up) and `COST.*` arguments.
-        if let Some(tenant) = auth.tenant() {
-            if let Err(response) = apply_tenant_scope(&cmd, &mut args, tenant) {
-                return response;
             }
         }
 
@@ -1248,30 +1050,7 @@ impl Server {
             None => return Response::Reply(err("ERR AUTH token must be a string")),
         };
 
-        // 1. Control-plane workspace JWT. Try asymmetric (Ed25519 public key)
-        //    first, then symmetric (HS256 secret). A token that verifies is
-        //    resolved straight from its claims; one that isn't a valid JWT for
-        //    us falls through to the static catalog.
-        let claims = self
-            .jwt_public_key
-            .as_ref()
-            .and_then(|pk| duxx_token::verify_ed25519(token, pk).ok())
-            .or_else(|| {
-                self.jwt_secret
-                    .as_ref()
-                    .and_then(|s| duxx_token::verify(token, s).ok())
-            });
-        if let Some(claims) = claims {
-            return match self.principal_from_claims(&claims) {
-                Ok(principal) => {
-                    auth.set_principal(principal);
-                    Response::Reply(simple("OK"))
-                }
-                Err(e) => Response::Reply(err(format!("WRONGPASS {e}"))),
-            };
-        }
-
-        // 2. Static auth catalog.
+        // Static auth catalog.
         if !self.auth.is_required() {
             return Response::Reply(err("ERR Client sent AUTH, but no password is set"));
         }
@@ -1284,65 +1063,12 @@ impl Server {
         }
     }
 
-    /// Whether clients must `AUTH` before issuing commands: true if a static
-    /// catalog OR a JWT verification secret is configured.
+    /// Whether clients must `AUTH` before issuing commands.
     fn auth_required(&self) -> bool {
-        self.auth.is_required() || self.jwt_secret.is_some() || self.jwt_public_key.is_some()
-    }
-
-    /// Build a tenant-scoped principal from verified JWT claims. The tenant
-    /// field is `org/project/env` (which the workspace view parses into an
-    /// isolated namespace); the role string maps via the same parser as
-    /// `--auth-key`.
-    fn principal_from_claims(
-        &self,
-        claims: &duxx_token::Claims,
-    ) -> anyhow::Result<security::Principal> {
-        let role: security::Role = claims.role.parse()?;
-        // `sub` (the key id) doubles as the principal name and the token slot
-        // (the latter is unused once the principal is set on the connection).
-        let mut principal = security::Principal::new(
-            claims.sub.clone(),
-            claims.sub.clone(),
-            role,
-            Some(claims.tenant()),
-        )?;
-        // Fine-grained capabilities from the claim's role name.
-        principal.caps = security::Capabilities::for_role_str(&claims.role);
-        Ok(principal)
+        self.auth.is_required()
     }
 
     // ----- command handlers ------------------------------------------------
-
-    /// Build a per-request view of this server whose agent primitives point
-    /// at the caller's isolated [`duxx_tenant::Workspace`].
-    ///
-    /// * Returns `None` for an **unscoped** principal (admin / auth-off):
-    ///   dispatch runs against the default workspace (`self`).
-    /// * For a **tenant-scoped** principal it returns a shallow `Server`
-    ///   clone — every field is `Arc`-backed, so the clone is cheap — with
-    ///   `memory`, `sessions`, `traces`, `prompts`, `datasets`, `evals`,
-    ///   `replays`, and `costs` swapped for the workspace's own stores.
-    ///
-    /// Because the view IS a `Server`, every command handler transparently
-    /// operates on the tenant's stores via `self.<primitive>` with no
-    /// per-handler routing code — memory, sessions, AND the Phase 7
-    /// registries are all isolated by the same mechanism.
-    fn workspace_view(&self, auth: &security::AuthState) -> Option<Server> {
-        let tenant = auth.tenant()?;
-        let ws = self.tenants.workspace(&Namespace::parse(tenant));
-        let mut view = self.clone();
-        view.memory = ws.memory().clone();
-        view.sessions = ws.sessions().clone();
-        view.traces = ws.traces().clone();
-        view.prompts = ws.prompts().clone();
-        view.datasets = ws.datasets().clone();
-        view.evals = ws.evals().clone();
-        view.replays = ws.replays().clone();
-        view.costs = ws.costs().clone();
-        view.docs = ws.docs().clone();
-        Some(view)
-    }
 
     fn cmd_ping(&self, args: &[RespValue]) -> Response {
         if args.len() == 1 {
@@ -3627,153 +3353,11 @@ fn command_name(value: &RespValue) -> Option<String> {
     }
 }
 
-/// Encode a RESP command (array of args) as `bincode(Vec<Vec<u8>>)` for the
-/// replication change feed. `apply_replicated` decodes it back.
-fn encode_command(value: &RespValue) -> Vec<u8> {
-    let args: Vec<Vec<u8>> = match value {
-        RespValue::Array(items) => items.iter().map(resp_arg_bytes).collect(),
-        other => vec![resp_arg_bytes(other)],
-    };
-    bincode::serialize(&args).unwrap_or_default()
-}
-
-fn resp_arg_bytes(v: &RespValue) -> Vec<u8> {
-    match v {
-        RespValue::BulkString(b) => b.clone(),
-        RespValue::SimpleString(s) => s.clone().into_bytes(),
-        RespValue::Integer(i) => i.to_string().into_bytes(),
-        _ => Vec::new(),
-    }
-}
-
 fn response_is_error(response: &Response) -> bool {
     matches!(
         response,
         Response::Reply(RespValue::Error(_)) | Response::CloseAfter(RespValue::Error(_))
     )
-}
-
-/// Whether a tenant-scoped credential may run `command`.
-///
-/// Since A2, the per-namespace workspace view (`Server::workspace_view`)
-/// routes every agent primitive — memory, session, AND the Phase 7
-/// registries — to the tenant's isolated stores. So all of those families
-/// are now tenant-safe (previously Phase 7 was blocked entirely). Sub-command
-/// families are matched by their `FAMILY.` prefix so new sub-commands are
-/// covered automatically. Role checks (`required_role`) still apply on top,
-/// so e.g. a read-only tenant key still cannot `PROMPT.PUT`.
-fn tenant_safe_command(command: &str) -> bool {
-    if let Some((family, _sub)) = command.split_once('.') {
-        return matches!(
-            family,
-            "MEMORY"
-                | "SESSION"
-                | "TRACE"
-                | "PROMPT"
-                | "DATASET"
-                | "EVAL"
-                | "REPLAY"
-                | "COST"
-                | "DOC"
-        );
-    }
-    matches!(
-        command,
-        "PING"
-            | "HELLO"
-            | "COMMAND"
-            | "INFO"
-            | "QUIT"
-            | "AUTH"
-            | "SET"
-            | "GET"
-            | "DEL"
-            | "REMEMBER"
-            | "RECALL"
-            | "SUBSCRIBE"
-            | "UNSUBSCRIBE"
-            | "PSUBSCRIBE"
-            | "PUNSUBSCRIBE"
-    )
-}
-
-/// Tenant arg-scoping for commands that are NOT routed to a per-namespace
-/// workspace.
-///
-/// Memory + session commands (`SET/GET/DEL/REMEMBER/RECALL`) are no longer
-/// here: they are isolated structurally by routing to the tenant's own
-/// [`duxx_tenant::Workspace`] (see `Server::stores_for`), which fixes the
-/// v0.2.2 recall leak that key-prefixing could not.
-///
-/// What remains:
-/// * pub/sub channels — still namespaced by prefix (per-workspace reactive
-///   buses are a follow-up; until then prefixing keeps channels separated).
-/// * `COST.*` — the cost ledger is a single tenant-aware store, so the
-///   tenant is injected/forced into the relevant argument or filter.
-fn apply_tenant_scope(cmd: &str, args: &mut Vec<RespValue>, tenant: &str) -> Result<(), Response> {
-    match cmd {
-        "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" => {
-            prefix_channel_arg(args, 1, tenant)
-        }
-        "COST.RECORD" | "COST.TOTAL" | "COST.GET_BUDGET" | "COST.STATUS" => {
-            set_arg(args, 1, tenant.to_string())
-        }
-        "COST.QUERY" | "COST.CLUSTER_EXPENSIVE" => ensure_cost_filter(args, 1, tenant),
-        "COST.AGGREGATE" => ensure_cost_filter(args, 2, tenant),
-        _ => Ok(()),
-    }
-}
-
-fn prefix_channel_arg(args: &mut [RespValue], idx: usize, tenant: &str) -> Result<(), Response> {
-    let Some(value) = args.get(idx).and_then(arg_string) else {
-        return Ok(());
-    };
-    let scoped = if let Some(key) = value.strip_prefix("memory.") {
-        if key.starts_with(&format!("{tenant}:")) {
-            value.to_string()
-        } else {
-            format!("memory.{tenant}:{key}")
-        }
-    } else {
-        value.to_string()
-    };
-    set_arg(args, idx, scoped)
-}
-
-fn set_arg(args: &mut [RespValue], idx: usize, value: String) -> Result<(), Response> {
-    if let Some(slot) = args.get_mut(idx) {
-        *slot = RespValue::bulk(value);
-    }
-    Ok(())
-}
-
-fn ensure_cost_filter(args: &mut Vec<RespValue>, idx: usize, tenant: &str) -> Result<(), Response> {
-    while args.len() <= idx {
-        args.push(RespValue::bulk("-"));
-    }
-    let raw = args.get(idx).and_then(arg_string).unwrap_or("-");
-    let mut value = match raw {
-        "-" | "" => serde_json::json!({}),
-        json => match serde_json::from_str::<serde_json::Value>(json) {
-            Ok(v) => v,
-            Err(e) => return Err(Response::Reply(err(format!("ERR filter_json: {e}")))),
-        },
-    };
-    if !value.is_object() {
-        return Err(Response::Reply(err("ERR filter_json must be an object")));
-    }
-    value["tenant"] = serde_json::Value::String(tenant.to_string());
-    set_arg(args, idx, value.to_string())
-}
-
-fn event_allowed_for_auth(auth: &security::AuthState, event: &ChangeEvent) -> bool {
-    let Some(tenant) = auth.tenant() else {
-        return true;
-    };
-    let Some(key) = event.key.as_deref() else {
-        return true;
-    };
-    key.starts_with(&format!("{tenant}:"))
 }
 
 fn arg_string(v: &RespValue) -> Option<&str> {
@@ -3840,66 +3424,6 @@ mod tests {
         // Idempotent: nothing left to reclaim.
         let r2 = dispatch_array(&s, vec![RespValue::bulk("COMPACT")]);
         assert_eq!(r2, RespValue::Integer(0));
-    }
-
-    /// Gap 2: a leader appends every successful mutation to the change feed; a
-    /// fresh follower tails it, applies the ops, and converges — reads are not
-    /// replicated.
-    #[test]
-    fn replication_leader_logs_and_follower_converges() {
-        use duxx_cluster::{ChangeLog, Follower, MemoryLog, StaticCoordinator};
-        use std::sync::Arc;
-
-        let log = Arc::new(MemoryLog::new());
-        let leader = Server::new()
-            .with_replication(log.clone(), Arc::new(StaticCoordinator::solo("leader")));
-
-        // A write on the leader is logged.
-        dispatch_array(
-            &leader,
-            vec![
-                RespValue::bulk("REMEMBER"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("replicate me falcon"),
-            ],
-        );
-        assert_eq!(log.latest_seq(), 1, "leader must log the mutation");
-
-        // A read is NOT logged.
-        dispatch_array(
-            &leader,
-            vec![
-                RespValue::bulk("RECALL"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("falcon"),
-            ],
-        );
-        assert_eq!(log.latest_seq(), 1, "reads must not be replicated");
-
-        // A fresh follower applies the change feed and converges.
-        let follower = Server::new();
-        let mut f = Follower::new();
-        let applied = f.catch_up(&*log, |c| follower.apply_replicated(c));
-        assert_eq!(applied, 1);
-
-        let r = dispatch_array(
-            &follower,
-            vec![
-                RespValue::bulk("RECALL"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("falcon"),
-                RespValue::bulk("5"),
-            ],
-        );
-        match r {
-            RespValue::Array(items) => {
-                assert!(
-                    !items.is_empty(),
-                    "follower must have the replicated memory"
-                )
-            }
-            other => panic!("expected array, got {other:?}"),
-        }
     }
 
     /// Document layer: DOC.INGEST → DOC.SEARCH (with citation) → DOC.LIST →
@@ -4257,146 +3781,6 @@ mod tests {
         }
     }
 
-    /// A tenant-scoped principal is routed to its own isolated workspace.
-    /// Its session writes round-trip for itself, never touch the default
-    /// workspace, and are invisible to other tenants. (Replaces the old
-    /// key-prefix assertion — routing is now the isolation mechanism.)
-    #[test]
-    fn tenant_scoped_principal_routes_to_isolated_workspace() {
-        let catalog = security::AuthCatalog::parse_entries([
-            "acme-writer:acmesecret:write:acme",
-            "globex-writer:globexsecret:write:globex",
-        ])
-        .unwrap();
-        let s = Server::new().with_auth_catalog(catalog);
-
-        let authed = |token: &str| {
-            let mut auth = security::AuthState::unauthenticated();
-            s.dispatch_with_auth_state(
-                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
-                false,
-                &mut auth,
-            );
-            auth
-        };
-
-        // acme writes a session value.
-        let mut acme = authed("acmesecret");
-        let r = s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("SET"),
-                RespValue::bulk("session"),
-                RespValue::bulk("acme-value"),
-            ]),
-            false,
-            &mut acme,
-        );
-        assert!(matches!(r, Response::Reply(RespValue::SimpleString(_))));
-
-        // It round-trips for acme (routed to acme's own workspace).
-        let got = s.dispatch_with_auth_state(
-            RespValue::Array(vec![RespValue::bulk("GET"), RespValue::bulk("session")]),
-            false,
-            &mut acme,
-        );
-        match got {
-            Response::Reply(RespValue::BulkString(b)) => assert_eq!(b, b"acme-value"),
-            other => panic!("expected acme-value, got {other:?}"),
-        }
-
-        // The DEFAULT workspace never saw it — no key-prefix leakage.
-        assert_eq!(s.sessions().get("session"), None);
-        assert_eq!(s.sessions().get("acme:session"), None);
-
-        // A different tenant cannot read acme's session.
-        let mut globex = authed("globexsecret");
-        let other = s.dispatch_with_auth_state(
-            RespValue::Array(vec![RespValue::bulk("GET"), RespValue::bulk("session")]),
-            false,
-            &mut globex,
-        );
-        match other {
-            Response::Reply(RespValue::Null) => {}
-            o => panic!("expected null (no cross-tenant read), got {o:?}"),
-        }
-    }
-
-    /// THE leak fix, at the server level: `RECALL` cannot cross tenants.
-    /// In v0.2.2 this leaked because `MemoryStore::recall` ignores the key
-    /// and searches the whole shared index; per-workspace routing fixes it.
-    #[test]
-    fn tenant_recall_is_isolated_across_workspaces() {
-        let catalog = security::AuthCatalog::parse_entries([
-            "a:asecret:write:acme",
-            "b:bsecret:write:globex",
-        ])
-        .unwrap();
-        let s = Server::new().with_auth_catalog(catalog);
-
-        let authed = |token: &str| {
-            let mut auth = security::AuthState::unauthenticated();
-            s.dispatch_with_auth_state(
-                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
-                false,
-                &mut auth,
-            );
-            auth
-        };
-
-        // acme remembers a secret.
-        let mut acme = authed("asecret");
-        s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("REMEMBER"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("alice"),
-                RespValue::bulk("secret"),
-                RespValue::bulk("wallet"),
-                RespValue::bulk("zebra"),
-            ]),
-            false,
-            &mut acme,
-        );
-
-        // globex recalls overlapping terms → must get NOTHING.
-        let mut globex = authed("bsecret");
-        let leaked = s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("RECALL"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("wallet zebra secret"),
-                RespValue::bulk("10"),
-            ]),
-            false,
-            &mut globex,
-        );
-        match leaked {
-            Response::Reply(RespValue::Array(items)) => {
-                assert!(
-                    items.is_empty(),
-                    "LEAK: globex recalled acme's memory: {items:?}"
-                );
-            }
-            other => panic!("expected array, got {other:?}"),
-        }
-
-        // acme can still recall its own memory.
-        let mine = s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("RECALL"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("wallet zebra"),
-                RespValue::bulk("10"),
-            ]),
-            false,
-            &mut acme,
-        );
-        match mine {
-            Response::Reply(RespValue::Array(items)) => assert_eq!(items.len(), 1),
-            other => panic!("expected array, got {other:?}"),
-        }
-    }
-
     /// A3 (finish): fine-grained capabilities restrict richer roles beyond
     /// their coarse level — an Evaluator may score evals but not delete or
     /// overwrite memory; an Observer is read-only.
@@ -4464,372 +3848,6 @@ mod tests {
                 ],
             )),
             "observer must not write"
-        );
-    }
-
-    /// A2: tenant-scoped principals can now USE the Phase 7 registries
-    /// (previously blocked entirely), and each tenant's registry is isolated.
-    #[test]
-    fn tenant_can_use_phase7_prompts_and_is_isolated() {
-        let catalog = security::AuthCatalog::parse_entries([
-            "a:asecret:write:acme",
-            "b:bsecret:write:globex",
-        ])
-        .unwrap();
-        let s = Server::new().with_auth_catalog(catalog);
-
-        let authed = |token: &str| {
-            let mut auth = security::AuthState::unauthenticated();
-            s.dispatch_with_auth_state(
-                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
-                false,
-                &mut auth,
-            );
-            auth
-        };
-
-        // acme stores a prompt — previously rejected with NOPERM for
-        // tenant-scoped creds; now routed to acme's own registry.
-        let mut acme = authed("asecret");
-        let put = s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("PROMPT.PUT"),
-                RespValue::bulk("greeting"),
-                RespValue::bulk("hello from acme"),
-            ]),
-            false,
-            &mut acme,
-        );
-        match put {
-            Response::Reply(RespValue::Integer(v)) => assert_eq!(v, 1),
-            other => panic!("PROMPT.PUT should be allowed and return a version, got {other:?}"),
-        }
-
-        // acme reads it back from its own workspace.
-        let mine = s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("PROMPT.GET"),
-                RespValue::bulk("greeting"),
-            ]),
-            false,
-            &mut acme,
-        );
-        assert!(
-            matches!(mine, Response::Reply(RespValue::BulkString(_))),
-            "acme should read its own prompt, got {mine:?}"
-        );
-
-        // globex cannot see acme's prompt — isolated registry.
-        let mut globex = authed("bsecret");
-        let other = s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("PROMPT.GET"),
-                RespValue::bulk("greeting"),
-            ]),
-            false,
-            &mut globex,
-        );
-        assert!(
-            matches!(other, Response::Reply(RespValue::Null)),
-            "globex must NOT see acme's prompt, got {other:?}"
-        );
-    }
-
-    /// A4 end-to-end: tenant data written through one server is recalled by a
-    /// fresh server sharing the same `--tenants-dir`.
-    #[test]
-    fn tenant_data_is_durable_across_server_restart() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let catalog = security::AuthCatalog::parse_entries(["a:asecret:write:acme"]).unwrap();
-
-        let authed = |s: &Server, token: &str| {
-            let mut auth = security::AuthState::unauthenticated();
-            s.dispatch_with_auth_state(
-                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
-                false,
-                &mut auth,
-            );
-            auth
-        };
-
-        {
-            let s = Server::new()
-                .with_auth_catalog(catalog.clone())
-                .with_tenant_root(root, 512);
-            let mut acme = authed(&s, "asecret");
-            s.dispatch_with_auth_state(
-                RespValue::Array(vec![
-                    RespValue::bulk("REMEMBER"),
-                    RespValue::bulk("u1"),
-                    RespValue::bulk("alice"),
-                    RespValue::bulk("durable"),
-                    RespValue::bulk("wallet"),
-                    RespValue::bulk("zebra"),
-                ]),
-                false,
-                &mut acme,
-            );
-        } // server dropped → tenant workspace flushed to disk
-
-        // Fresh server, same workspaces dir.
-        let s2 = Server::new()
-            .with_auth_catalog(catalog)
-            .with_tenant_root(root, 512);
-        let mut acme2 = authed(&s2, "asecret");
-        let r = s2.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("RECALL"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("wallet zebra"),
-                RespValue::bulk("5"),
-            ]),
-            false,
-            &mut acme2,
-        );
-        match r {
-            Response::Reply(RespValue::Array(items)) => {
-                assert!(
-                    !items.is_empty(),
-                    "persisted tenant memory should be recalled after restart"
-                );
-            }
-            other => panic!("expected array, got {other:?}"),
-        }
-    }
-
-    /// Phase B contract: the control-plane credential format — `org/project/env`
-    /// in the tenant field, with a capability-model role name (`developer`) —
-    /// routes to distinct isolated workspaces on the data plane.
-    #[test]
-    fn control_plane_org_project_env_credentials_isolate() {
-        let catalog = security::AuthCatalog::parse_entries([
-            "key_a:sk_a:developer:org1/projA/prod",
-            "key_b:sk_b:developer:org1/projB/prod",
-        ])
-        .unwrap();
-        let s = Server::new().with_auth_catalog(catalog);
-
-        let authed = |token: &str| {
-            let mut auth = security::AuthState::unauthenticated();
-            s.dispatch_with_auth_state(
-                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(token)]),
-                false,
-                &mut auth,
-            );
-            auth
-        };
-
-        let mut a = authed("sk_a");
-        s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("REMEMBER"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("projA secret falcon"),
-            ]),
-            false,
-            &mut a,
-        );
-
-        // projB cannot recall projA's memory.
-        let mut b = authed("sk_b");
-        let r = s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("RECALL"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("secret falcon"),
-                RespValue::bulk("10"),
-            ]),
-            false,
-            &mut b,
-        );
-        match r {
-            Response::Reply(RespValue::Array(items)) => {
-                assert!(
-                    items.is_empty(),
-                    "projB must not see projA's memory: {items:?}"
-                );
-            }
-            other => panic!("expected array, got {other:?}"),
-        }
-    }
-
-    /// Phase B (signed path): a control-plane-issued JWT authenticates, its
-    /// claims resolve the tenant, and two projects' tokens stay isolated. A
-    /// bogus token is rejected.
-    #[test]
-    fn jwt_auth_resolves_tenant_from_claims_and_isolates() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secret = b"shared-hs256-secret-cp-and-node".to_vec();
-        let s = Server::new().with_jwt_secret(secret.clone());
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        // Stand in for `ControlPlane::mint_jwt` — same crate, same claims.
-        let mint = |proj: &str| {
-            let claims =
-                duxx_token::Claims::new("key_x", "org1", proj, "prod", "developer", now, 3600);
-            duxx_token::sign(&claims, &secret).unwrap()
-        };
-        let authed = |jwt: &str| {
-            let mut auth = security::AuthState::unauthenticated();
-            let r = s.dispatch_with_auth_state(
-                RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(jwt)]),
-                false,
-                &mut auth,
-            );
-            (auth, r)
-        };
-
-        // Valid JWT for projA → authenticates and writes.
-        let (mut a, ra) = authed(&mint("projA"));
-        assert!(
-            matches!(ra, Response::Reply(RespValue::SimpleString(_))),
-            "JWT AUTH should succeed, got {ra:?}"
-        );
-        s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("REMEMBER"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("projA secret owl"),
-            ]),
-            false,
-            &mut a,
-        );
-
-        // projB's JWT cannot recall projA's memory.
-        let (mut b, _) = authed(&mint("projB"));
-        let r = s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("RECALL"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("secret owl"),
-                RespValue::bulk("10"),
-            ]),
-            false,
-            &mut b,
-        );
-        match r {
-            Response::Reply(RespValue::Array(items)) => {
-                assert!(items.is_empty(), "projB must not see projA: {items:?}")
-            }
-            other => panic!("expected array, got {other:?}"),
-        }
-
-        // A non-JWT / tampered token is rejected.
-        let (bad, rb) = authed("not.a.valid.jwt");
-        assert!(!bad.is_authed(), "garbage token must not authenticate");
-        assert!(
-            matches!(rb, Response::Reply(RespValue::Error(_))),
-            "bad token must error, got {rb:?}"
-        );
-    }
-
-    /// Asymmetric path: a node holding only the Ed25519 **public** key accepts
-    /// a control-plane-signed JWT, and rejects one signed by a different key.
-    #[test]
-    fn ed25519_jwt_auth_works_with_public_key_only() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let (priv_der, pub_der) = duxx_token::generate_ed25519().unwrap();
-        // The node is given ONLY the public key — it can verify, not mint.
-        let s = Server::new().with_jwt_public_key(pub_der);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let claims = duxx_token::Claims::new("k", "org1", "projA", "prod", "developer", now, 3600);
-        let jwt = duxx_token::sign_ed25519(&claims, &priv_der).unwrap();
-
-        let mut auth = security::AuthState::unauthenticated();
-        let r = s.dispatch_with_auth_state(
-            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(jwt)]),
-            false,
-            &mut auth,
-        );
-        assert!(
-            matches!(r, Response::Reply(RespValue::SimpleString(_))),
-            "EdDSA JWT should authenticate, got {r:?}"
-        );
-
-        // A token signed by a DIFFERENT private key must be rejected.
-        let (other_priv, _) = duxx_token::generate_ed25519().unwrap();
-        let forged = duxx_token::sign_ed25519(&claims, &other_priv).unwrap();
-        let mut auth2 = security::AuthState::unauthenticated();
-        s.dispatch_with_auth_state(
-            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(forged)]),
-            false,
-            &mut auth2,
-        );
-        assert!(
-            !auth2.is_authed(),
-            "token from a different key must be rejected"
-        );
-    }
-
-    /// Full A→B→C vertical: the control plane issues a workspace JWT, the data
-    /// plane verifies it and writes to the isolated workspace, and the Studio
-    /// read-API serves that exact workspace back — all wired by the same
-    /// shared secret and credential claims.
-    #[test]
-    fn end_to_end_control_plane_to_data_plane_to_studio() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secret = b"end-to-end-shared-hs256-secret".to_vec();
-
-        // (B) Control plane: org → project → key → short-lived JWT.
-        let cp = duxx_control::ControlPlane::with_signing_key(secret.clone());
-        let org = cp.create_org("Acme").unwrap();
-        let proj = cp.create_project(&org.id, "bot").unwrap();
-        let key = cp
-            .issue_key(
-                &proj.id,
-                duxx_control::Env::Prod,
-                duxx_control::Role::Developer,
-                "agent",
-            )
-            .unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let jwt = cp.mint_jwt(&key.secret, now, 900).unwrap();
-        let expected_tenant = format!("{}/{}/prod", org.id, proj.id);
-
-        // (A) Data plane: verify the JWT at AUTH, then write to the workspace.
-        let s = Server::new().with_jwt_secret(secret.clone());
-        let mut auth = security::AuthState::unauthenticated();
-        let r = s.dispatch_with_auth_state(
-            RespValue::Array(vec![RespValue::bulk("AUTH"), RespValue::bulk(jwt.clone())]),
-            false,
-            &mut auth,
-        );
-        assert!(
-            matches!(r, Response::Reply(RespValue::SimpleString(_))),
-            "control-plane JWT should authenticate on the data plane, got {r:?}"
-        );
-        s.dispatch_with_auth_state(
-            RespValue::Array(vec![
-                RespValue::bulk("REMEMBER"),
-                RespValue::bulk("u1"),
-                RespValue::bulk("end to end falcon memory"),
-            ]),
-            false,
-            &mut auth,
-        );
-
-        // (C) Studio: read that exact workspace back via the same JWT.
-        let r = crate::studio::route(&s, "GET", "/studio/overview", "", Some(&jwt));
-        assert_eq!(r.status, 200);
-        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-        assert_eq!(v["tenant"], expected_tenant);
-        assert_eq!(v["memory_count"], 1);
-
-        let r = crate::studio::route(&s, "GET", "/studio/memory", "q=falcon&k=5", Some(&jwt));
-        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-        assert!(
-            !v["hits"].as_array().unwrap().is_empty(),
-            "Studio should recall the memory written via the control-plane JWT"
         );
     }
 
