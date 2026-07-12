@@ -255,6 +255,8 @@ impl Duxx for DuxxService {
             sessions: 0, // SessionStore not exposed via gRPC yet
             dim: self.dim as u32,
             version: SERVER_VERSION.to_string(),
+            tombstone_ratio: self.memory.tombstone_ratio(),
+            compactions: self.memory.compactions_total(),
         }))
     }
 
@@ -539,5 +541,41 @@ mod tests {
             .into_inner();
         assert_eq!(resp.reclaimed, 3);
         assert_eq!(resp.tombstone_ratio, 0.0);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_compaction_health() {
+        let svc = DuxxService::new();
+        svc.memory.set_auto_compact_ratio(None);
+        svc.memory.set_max_rows(Some(2));
+        svc.memory
+            .set_eviction_half_life(std::time::Duration::from_micros(1));
+        for i in 0..5 {
+            svc.remember(Request::new(RememberRequest {
+                key: "u".into(),
+                text: format!("note {i}"),
+                embedding: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+        // Before compaction: 2 live rows, 3 tombstones -> ratio 1.5, 0 compactions.
+        let s = svc
+            .stats(Request::new(StatsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(s.memories, 2);
+        assert!(s.tombstone_ratio > 0.0, "ratio={}", s.tombstone_ratio);
+        assert_eq!(s.compactions, 0);
+
+        svc.compact(Request::new(CompactRequest {})).await.unwrap();
+        let s2 = svc
+            .stats(Request::new(StatsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(s2.tombstone_ratio, 0.0);
+        assert_eq!(s2.compactions, 1);
     }
 }

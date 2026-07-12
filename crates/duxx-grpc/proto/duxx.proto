@@ -99,6 +99,9 @@ message StatsResponse {
     uint64 sessions = 2;
     uint32 dim = 3;
     string version = 4;
+    // Memory-store compaction health (mirrors the Prometheus gauges).
+    float tombstone_ratio = 5;  // (indexed - live) / live
+    uint64 compactions = 6;     // graph compactions performed (manual + auto)
 }
 
 message PingRequest {

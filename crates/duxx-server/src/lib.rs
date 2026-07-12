@@ -959,6 +959,7 @@ impl Server {
             "REMEMBER" => self.cmd_remember(&args),
             "RECALL" => self.cmd_recall(&args),
             "COMPACT" => self.cmd_compact(),
+            "FORGET" => self.cmd_forget(&args),
             "DOC.INGEST" => self.cmd_doc_ingest(&args),
             "DOC.SEARCH" => self.cmd_doc_search(&args),
             "DOC.LIST" => self.cmd_doc_list(),
@@ -1110,6 +1111,7 @@ impl Server {
             "REMEMBER",
             "RECALL",
             "COMPACT",
+            "FORGET",
             "SUBSCRIBE",
             "UNSUBSCRIBE",
             "PSUBSCRIBE",
@@ -1281,6 +1283,20 @@ impl Server {
             }
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
+    }
+
+    /// `FORGET <id>` — remove one memory by id. Returns `:1` if the id existed,
+    /// `:0` otherwise. The index entry is reclaimed lazily by `COMPACT`.
+    fn cmd_forget(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR FORGET expects 1 arg: id"));
+        }
+        let id = match arg_string(&args[1]).and_then(|s| s.parse::<u64>().ok()) {
+            Some(id) => id,
+            None => return Response::Reply(err("ERR FORGET id must be an integer")),
+        };
+        let removed = self.memory.forget(id);
+        Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
     }
 
     fn cmd_subscribe(&self, args: &[RespValue]) -> Response {
@@ -3530,6 +3546,58 @@ mod tests {
         assert_eq!(del, RespValue::Integer(1));
         let get2 = dispatch_array(&s, vec![RespValue::bulk("GET"), RespValue::bulk("k")]);
         assert_eq!(get2, RespValue::Null);
+    }
+
+    #[test]
+    fn forget_removes_memory_by_id() {
+        let s = Server::new();
+        let id = match dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("REMEMBER"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("a wallet at the cafe"),
+            ],
+        ) {
+            RespValue::Integer(id) => id,
+            other => panic!("expected id, got {other:?}"),
+        };
+        // FORGET the id -> :1; forgetting again -> :0.
+        assert_eq!(
+            dispatch_array(
+                &s,
+                vec![RespValue::bulk("FORGET"), RespValue::bulk(id.to_string())]
+            ),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            dispatch_array(
+                &s,
+                vec![RespValue::bulk("FORGET"), RespValue::bulk(id.to_string())]
+            ),
+            RespValue::Integer(0)
+        );
+        // The forgotten row must not surface in recall.
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u1"),
+                RespValue::bulk("wallet"),
+                RespValue::bulk("5"),
+            ],
+        );
+        if let RespValue::Array(items) = r {
+            assert!(items.is_empty(), "forgotten memory leaked into recall");
+        }
+        // Bad id -> error.
+        assert!(matches!(
+            dispatch_array(
+                &s,
+                vec![RespValue::bulk("FORGET"), RespValue::bulk("notanid")]
+            ),
+            RespValue::Error(_)
+        ));
     }
 
     #[test]

@@ -191,6 +191,7 @@ impl Capabilities {
             // COMPACT physically purges already-deleted rows from the index —
             // the completion of deletion, so gate it on the same capability.
             "COMPACT" => self.delete_memory,
+            "FORGET" => self.delete_memory,
             "PROMPT.PUT" | "PROMPT.TAG" | "PROMPT.UNTAG" => self.write_prompt,
             "DATASET.CREATE"
             | "DATASET.ADD"
@@ -442,6 +443,7 @@ pub fn required_role(command: &str) -> Role {
         | "DEL"
         | "REMEMBER"
         | "COMPACT"
+        | "FORGET"
         | "TRACE.RECORD"
         | "TRACE.CLOSE"
         | "PROMPT.PUT"
