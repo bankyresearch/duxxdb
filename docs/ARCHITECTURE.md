@@ -1,310 +1,321 @@
 # DuxxDB — Architecture
 
-**Version:** 0.1-draft
-**Status:** Design locked, implementation starting
+**Version:** 0.4.0
+**Status:** Shipping (self-hosted beta) — Apache-2.0 single-node engine
 **Audience:** Contributors, integrators, system designers
 
----
-
-## 1. Mission
-
-Build the **fastest database purpose-built for AI agents** — chatbots, voice bots, and autonomous agents — unifying structured data, unstructured text, and vector embeddings behind a single low-latency API.
-
-**Target latency budgets (p99):**
-
-| Operation | Budget | Why |
-|---|---|---|
-| Session KV read | < 0.5 ms | Voice bots have a ~200 ms end-to-end budget |
-| Hybrid RECALL (vector + BM25) | < 10 ms | RAG must feel instant |
-| Structured filter + ANN | < 15 ms | "Find my top-10 refund emails this week" |
-| Write + index | < 5 ms | Agents write memory on every turn |
+> This document describes the **current** engine. Multi-tenancy, the control
+> plane, replication/HA, and the Cloud Console live in the separate
+> managed-services product (DuxxDB Cloud) — see [LICENSING.md](../LICENSING.md)
+> and the "Future architecture" section below.
 
 ---
 
-## 2. Design Principles
+## 1. What DuxxDB is
 
-1. **Agent-native, not agent-friendly.** First-class primitives for MEMORY, TOOL_CACHE, SESSION — not generic tables that agents bolt onto.
-2. **Embedded-first, server-optional.** Same binary runs in-process (like SQLite / DuckDB) or as a daemon. Zero network hop when you don't need one.
-3. **Compose, don't reinvent.** Storage, vector index, BM25, SQL — all from battle-tested Rust crates. The innovation is in the **agent layer and the hybrid query planner**, not in yet another LSM tree.
-4. **One table, mixed columns.** Structured, unstructured, and vector columns coexist in a single row. One insert, one query plan.
-5. **Realtime reactive.** `SUBSCRIBE` for push updates — agents shouldn't poll for new memories.
-6. **MCP-native.** The Model Context Protocol is the default wire format. Any Claude/GPT/Llama agent plugs in with zero glue code.
+DuxxDB is a database built for AI agents. It unifies three retrieval modes —
+**vector ANN**, **BM25 full-text**, and **structured filters** — behind one
+hybrid query plan, and exposes first-class **agent primitives** (`MEMORY`,
+`TOOL_CACHE`, `SESSION`) plus an observability/evaluation stack (traces,
+prompts, datasets, evals, replay, cost) as the operational state layer an agent
+uses while it runs.
+
+The same Rust engine runs **embedded** (in-process, like SQLite) or as a
+**network server** (RESP / gRPC / MCP). Storage is durable and pure-Rust; there
+is no GC and no external service dependency.
+
+**Design latency targets (single node, NVMe):**
+
+| Operation | Target |
+|---|---|
+| Session KV read | sub-millisecond |
+| Hybrid recall (vector + BM25, k=10) | low single-digit ms |
+| Write + index | a few ms (batched tantivy commit) |
+
+See `bench/comparative/` for measured numbers and methodology.
 
 ---
 
-## 3. System Tiering
+## 2. Design principles
 
-DuxxDB is the **hot tier** only. It is explicitly **not** a lakehouse.
+1. **Agent-native, not agent-friendly.** `MEMORY`, `TOOL_CACHE`, and `SESSION`
+   are first-class managed types, not generic tables agents bolt onto.
+2. **Embedded-first, server-optional.** One codebase; run in-process or as a
+   daemon. Zero network hop when you don't need one.
+3. **Compose, don't reinvent.** Durable storage, the vector index, and BM25 are
+   battle-tested Rust crates. The value is the **agent layer**, the **hybrid
+   query plan**, and the **Phase-7 operational stack** — not another LSM tree.
+4. **Correctness under deletion.** Agent memory is deletion-heavy; recall must
+   stay correct *and* stay fast as rows are forgotten (see §7, Compaction).
+5. **Many surfaces, one engine.** RESP, gRPC, MCP, Python, Node, and embedded
+   Rust all sit on the same core.
+6. **Open-core, honestly.** The engine is Apache-2.0 and fully useful on its
+   own; the commercial value is operating, scaling, and governing it.
+
+---
+
+## 3. System tiering
+
+DuxxDB is the **hot operational tier**. It is not a lakehouse.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│   AGENT (chatbot / voice bot / MCP client)                  │
-└─────────────────────────┬───────────────────────────────────┘
-                          │  <5 ms RECALL / WRITE
-                          ▼
+│  AGENT  (chatbot / voice bot / autonomous / MCP client)      │
+└────────────────────────────┬────────────────────────────────┘
+                             │  low-latency recall / write
+                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│   HOT TIER — DuxxDB                                         │
-│   Last 30–90 days, live sessions, tool caches, hot vectors  │
-└─────────────────────────┬───────────────────────────────────┘
-                          │  async CDC / batch export (minutes)
-                          ▼
+│  HOT TIER — DuxxDB (this repo)                               │
+│  live memory / sessions / tool cache / hot vectors +         │
+│  traces · prompts · datasets · evals · replay · cost · docs  │
+└────────────────────────────┬────────────────────────────────┘
+                             │  batch export (duxx-coldtier)
+                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│   COLD TIER — Lakehouse (Iceberg / Delta on S3)             │
-│   Full history, training corpora, audit logs, analytics     │
+│  COLD TIER — Apache Parquet on object storage                │
+│  full history · training corpora · analytics (Spark/DuckDB)  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Cold-tier integration is a **v0.3 feature** (Arrow Flight → Iceberg/Delta exporter). Out of scope for v0.1.
+Cold tiering is **Parquet export** via `duxx-coldtier` (`duxx-export`), read
+natively by Spark / DuckDB / Polars / pandas. Offline `duxx-snapshot`
+create/verify/restore provides consistent filesystem snapshots.
 
 ---
 
-## 4. Component Architecture
+## 4. Crate map (21 crates, all Apache-2.0)
 
 ```
-                    ┌──────────────────────────────────────┐
-                    │         AGENT BINDINGS               │
-                    │   Rust | Python | TypeScript | Go    │
-                    └──────────────────┬───────────────────┘
-                                       │
-        ┌──────────────────────────────┼──────────────────────────────┐
-        ▼                              ▼                              ▼
-┌───────────────┐             ┌───────────────┐             ┌───────────────┐
-│  duxx-server  │             │   duxx-mcp    │             │   duxx-cli    │
-│  gRPC + RESP3 │             │  MCP protocol │             │  duxx shell   │
-└───────┬───────┘             └───────┬───────┘             └───────┬───────┘
-        │                             │                             │
-        └─────────────────────────────┼─────────────────────────────┘
-                                      ▼
-                    ┌──────────────────────────────────────┐
-                    │         duxx-memory                  │
-                    │  MEMORY | TOOL_CACHE | SESSION types │
-                    │  Auto-embed, TTL, importance decay   │
-                    └──────────────────┬───────────────────┘
-                                       ▼
-                    ┌──────────────────────────────────────┐
-                    │         duxx-query                   │
-                    │  DataFusion SQL + hybrid fusion (RRF)│
-                    │  Cost-based planner, filter pushdown │
-                    └──────────────────┬───────────────────┘
-                                       ▼
-        ┌──────────────────────────────┼──────────────────────────────┐
-        ▼                              ▼                              ▼
-┌───────────────┐             ┌───────────────┐             ┌───────────────┐
-│  duxx-index   │             │ duxx-reactive │             │  duxx-core    │
-│  usearch HNSW │             │  subscriptions│             │  types/errors │
-│  tantivy BM25 │             │  change feed  │             │  config       │
-└───────┬───────┘             └───────────────┘             └───────────────┘
-        │
+                 access surfaces
+   ┌───────────────┬───────────────┬───────────────┐
+   │ duxx-server   │  duxx-grpc    │  duxx-mcp      │  + embedded Rust
+   │ RESP2/3 TCP   │  tonic gRPC   │  MCP stdio     │  + bindings/python (PyO3)
+   │ auth·TLS·     │  streaming    │  JSON-RPC      │  + bindings/node   (napi)
+   │ metrics       │  Subscribe    │                │
+   └───────┬───────┴───────┬───────┴───────┬────────┘
+           └───────────────┼───────────────┘
+                           ▼
+           ┌───────────────────────────────┐   agent primitives + Phase 7
+           │  duxx-memory                  │   MEMORY · TOOL_CACHE · SESSION
+           │  decay · cap-eviction · COMPACT│   + duxx-{trace,prompts,datasets,
+           └───────────────┬───────────────┘        eval,replay,cost} · duxx-docs
+                           ▼
+           ┌───────────────────────────────┐
+           │  duxx-query — hybrid recall    │   RRF fusion (k=60)
+           └───────────────┬───────────────┘
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+│  duxx-index   │  │ duxx-reactive │  │  duxx-embed   │
+│  hnsw_rs HNSW │  │  ChangeBus    │  │ hash/OpenAI/  │
+│  tantivy BM25 │  │  pub/sub      │  │ Cohere        │
+└───────┬───────┘  └───────────────┘  └───────────────┘
         ▼
-┌───────────────────────────────────────────────────────────┐
-│                    duxx-storage                           │
-│  Lance columnar format (Arrow-native, vector-aware)       │
-│  redb for session/KV hot path                             │
-└───────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  duxx-storage — Backend trait                          │
+│  redb (durable, ACID, MVCC) · in-memory                │
+└───────────────────────────────────────────────────────┘
+        ▲            duxx-coldtier (Parquet export + snapshot)
+        │            duxx-token   (signed JWT credentials)
+        │            duxx-core    (types · errors · Value)
+        └── duxx-cli (shell + examples) · duxx-bench (Criterion)
 ```
-
-### 4.1 Crate responsibilities
 
 | Crate | Role |
 |---|---|
-| `duxx-core` | Shared types, errors, config, feature flags |
-| `duxx-storage` | Lance table wrapper, schema, open/scan/insert/compact. redb for session KV |
-| `duxx-index` | HNSW (usearch) + BM25 (tantivy) builders and searchers |
-| `duxx-query` | DataFusion plan integration, hybrid fusion via Reciprocal Rank Fusion |
-| `duxx-memory` | High-level agent primitives (MEMORY, TOOL_CACHE, SESSION) |
-| `duxx-reactive` | Subscription manager, change feed, WAL tailer |
-| `duxx-server` | gRPC + RESP3 daemon |
-| `duxx-mcp` | MCP server (stdio + SSE transports) |
-| `duxx-cli` | Interactive shell + admin commands |
-| `duxx-bench` | Criterion benchmarks; runs against Redis/Qdrant/pgvector for comparison |
+| `duxx-core` | Shared `Value`, error types, config |
+| `duxx-storage` | `Backend` trait; **redb** (durable ACID/MVCC) + in-memory backends |
+| `duxx-index` | **hnsw_rs** HNSW (cosine) + **tantivy** BM25; `rebuild` for compaction |
+| `duxx-query` | Hybrid recall — Reciprocal Rank Fusion of vector + BM25 rankings |
+| `duxx-embed` | Embedders: deterministic `hash`, OpenAI, Cohere (HTTP) |
+| `duxx-memory` | `MEMORY` / `TOOL_CACHE` / `SESSION`, importance decay, cap-eviction, `compact` |
+| `duxx-reactive` | `ChangeBus` pub/sub change feed |
+| `duxx-trace` | Agent trace/thread store (Phase 7.1) |
+| `duxx-prompts` | Versioned prompt registry with semantic search (7.2) |
+| `duxx-datasets` | Versioned eval datasets (7.3) |
+| `duxx-eval` | Eval runs, scores, regressions, failure clustering (7.4) |
+| `duxx-replay` | Deterministic agent replay (7.5) |
+| `duxx-cost` | Token + cost ledger, budgets, expensive-query clustering (7.6) |
+| `duxx-docs` | Document intelligence: ingest → chunk → embed → index → cite |
+| `duxx-token` | Signed short-lived credentials (HS256 + Ed25519 JWT) |
+| `duxx-coldtier` | Apache Parquet exporter (`duxx-export`) + `duxx-snapshot` |
+| `duxx-server` | RESP2/3 TCP daemon: auth/RBAC, TLS/mTLS, Prometheus, graceful shutdown |
+| `duxx-grpc` | tonic gRPC daemon with streaming `Subscribe` + gRPC health |
+| `duxx-mcp` | MCP stdio JSON-RPC server (Claude / Cline / any MCP agent) |
+| `duxx-cli` | Interactive shell + worked examples |
+| `duxx-bench` | Criterion benchmarks |
+
+`bindings/python` (PyO3, abi3 wheel) and `bindings/node` (napi-rs) wrap the
+embedded engine.
 
 ---
 
-## 5. Data Model
+## 5. Agent primitives (`duxx-memory`)
 
-### 5.1 Unified schema
+### 5.1 `MEMORY`
+Long-term semantic memory. `remember(key, text, embedding)` stores a row and
+indexes it in both HNSW and tantivy. `recall(key, query, embedding, k)` runs
+hybrid retrieval (§6). Each memory carries an `importance` and a wall-clock
+`created_at`; the value used for ranking/eviction is the **effective**
+importance, which decays with age:
 
-A DuxxDB table can mix any of these column kinds in a single row:
-
-| Kind | Rust type | Index | Use |
-|---|---|---|---|
-| Scalar | `i64`, `f64`, `bool`, `Utf8`, `Timestamp` | B-tree (optional) | Filter, sort |
-| JSON / Struct | `Struct<...>` | — | Metadata |
-| Text | `Utf8` with `@bm25` tag | Tantivy inverted index | Keyword search |
-| Vector | `FixedSizeList<Float32, D>` with `@hnsw` tag | usearch HNSW | ANN search |
-| Array | `List<T>` | — | Nested collections |
-
-### 5.2 Example DDL
-
-```sql
-CREATE TABLE conversations (
-  id         UUID PRIMARY KEY,
-  user_id    TEXT,
-  agent_id   TEXT,
-  turn_at    TIMESTAMP,
-  role       TEXT,                            -- 'user' | 'assistant' | 'tool'
-  message    TEXT @bm25,                      -- BM25 index
-  embedding  VECTOR(1024) @hnsw(m=16, ef=64), -- HNSW index
-  tool_calls JSON,
-  importance FLOAT DEFAULT 1.0,
-  ttl        INTERVAL DEFAULT '90 days'
-);
+```
+effective_importance = importance × 2^(−age / half_life)
 ```
 
-### 5.3 Agent primitive: MEMORY
+An optional row **cap** evicts the lowest effective-importance rows on overflow
+(agent-friendly: keep `--max-memories 1_000_000` and trust the store to forget
+the boring stuff first).
 
-`MEMORY` is a built-in managed type. On insert:
-1. Auto-embed `message` with the configured provider (OpenAI / Cohere / local BGE).
-2. Set `turn_at = now()`.
-3. Compute `importance` from caller + optional LLM scoring.
-4. Start TTL countdown with exponential decay on `importance`.
+### 5.2 `TOOL_CACHE`
+Two-stage cache for expensive tool/LLM results, keyed by `(tool, args_hash)`:
+an **exact** hash hit, or a **semantic near-hit** (cosine ≥ 0.95) against the
+args embedding, with per-entry TTL. Turns repeated tool calls into cache hits.
 
-### 5.4 Agent primitive: TOOL_CACHE
-
-Caches tool-call results keyed by `(tool_name, args_hash)` **and** args embedding.
-Lookup returns a hit if:
-- exact `args_hash` match, **or**
-- cosine similarity of args embedding ≥ 0.95 **and** result hasn't expired.
-
-Saves real money on expensive tool calls (web search, LLM summarization, DB queries).
-
-### 5.5 Agent primitive: SESSION
-
-Hot KV under redb, keyed by `session_id`. Holds conversation buffer, open tool invocations, flags. Auto-flushed to main table on session end.
+### 5.3 `SESSION`
+Hot KV with **sliding TTL** for per-conversation working state (turn buffer,
+in-flight tool invocations, scratch flags). In-process, lazily evicted.
 
 ---
 
-## 6. Query Flow — the RECALL operation
+## 6. Hybrid recall pipeline (`duxx-query`)
 
 ```
-RECALL "user's refund issue last month"
-  WHERE user_id = '42'
-  USING vector_col = embedding, text_col = message
-  LIMIT 10
+recall(key, "user's refund issue", q_embedding, k=10)
 ```
 
-**Pipeline:**
-
-1. **Parse & plan** (`duxx-query`)
-   - Embed the query string → `q_vec` (same provider as inserted vectors).
-   - Tokenize → `q_terms` for BM25.
-2. **Filter pushdown** (DataFusion) — apply `user_id = '42'` first. Narrows candidate set.
-3. **Parallel index probes** (tokio, join!):
-   - HNSW search on `embedding` → top-50 by cosine, filtered by candidate set.
-   - BM25 search on `message` → top-50 by score, filtered.
-4. **Fusion via Reciprocal Rank Fusion (RRF)**:
+1. **Vector probe** — HNSW (`hnsw_rs`, cosine) returns the top `per = max(k×3, 32)` ids by similarity.
+2. **BM25 probe** — tantivy returns the top `per` ids by BM25 score.
+3. **Reciprocal Rank Fusion** — the two ranked lists are fused:
    ```
-   score(doc) = Σ  1 / (k + rank_i(doc))   for k ≈ 60
+   score(id) = Σ_i  1 / (k_rrf + rank_i(id))     k_rrf = 60
    ```
-   Tunable weight per index; recency boost optional.
-5. **Hydrate** — fetch full rows for top-N from Lance (columnar projection).
-6. **Return** as Arrow RecordBatch (zero-copy to Python/JS bindings).
-
-**Expected p99:** < 10 ms on 1M rows, single node, NVMe.
+   Ids ranked highly by *both* retrievers rise to the top; the fusion is
+   scale-free (it doesn't care that cosine and BM25 use different scales).
+4. **Hydrate + filter** — hits are resolved against the live row map (`by_id`),
+   which also guarantees a forgotten row can never surface even before the
+   index is compacted.
+5. **Optional decay rerank** — `recall_decayed` multiplies each hit by its
+   effective importance for recency-aware ordering.
 
 ---
 
-## 7. Storage Layer Details
+## 7. Deletion-safe recall (compaction)
 
-### 7.1 Why Lance
+`hnsw_rs` has no in-place delete: a forgotten vector stays a node in the
+navigable graph. Recall stays **correct** (results are filtered through the live
+row map), but those tombstone nodes are still traversed during search, so recall
+**quality** degrades in exactly the regions you've deleted from most.
 
-- Columnar (Parquet-like) but **random-access friendly** — critical for ANN hydration.
-- Vector indices are **first-class** and stored in the same file.
-- Arrow-native → zero-copy to every language binding.
-- Versioning built in — we get time-travel for free.
-- Apache 2.0.
+`MEMORY` tracks a **tombstone ratio** `(indexed − live) / live`. `COMPACT`
+rebuilds the HNSW graph and the BM25 index from the surviving rows and swaps
+them in atomically, reclaiming all tombstones. When the ratio crosses a
+threshold (default `0.20`), the next write auto-compacts; it is also exposed
+explicitly on every surface (`COMPACT` in RESP, `compact()` in Python/MCP/gRPC)
+and observable via `duxx_resp_memory_compactions` / `duxx_resp_memory_tombstone_ratio`.
 
-### 7.2 Why redb for hot KV
+---
 
-- Pure Rust, no FFI.
-- mmap-backed, MVCC, ACID.
-- Sub-microsecond reads.
-- Used for `SESSION`, the reactive change-feed WAL, and small metadata.
+## 8. Storage layer (`duxx-storage`)
 
-### 7.3 Directory layout on disk
+The `Backend` trait abstracts durable byte-keyed storage. The default backend is
+**redb** — pure Rust, ACID, MVCC, mmap-backed, no FFI — used for the memory row
+store and the Phase-7 registries. An in-memory backend is available for tests
+and ephemeral use.
+
+Fully-persistent memory (`MemoryStore::open_at`) keeps three artifacts under one
+directory so a graceful restart skips the expensive rebuild:
 
 ```
 <data_dir>/
-├── duxx.config            # TOML config
-├── sessions.redb          # redb file — session/KV hot path
-├── wal/                   # reactive change feed
-│   └── 000001.log
-└── tables/
-    └── conversations/
-        ├── _versions/     # Lance dataset versions
-        ├── _indices/      # HNSW, BM25 index files
-        └── data/          # Arrow/Lance fragments
+├── store.redb      # memory rows (redb)
+├── tantivy/        # BM25 index (mmap)
+└── hnsw/           # HNSW graph dump + id-map sidecar
 ```
 
----
-
-## 8. Concurrency Model
-
-- **Tokio** async runtime; one reactor per process.
-- **Read path:** shared `Arc<LanceDataset>` + `Arc<IndexSet>`, lock-free.
-- **Write path:** single writer per table (MVCC via Lance snapshots). Appends are O(1); index updates amortized.
-- **Compaction + reindex** runs on a background tokio task, triggered by write-volume threshold.
+On reopen, if the on-disk indices match the row count they are loaded directly
+(sub-second cold start); after a hard kill they are rebuilt from the rows.
 
 ---
 
-## 9. Wire Protocols
+## 9. Concurrency model
 
-| Protocol | When | Why |
+- **Tokio** async runtime for the servers; the engine core is synchronous and
+  cheaply `Clone` (Arc internals).
+- **Reads** take shared locks over the indices and the row map.
+- **Writes** take short-lived write locks; tantivy commits are **batched**
+  (default every 100 inserts) and auto-flushed on read so "insert-then-recall"
+  holds.
+- **Compaction** takes the index write locks for the rebuild; it acquires them
+  in the same order as writes, so the two can't deadlock.
+
+---
+
+## 10. Access surfaces
+
+| Surface | Crate / binding | Notes |
 |---|---|---|
-| **Embedded (in-process)** | Rust agent code | Zero overhead |
-| **gRPC + protobuf** | Services, multi-lang | Typed, streaming, HTTP/2 |
-| **RESP3** | Existing Redis / Valkey clients | Drop-in compat path |
-| **MCP (stdio + SSE)** | Claude / GPT / any LLM agent | Zero-glue integration |
+| Embedded Rust | `duxx-memory` etc. | Zero overhead, in-process |
+| Python | `bindings/python` (PyO3, abi3) | One wheel for 3.8–3.13 |
+| Node / TypeScript | `bindings/node` (napi-rs) | Native module |
+| RESP2/3 | `duxx-server` | Valkey/Redis-client compatible |
+| gRPC | `duxx-grpc` (tonic) | Streaming `Subscribe`, gRPC health |
+| MCP stdio | `duxx-mcp` | Claude / Cline / any MCP agent |
 
 ---
 
-## 10. Reactive Subscriptions
+## 11. Reactive subscriptions (`duxx-reactive`)
 
-```
-SUBSCRIBE conversations WHERE agent_id = 'sales-bot-01'
-```
-
-- WAL-tailing model (Postgres logical replication inspiration).
-- Subscribers receive Arrow RecordBatches on change.
-- Backpressure via bounded `tokio::mpsc`.
-- Filter predicates evaluated at publish-time to avoid fan-out explosion.
-
-Use case: a supervisor agent watching every memory created by a fleet of worker agents.
+Every mutation publishes a `ChangeEvent` on a `ChangeBus`. Clients `SUBSCRIBE` /
+`PSUBSCRIBE` (RESP) or stream the gRPC `Subscribe` RPC to watch memory changes —
+e.g. a supervisor agent watching a fleet of workers. The bus is a bounded
+broadcast channel (lossy by design under slow consumers).
 
 ---
 
-## 11. Security & Multi-tenancy (post v0.1)
+## 12. Security (single-node)
 
-- Row-level isolation via `tenant_id` column + DataFusion filter injection.
-- mTLS between server and clients.
-- At-rest encryption via Lance's optional AES-GCM.
-- Unity-Catalog-compatible ACL layer in v0.3.
-
----
-
-## 12. Non-Goals (v0.1)
-
-- Distributed / sharded cluster mode — single node only. Distribution comes after we saturate single-node perf.
-- OLAP dashboards — that's the cold tier's job.
-- Full SQL compliance — DataFusion covers what we need; we don't add custom SQL surface in v0.1.
-- Write-optimized graph traversal — future.
+- **Auth**: shared token (`--token` / `DUXX_TOKEN`) or a role-based API-key
+  catalog (`--auth-key principal:token:role`, `DUXX_AUTH_KEYS`) with
+  read/write/admin roles and finer capabilities.
+- **Transport**: native TLS on RESP + gRPC (rustls); mTLS client-cert
+  verification via `--tls-client-ca`.
+- **Audit**: JSON-lines security audit log (`--audit-log`).
+- **Limits**: configurable RESP resource limits, connection caps, and
+  per-connection command-rate limits.
+- **Observability**: Prometheus `/metrics` + `/health`; gRPC health protocol.
+- **Credentials**: `duxx-token` issues/verifies short-lived HS256 or Ed25519
+  JWTs (the data plane can verify with only a public key).
 
 ---
 
-## 13. Open Questions (tracked for resolution)
+## 13. Future architecture (DuxxDB Cloud)
 
-1. **Default embedding provider** — bundle a local BGE model or require explicit config?
-2. **Vector quantization default** — full float32 at 1M scale, switch to PQ at ≥ 10M?
-3. **Compaction trigger** — write count or wall clock?
-4. **RRF `k` tuning** — expose or hardcode at 60?
+The following are **not** in this repo — they are the managed-services layer
+(source-available, BUSL-1.1) that builds on these Apache crates:
 
-These are implementation-time decisions and don't block scaffolding.
+- **Multi-tenancy** — physical per-workspace isolation of every primitive.
+- **Control plane** — orgs / projects / environments / API keys / placement /
+  usage / billing, with durable persistence and SSO.
+- **Replication / HA** — leader/follower, failover, cross-AZ, PITR.
+- **Cloud Console + Studio** — operator UI and cross-primitive debugging.
+
+Their engineering status and roadmap are tracked as issues in the
+`duxxdb-cloud` repository.
 
 ---
 
-## 14. Implementation Notes
+## 14. Non-goals (this repo)
 
-Runtime dependency notices for distributed builds are maintained in
-[`../NOTICE`](../NOTICE). Design and implementation details in this
-document describe DuxxDB behavior and release scope rather than acting
-as a dependency credit list.
+- Distributed / sharded cluster mode and multi-tenancy — single node here; those
+  are DuxxDB Cloud.
+- OLAP dashboards — that's the cold tier's job (Parquet → Spark/DuckDB).
+- A full SQL surface — retrieval is via the agent primitives and hybrid recall,
+  not a SQL parser.
+
+---
+
+## 15. Implementation notes
+
+Third-party dependency notices required for distribution are maintained in
+[`../NOTICE`](../NOTICE).
