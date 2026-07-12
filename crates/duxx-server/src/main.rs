@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tls_key: Option<String> = None;
     let mut tls_client_ca: Option<String> = None;
     let mut max_memories: Option<usize> = None;
+    let mut auto_compact_ratio: Option<String> = None;
     let mut phase7_storage: Option<String> = None;
     let mut max_bulk_bytes: Option<usize> = None;
     let mut max_array_items: Option<usize> = None;
@@ -118,6 +119,11 @@ async fn main() -> anyhow::Result<()> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--max-memories needs a value"))?;
                 max_memories = Some(v.parse()?);
+            }
+            "--auto-compact-ratio" => {
+                auto_compact_ratio = Some(args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--auto-compact-ratio needs a value (e.g. 0.20, or 'off')")
+                })?);
             }
             "--phase7-storage" => {
                 phase7_storage = Some(args.next().ok_or_else(|| {
@@ -376,6 +382,34 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Tombstone ratio at which a write auto-triggers COMPACT. `off`/`0`
+    // disables auto-compaction; a fraction (e.g. 0.20) sets the threshold.
+    let auto_compact_ratio =
+        auto_compact_ratio.or_else(|| std::env::var("DUXX_AUTO_COMPACT_RATIO").ok());
+    if let Some(spec) = auto_compact_ratio {
+        let trimmed = spec.trim();
+        let ratio = match trimmed.to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => None,
+            _ => {
+                let v: f32 = trimmed.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "--auto-compact-ratio: expected a number or 'off', got {spec:?}"
+                    )
+                })?;
+                if v <= 0.0 {
+                    None
+                } else {
+                    Some(v)
+                }
+            }
+        };
+        server.memory().set_auto_compact_ratio(ratio);
+        match ratio {
+            Some(r) => tracing::info!(auto_compact_ratio = r, "auto-compaction threshold set"),
+            None => tracing::info!("auto-compaction DISABLED"),
+        }
+    }
+
     // Optional Prometheus / health endpoint on a separate listener.
     let metrics_addr = metrics_addr.or_else(|| std::env::var("DUXX_METRICS_ADDR").ok());
     if let Some(addr) = metrics_addr {
@@ -448,6 +482,9 @@ fn print_help() {
     println!("  --tls-client-ca PATH   PEM CA bundle for client certificate auth");
     println!("  --max-memories N       Cap memory rows; oldest decayed-importance");
     println!("                         is evicted on overflow (default: unlimited)");
+    println!("  --auto-compact-ratio R Tombstone ratio (indexed-live)/live at which a");
+    println!("                         write auto-compacts the index (default 0.20;");
+    println!("                         'off' to disable)");
     println!("  --phase7-storage SPEC  Persist Phase 7 primitives (trace / prompts /");
     println!("                         datasets / evals / replay / cost). New in v0.2.0.");
     println!("                         Defaults to in-memory.");

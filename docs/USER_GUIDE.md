@@ -414,9 +414,18 @@ crosses a threshold (default `0.20`), the next `remember` triggers a rebuild.
 You can also trigger it explicitly, and observe it.
 
 ```bash
-# RESP — returns the number of tombstones reclaimed.
-> COMPACT
+# RESP — forget a specific memory, then reclaim its index entry.
+> FORGET 4096          # -> :1 if the id existed, :0 otherwise
+> COMPACT              # -> number of tombstones reclaimed
 (integer) 4096
+```
+
+Configure the auto-compaction threshold from the server too:
+
+```bash
+duxx-server --auto-compact-ratio 0.10   # compact sooner
+duxx-server --auto-compact-ratio off    # disable auto-compaction
+# or DUXX_AUTO_COMPACT_RATIO=0.10
 ```
 
 ```python
