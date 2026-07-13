@@ -17,7 +17,7 @@ use duxx_query::{hybrid_recall, RecallHit};
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
 use duxx_storage::Storage;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -107,7 +107,9 @@ pub struct MemoryStore {
 #[derive(Debug)]
 struct Inner {
     dim: usize,
-    by_id: RwLock<HashMap<u64, Memory>>,
+    /// Rows keyed by id. A `BTreeMap` (not `HashMap`) so `scan` can do an
+    /// efficient ordered keyset range and pagination is stable.
+    by_id: RwLock<BTreeMap<u64, Memory>>,
     vector_index: RwLock<VectorIndex>,
     text_index: RwLock<TextIndex>,
     next_id: RwLock<u64>,
@@ -194,7 +196,7 @@ impl MemoryStore {
         Self {
             inner: Arc::new(Inner {
                 dim,
-                by_id: RwLock::new(HashMap::new()),
+                by_id: RwLock::new(BTreeMap::new()),
                 vector_index: RwLock::new(VectorIndex::with_capacity(dim, capacity)),
                 text_index: RwLock::new(TextIndex::new()),
                 next_id: RwLock::new(1),
@@ -520,9 +522,38 @@ impl MemoryStore {
     /// Used by the cold-tier exporter; the cost is O(n) clones.
     pub fn all_memories(&self) -> Vec<Memory> {
         let by_id = self.inner.by_id.read();
-        let mut out: Vec<Memory> = by_id.values().cloned().collect();
-        out.sort_by_key(|m| m.id);
-        out
+        by_id.values().cloned().collect()
+    }
+
+    /// Stable keyset scan over all memories, ordered by ascending id.
+    ///
+    /// Returns up to `limit` memories with `id > after`, plus the cursor to
+    /// resume from (`None` once the scan is exhausted). Because ids are
+    /// monotonic, this is **stable under concurrent inserts**: a new row gets a
+    /// higher id and appears at the tail, so paging never skips or repeats a
+    /// row already returned. Backed by a `BTreeMap` range, so each page is
+    /// `O(log n + limit)`, not `O(n)`.
+    ///
+    /// Start a scan with `after = 0`. `limit` is clamped to at least 1.
+    pub fn scan(&self, after: u64, limit: usize) -> (Vec<Memory>, Option<u64>) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let limit = limit.max(1);
+        let by_id = self.inner.by_id.read();
+        let out: Vec<Memory> = by_id
+            .range((Excluded(after), Unbounded))
+            .take(limit)
+            .map(|(_, m)| m.clone())
+            .collect();
+        // More rows remain iff this page filled `limit` and at least one id
+        // lies beyond the last one returned.
+        let next = match out.last() {
+            Some(last) if out.len() == limit => by_id
+                .range((Excluded(last.id), Unbounded))
+                .next()
+                .map(|_| last.id),
+            _ => None,
+        };
+        (out, next)
     }
 
     /// Insert a new memory. `embedding.len()` must match `self.dim()`.
@@ -662,7 +693,7 @@ impl MemoryStore {
         // 3. Walk the row store. Always rebuild `by_id` (it's not persisted
         //    independently). Only re-insert into the indices if they're
         //    NOT intact.
-        let mut by_id = HashMap::with_capacity(row_count);
+        let mut by_id: BTreeMap<u64, Memory> = BTreeMap::new();
         let mut max_id = 0u64;
         let rows = storage.iter()?;
         let mut text_index = text_index;
@@ -790,6 +821,45 @@ mod tests {
             *x /= n;
         }
         v
+    }
+
+    #[test]
+    fn scan_pages_all_rows_stably_under_inserts() {
+        const DIM: usize = 8;
+        let s = MemoryStore::new(DIM);
+        let n: u64 = 25;
+        for i in 0..n {
+            s.remember("u", format!("m{i}"), embed(&format!("m{i}"), DIM))
+                .unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let (page, next) = s.scan(cursor, 10);
+            for m in &page {
+                seen.push(m.id);
+            }
+            match next {
+                Some(c) => {
+                    // Insert mid-pagination: must not disrupt the scan.
+                    s.remember("u", "late", embed("late", DIM)).unwrap();
+                    cursor = c;
+                }
+                None => break,
+            }
+        }
+        // No id returned twice.
+        let mut dedup = seen.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), seen.len(), "an id was paged twice");
+        // Every original row was seen exactly once.
+        for id in 1..=n {
+            assert!(seen.contains(&id), "missing original id {id}");
+        }
+        // Exhausted scan returns an empty next cursor.
+        let (_, next) = s.scan(u64::MAX - 1, 10);
+        assert_eq!(next, None);
     }
 
     #[test]

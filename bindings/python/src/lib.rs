@@ -155,6 +155,29 @@ impl MemoryStore {
         self.inner.forget(id)
     }
 
+    /// Stable keyset pagination over all memories, ordered by id. Start with
+    /// ``cursor=0``. Returns ``(next_cursor, hits)`` where ``next_cursor`` is
+    /// ``None`` once the scan is exhausted; the scan is stable across
+    /// concurrent inserts. New in duxxdb v0.4.1.
+    ///
+    /// >>> cursor, hits = store.scan(0, 100)
+    /// >>> while cursor is not None:
+    /// ...     cursor, page = store.scan(cursor, 100); hits += page
+    #[pyo3(signature = (cursor = 0, limit = 10))]
+    fn scan(&self, cursor: u64, limit: usize) -> (Option<u64>, Vec<MemoryHit>) {
+        let (page, next) = self.inner.scan(cursor, limit);
+        let hits = page
+            .into_iter()
+            .map(|m| MemoryHit {
+                id: m.id,
+                key: m.key,
+                text: m.text,
+                score: 0.0,
+            })
+            .collect();
+        (next, hits)
+    }
+
     /// Configure a soft maximum number of rows. When the cap is
     /// exceeded, every subsequent `remember` evicts the row with the
     /// lowest decayed importance until the count is back at the cap.

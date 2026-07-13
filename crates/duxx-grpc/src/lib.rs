@@ -30,8 +30,8 @@ pub use pb::duxx::v1 as proto;
 use proto::duxx_server::{Duxx, DuxxServer};
 use proto::{
     ChangeEvent, CompactRequest, CompactResponse, MemoryHit, PingRequest, PingResponse,
-    RecallRequest, RecallResponse, RememberRequest, RememberResponse, StatsRequest, StatsResponse,
-    SubscribeRequest,
+    RecallRequest, RecallResponse, RememberRequest, RememberResponse, ScanRequest, ScanResponse,
+    StatsRequest, StatsResponse, SubscribeRequest,
 };
 
 pub const SERVER_NAME: &str = "duxxdb-grpc";
@@ -338,6 +338,30 @@ impl Duxx for DuxxService {
         Ok(Response::new(RecallResponse { hits: pb_hits }))
     }
 
+    async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit == 0 {
+            10
+        } else {
+            req.limit as usize
+        };
+        let (page, next) = self.memory.scan(req.cursor, limit);
+        let memories: Vec<MemoryHit> = page
+            .into_iter()
+            .map(|m| MemoryHit {
+                id: m.id,
+                key: m.key,
+                text: m.text,
+                score: 0.0,
+            })
+            .collect();
+        Ok(Response::new(ScanResponse {
+            memories,
+            next_cursor: next.unwrap_or(0),
+            has_more: next.is_some(),
+        }))
+    }
+
     async fn compact(
         &self,
         _request: Request<CompactRequest>,
@@ -547,6 +571,36 @@ mod tests {
             .into_inner();
         assert_eq!(resp.reclaimed, 3);
         assert_eq!(resp.tombstone_ratio, 0.0);
+    }
+
+    #[tokio::test]
+    async fn scan_pages_all_via_grpc() {
+        let svc = DuxxService::new();
+        for i in 0..25 {
+            svc.remember(Request::new(RememberRequest {
+                key: "u".into(),
+                text: format!("m{i}"),
+                embedding: vec![],
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap();
+        }
+        let mut count = 0usize;
+        let mut cursor = 0u64;
+        loop {
+            let resp = svc
+                .scan(Request::new(ScanRequest { cursor, limit: 10 }))
+                .await
+                .unwrap()
+                .into_inner();
+            count += resp.memories.len();
+            if !resp.has_more {
+                break;
+            }
+            cursor = resp.next_cursor;
+        }
+        assert_eq!(count, 25);
     }
 
     #[tokio::test]

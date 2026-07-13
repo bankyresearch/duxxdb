@@ -400,6 +400,7 @@ pub fn required_role(command: &str) -> Role {
         | "INFO"
         | "GET"
         | "RECALL"
+        | "MEMORY.SCAN"
         | "SUBSCRIBE"
         | "UNSUBSCRIBE"
         | "PSUBSCRIBE"
