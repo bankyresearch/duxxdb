@@ -287,11 +287,24 @@ impl Duxx for DuxxService {
                 self.dim
             )));
         }
-        let id = if req.idempotency_key.is_empty() {
-            self.memory.remember(req.key, req.text, embedding)
-        } else {
+        let has_meta = req.importance != 0.0
+            || !req.kind.is_empty()
+            || !req.tags.is_empty()
+            || !req.provenance.is_empty();
+        let meta = duxx_memory::MemoryMeta {
+            importance: (req.importance != 0.0).then_some(req.importance),
+            kind: (!req.kind.is_empty()).then_some(req.kind),
+            tags: req.tags,
+            provenance: (!req.provenance.is_empty()).then_some(req.provenance),
+        };
+        let id = if !req.idempotency_key.is_empty() {
             self.memory
                 .remember_idempotent(req.key, req.text, embedding, req.idempotency_key)
+        } else if has_meta {
+            self.memory
+                .remember_with(req.key, req.text, embedding, meta)
+        } else {
+            self.memory.remember(req.key, req.text, embedding)
         }
         .map_err(|e| Status::internal(format!("remember: {e}")))?;
         Ok(Response::new(RememberResponse { id }))
@@ -370,9 +383,13 @@ impl Duxx for DuxxService {
             .into_iter()
             .map(|h| MemoryHit {
                 id: h.memory.id,
+                score: h.score,
+                importance: h.memory.importance,
                 key: h.memory.key,
                 text: h.memory.text,
-                score: h.score,
+                kind: h.memory.kind.unwrap_or_default(),
+                tags: h.memory.tags,
+                provenance: h.memory.provenance.unwrap_or_default(),
             })
             .collect();
         Ok(Response::new(RecallResponse { hits: pb_hits }))
@@ -390,9 +407,13 @@ impl Duxx for DuxxService {
             .into_iter()
             .map(|m| MemoryHit {
                 id: m.id,
+                score: 0.0,
+                importance: m.importance,
                 key: m.key,
                 text: m.text,
-                score: 0.0,
+                kind: m.kind.unwrap_or_default(),
+                tags: m.tags,
+                provenance: m.provenance.unwrap_or_default(),
             })
             .collect();
         Ok(Response::new(ScanResponse {
@@ -584,6 +605,7 @@ mod tests {
                 text: "I lost my wallet at the cafe".into(),
                 embedding: vec![],
                 idempotency_key: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -619,6 +641,7 @@ mod tests {
                 text: format!("note {i}"),
                 embedding: vec![],
                 idempotency_key: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -634,6 +657,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remember_with_metadata_round_trips_via_grpc() {
+        let svc = DuxxService::new();
+        svc.remember(Request::new(RememberRequest {
+            key: "u".into(),
+            text: "refund for order 9910".into(),
+            importance: 3.0,
+            kind: "semantic".into(),
+            tags: vec!["billing".into(), "refund".into()],
+            provenance: "crm:1".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let hits = svc
+            .recall(Request::new(RecallRequest {
+                key: "u".into(),
+                query: "refund".into(),
+                embedding: vec![],
+                k: 5,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .hits;
+        let h = hits.first().expect("a hit");
+        assert_eq!(h.importance, 3.0);
+        assert_eq!(h.kind, "semantic");
+        assert_eq!(h.tags, vec!["billing", "refund"]);
+        assert_eq!(h.provenance, "crm:1");
+    }
+
+    #[tokio::test]
     async fn erase_by_key_via_grpc() {
         let svc = DuxxService::new();
         for i in 0..5 {
@@ -642,6 +697,7 @@ mod tests {
                 text: format!("note {i}"),
                 embedding: vec![],
                 idempotency_key: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -688,6 +744,7 @@ mod tests {
                 text: format!("m{i}"),
                 embedding: vec![],
                 idempotency_key: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -718,6 +775,7 @@ mod tests {
                 text: "I lost my wallet".into(),
                 embedding: vec![],
                 idempotency_key: "req-1".into(),
+                ..Default::default()
             }))
         };
         let id1 = mk().await.unwrap().into_inner().id;
@@ -739,6 +797,7 @@ mod tests {
                 text: format!("note {i}"),
                 embedding: vec![],
                 idempotency_key: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap();

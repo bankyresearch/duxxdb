@@ -186,7 +186,7 @@ impl Capabilities {
             "PING" | "HELLO" | "AUTH" | "COMMAND" | "INFO" | "QUIT" | "SUBSCRIBE"
             | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" => true,
             "SET" => self.write_session,
-            "REMEMBER" | "REMEMBER.IDEM" | "REMEMBER.BATCH" => self.write_memory,
+            "REMEMBER" | "REMEMBER.IDEM" | "REMEMBER.BATCH" | "REMEMBER.META" => self.write_memory,
             "DEL" => self.delete_memory,
             // COMPACT physically purges already-deleted rows from the index —
             // the completion of deletion, so gate it on the same capability.
@@ -445,6 +445,7 @@ pub fn required_role(command: &str) -> Role {
         | "REMEMBER"
         | "REMEMBER.IDEM"
         | "REMEMBER.BATCH"
+        | "REMEMBER.META"
         | "COMPACT"
         | "FORGET"
         | "FORGET.KEY"

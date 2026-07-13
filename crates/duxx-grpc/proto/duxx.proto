@@ -51,6 +51,11 @@ message RememberRequest {
     repeated float embedding = 3;
     // Optional idempotency key: a repeat within the TTL returns the original id.
     string idempotency_key = 4;
+    // Optional metadata. importance 0 -> default 1.0.
+    float importance = 5;
+    string kind = 6;
+    repeated string tags = 7;
+    string provenance = 8;
 }
 
 message RememberResponse {
@@ -100,6 +105,11 @@ message MemoryHit {
     string key = 2;
     string text = 3;
     float score = 4;
+    // Metadata (empty/zero when unset).
+    float importance = 5;
+    string kind = 6;
+    repeated string tags = 7;
+    string provenance = 8;
 }
 
 message SubscribeRequest {
