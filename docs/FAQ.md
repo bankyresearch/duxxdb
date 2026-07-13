@@ -345,9 +345,11 @@ Median hybrid recall on a single thread:
 | 1 000 docs | 166 µs |
 | 10 000 docs | 373 µs |
 
-Even over a localhost gRPC round-trip (Python client, dim 128, N=1k):
-recall p50 = **2.4 ms** — **30× faster** than embedded LanceDB on the
-same workload. Full numbers + caveats in [`bench/comparative/`](../bench/comparative/).
+For a fair cross-system comparison (quality + latency + throughput under load,
+DuxxDB disk-backed vs disk-backed peers), run `bench/comparative/run.sh` and see
+the methodology in [`docs/BENCHMARKS.md`](BENCHMARKS.md). We don't quote an
+unqualified "Nx faster" number — speed claims carry their full workload and
+hardware context.
 
 ### How big?
 

@@ -315,20 +315,21 @@ Phase 2.5's batched tantivy commits gave **~30× speedup** on the 100-
 doc bulk case (was ~400 ms → 14 ms) and **~12×** on the 1 k case
 (was ~4 s → 342 ms).
 
-### Comparative bench (Python clients, dim 128, N=1k)
+### Comparative bench
 
-| backend | ins p50 | rec p50 | rec p99 | mode |
-|---|---:|---:|---:|---|
-| **duxxdb** (Python wheel, embedded) | 354.9 µs | 322.3 µs | 755.0 µs | in-memory |
-| **duxxdb** (`duxx-grpc` over localhost) | 1714.9 µs | 2385.9 µs | 3104.0 µs | network |
-| lancedb | 35,155.7 µs | 73,014.8 µs | 122,649.2 µs | embedded, disk |
+The comparative harness measures **retrieval quality** (recall@k / nDCG@k vs an
+exact cosine ground truth), latency, and **throughput under concurrent load**
+against Redis Stack / Qdrant / pgvector, with DuxxDB run **disk-backed** for a
+like-for-like comparison and queried in its native hybrid mode. One command
+reproduces the suite and writes a JSON report with the hardware embedded:
 
-Even over the gRPC round-trip, DuxxDB recall (2.4 ms p50) beats
-LanceDB-embedded recall (73 ms) by **30×**. Full numbers + honest
-caveats: [`bench/comparative/README.md`](../bench/comparative/README.md).
+```bash
+cd bench/comparative && ./run.sh          # ./run.sh --quick for the no-services path
+```
 
-Redis Stack / Qdrant / pgvector are wired in the same harness;
-unblock by running `docker compose up -d` and re-running the bench.
+Methodology, fairness rules, and how to read the output:
+[`docs/BENCHMARKS.md`](BENCHMARKS.md). We publish no unqualified "Nx faster"
+headline — every speed claim carries its workload, dimensions, and hardware.
 
 ---
 
