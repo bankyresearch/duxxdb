@@ -959,6 +959,7 @@ impl Server {
             "REMEMBER" => self.cmd_remember(&args),
             "REMEMBER.IDEM" => self.cmd_remember_idem(&args),
             "REMEMBER.BATCH" => self.cmd_remember_batch(&args),
+            "REMEMBER.META" => self.cmd_remember_meta(&args),
             "RECALL" => self.cmd_recall(&args),
             "MEMORY.SCAN" => self.cmd_scan(&args),
             "COMPACT" => self.cmd_compact(),
@@ -1119,6 +1120,7 @@ impl Server {
             "REMEMBER",
             "REMEMBER.IDEM",
             "REMEMBER.BATCH",
+            "REMEMBER.META",
             "RECALL",
             "MEMORY.SCAN",
             "COMPACT",
@@ -1354,6 +1356,72 @@ impl Server {
         };
         let removed = self.memory.forget(id);
         Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `REMEMBER.META <key> <json_meta> <text...>` — store a memory with
+    /// metadata. `json_meta` is a JSON object with any of `importance` (number),
+    /// `kind` (string), `tags` (string array), `provenance` (string).
+    fn cmd_remember_meta(&self, args: &[RespValue]) -> Response {
+        if args.len() < 4 {
+            return Response::Reply(err("ERR REMEMBER.META expects: key json_meta text..."));
+        }
+        let key = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR REMEMBER.META key must be a string")),
+        };
+        let parsed: serde_json::Value = match arg_string(&args[2]) {
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR json_meta: {e}"))),
+            },
+            None => return Response::Reply(err("ERR REMEMBER.META json_meta must be a string")),
+        };
+        let meta = duxx_memory::MemoryMeta {
+            importance: parsed
+                .get("importance")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32),
+            kind: parsed
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            tags: parsed
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            provenance: parsed
+                .get("provenance")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        };
+        let parts: Vec<String> = args[3..]
+            .iter()
+            .filter_map(|v| arg_string(v).map(|s| s.to_string()))
+            .collect();
+        if parts.is_empty() {
+            return Response::Reply(err("ERR REMEMBER.META text required"));
+        }
+        let text = parts.join(" ");
+        let emb = match self.embedder.embed(&text) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
+        };
+        if emb.len() != self.dim {
+            return Response::Reply(err(format!(
+                "ERR embedder dim {} != server dim {}",
+                emb.len(),
+                self.dim
+            )));
+        }
+        match self.memory.remember_with(key, text, emb, meta) {
+            Ok(id) => Response::Reply(RespValue::Integer(id as i64)),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
     }
 
     /// `FORGET.KEY <key>` — erase every memory stored under `key` (GDPR subject
@@ -3756,6 +3824,36 @@ mod tests {
         let id3 = call("req-2");
         assert_ne!(id1, id3);
         assert_eq!(s.memory().len(), 2);
+    }
+
+    #[test]
+    fn remember_meta_sets_metadata() {
+        let s = Server::new();
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("REMEMBER.META"),
+                RespValue::bulk("u"),
+                RespValue::bulk(
+                    r#"{"importance":5.0,"kind":"semantic","tags":["billing","refund"],"provenance":"crm:1"}"#,
+                ),
+                RespValue::bulk("refund note"),
+            ],
+        );
+        let id = match r {
+            RespValue::Integer(id) => id as u64,
+            other => panic!("expected id, got {other:?}"),
+        };
+        let m = s
+            .memory()
+            .all_memories()
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("stored");
+        assert_eq!(m.importance, 5.0);
+        assert_eq!(m.kind.as_deref(), Some("semantic"));
+        assert_eq!(m.tags, vec!["billing", "refund"]);
+        assert_eq!(m.provenance.as_deref(), Some("crm:1"));
     }
 
     #[test]

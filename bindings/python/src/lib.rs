@@ -87,16 +87,24 @@ impl MemoryStore {
         Ok(Self { inner })
     }
 
-    /// Store a memory. Pass ``idempotency_key`` to make retries safe: a repeat
+    /// Store a memory. Optional metadata (``importance``, ``kind``, ``tags``,
+    /// ``provenance``) round-trips through ``recall``; ``importance`` also feeds
+    /// cap-eviction. Pass ``idempotency_key`` to make retries safe: a repeat
     /// call with the same key within the TTL returns the original id instead of
-    /// inserting a duplicate. New in duxxdb v0.4.1.
-    #[pyo3(signature = (key, text, embedding, idempotency_key = None))]
+    /// inserting a duplicate. ``idempotency_key`` and metadata are mutually
+    /// exclusive (metadata is ignored on an idempotent call). New in v0.4.1.
+    #[pyo3(signature = (key, text, embedding, idempotency_key = None, importance = None, kind = None, tags = None, provenance = None))]
+    #[allow(clippy::too_many_arguments)]
     fn remember(
         &self,
         key: &str,
         text: &str,
         embedding: Vec<f32>,
         idempotency_key: Option<&str>,
+        importance: Option<f32>,
+        kind: Option<String>,
+        tags: Option<Vec<String>>,
+        provenance: Option<String>,
     ) -> PyResult<u64> {
         if embedding.len() != self.inner.dim() {
             return Err(PyValueError::new_err(format!(
@@ -105,12 +113,25 @@ impl MemoryStore {
                 self.inner.dim()
             )));
         }
+        let has_meta =
+            importance.is_some() || kind.is_some() || tags.is_some() || provenance.is_some();
         match idempotency_key {
             Some(idem) => self.inner.remember_idempotent(
                 key.to_string(),
                 text.to_string(),
                 embedding,
                 idem.to_string(),
+            ),
+            None if has_meta => self.inner.remember_with(
+                key.to_string(),
+                text.to_string(),
+                embedding,
+                duxx_memory::MemoryMeta {
+                    importance,
+                    kind,
+                    tags: tags.unwrap_or_default(),
+                    provenance,
+                },
             ),
             None => self
                 .inner
@@ -166,6 +187,10 @@ impl MemoryStore {
                 key: h.memory.key,
                 text: h.memory.text,
                 score: h.score,
+                importance: h.memory.importance,
+                kind: h.memory.kind,
+                tags: h.memory.tags,
+                provenance: h.memory.provenance,
             })
             .collect())
     }
@@ -216,6 +241,10 @@ impl MemoryStore {
                 key: m.key,
                 text: m.text,
                 score: 0.0,
+                importance: m.importance,
+                kind: m.kind,
+                tags: m.tags,
+                provenance: m.provenance,
             })
             .collect();
         (next, hits)
@@ -328,6 +357,14 @@ struct MemoryHit {
     text: String,
     #[pyo3(get)]
     score: f32,
+    #[pyo3(get)]
+    importance: f32,
+    #[pyo3(get)]
+    kind: Option<String>,
+    #[pyo3(get)]
+    tags: Vec<String>,
+    #[pyo3(get)]
+    provenance: Option<String>,
 }
 
 #[pymethods]

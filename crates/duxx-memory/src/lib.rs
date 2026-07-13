@@ -65,6 +65,24 @@ pub struct Memory {
     /// Wall-clock so it survives process restart (a monotonic `Instant`
     /// would not). Tiny NTP-induced wobble is acceptable for decay use.
     pub created_at_unix_ns: u128,
+    /// Optional memory type, e.g. `"episodic"` / `"semantic"`. Free-form.
+    pub kind: Option<String>,
+    /// Optional labels for filtering (see structured recall).
+    pub tags: Vec<String>,
+    /// Optional provenance: where this memory came from (source id / URL).
+    pub provenance: Option<String>,
+}
+
+/// Optional metadata supplied to [`MemoryStore::remember_with`]. Everything is
+/// optional; the defaults reproduce plain [`MemoryStore::remember`]
+/// (importance `1.0`, no kind/tags/provenance).
+#[derive(Debug, Clone, Default)]
+pub struct MemoryMeta {
+    /// Base importance. `None` → `1.0`. Feeds cap-eviction's decay weighting.
+    pub importance: Option<f32>,
+    pub kind: Option<String>,
+    pub tags: Vec<String>,
+    pub provenance: Option<String>,
 }
 
 /// Current wall-clock time as Unix-epoch nanoseconds.
@@ -173,6 +191,14 @@ struct StoredMemory {
     /// with near-zero decayed importance.
     #[serde(default)]
     created_at_unix_ns: u128,
+    // Metadata (Phase: first-class metadata). `#[serde(default)]` so rows
+    // written before this shipped still deserialize.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    provenance: Option<String>,
 }
 
 impl From<&Memory> for StoredMemory {
@@ -184,6 +210,9 @@ impl From<&Memory> for StoredMemory {
             embedding: m.embedding.clone(),
             importance: m.importance,
             created_at_unix_ns: m.created_at_unix_ns,
+            kind: m.kind.clone(),
+            tags: m.tags.clone(),
+            provenance: m.provenance.clone(),
         }
     }
 }
@@ -259,6 +288,9 @@ impl MemoryStore {
                 embedding: stored.embedding,
                 importance: stored.importance,
                 created_at_unix_ns: stored.created_at_unix_ns,
+                kind: stored.kind,
+                tags: stored.tags,
+                provenance: stored.provenance,
             };
             store.inner.by_id.write().insert(id, mem);
             if id > max_id {
@@ -612,12 +644,26 @@ impl MemoryStore {
         (out, next)
     }
 
-    /// Insert a new memory. `embedding.len()` must match `self.dim()`.
+    /// Insert a new memory with default metadata (importance `1.0`).
+    /// `embedding.len()` must match `self.dim()`.
     pub fn remember(
         &self,
         key: impl Into<String>,
         text: impl Into<String>,
         embedding: Vec<f32>,
+    ) -> Result<u64> {
+        self.remember_with(key, text, embedding, MemoryMeta::default())
+    }
+
+    /// Insert a new memory with caller-supplied [`MemoryMeta`] — importance,
+    /// kind, tags, and provenance. The metadata round-trips through `recall`
+    /// and (for `importance`) feeds cap-eviction's decay weighting.
+    pub fn remember_with(
+        &self,
+        key: impl Into<String>,
+        text: impl Into<String>,
+        embedding: Vec<f32>,
+        meta: MemoryMeta,
     ) -> Result<u64> {
         let key = key.into();
         let text = text.into();
@@ -637,8 +683,11 @@ impl MemoryStore {
             key: key.clone(),
             text: text.clone(),
             embedding,
-            importance: 1.0,
+            importance: meta.importance.unwrap_or(1.0),
             created_at_unix_ns: now_unix_ns(),
+            kind: meta.kind,
+            tags: meta.tags,
+            provenance: meta.provenance,
         };
         // Write through to durable storage BEFORE inserting into the
         // in-memory cache. If the persistence write fails, we don't
@@ -708,6 +757,9 @@ impl MemoryStore {
                 embedding: emb,
                 importance: 1.0,
                 created_at_unix_ns: now,
+                kind: None,
+                tags: Vec::new(),
+                provenance: None,
             })
             .collect();
 
@@ -851,6 +903,9 @@ impl MemoryStore {
                 embedding: stored.embedding,
                 importance: stored.importance,
                 created_at_unix_ns: stored.created_at_unix_ns,
+                kind: stored.kind,
+                tags: stored.tags,
+                provenance: stored.provenance,
             };
             by_id.insert(id, mem);
             if id > max_id {
@@ -955,6 +1010,57 @@ mod tests {
             *x /= n;
         }
         v
+    }
+
+    #[test]
+    fn metadata_round_trips_through_recall() {
+        const DIM: usize = 16;
+        let s = MemoryStore::new(DIM);
+        let id = s
+            .remember_with(
+                "u",
+                "important refund note",
+                embed("refund order", DIM),
+                MemoryMeta {
+                    importance: Some(5.0),
+                    kind: Some("semantic".into()),
+                    tags: vec!["billing".into(), "refund".into()],
+                    provenance: Some("crm:123".into()),
+                },
+            )
+            .unwrap();
+        let hits = s.recall("u", "refund", &embed("refund", DIM), 5).unwrap();
+        let hit = hits.iter().find(|h| h.memory.id == id).expect("recalled");
+        assert_eq!(hit.memory.importance, 5.0);
+        assert_eq!(hit.memory.kind.as_deref(), Some("semantic"));
+        assert_eq!(hit.memory.tags, vec!["billing", "refund"]);
+        assert_eq!(hit.memory.provenance.as_deref(), Some("crm:123"));
+    }
+
+    #[test]
+    fn caller_importance_protects_from_eviction() {
+        const DIM: usize = 8;
+        let s = MemoryStore::new(DIM);
+        s.set_max_rows(Some(2));
+        s.set_eviction_half_life(std::time::Duration::from_secs(3600));
+        let vip = s
+            .remember_with(
+                "u",
+                "vip",
+                embed("vip", DIM),
+                MemoryMeta {
+                    importance: Some(100.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        s.remember("u", "low1", embed("low1", DIM)).unwrap();
+        s.remember("u", "low2", embed("low2", DIM)).unwrap(); // triggers eviction
+        assert_eq!(s.len(), 2);
+        assert!(
+            s.inner.by_id.read().contains_key(&vip),
+            "high-importance memory must survive eviction"
+        );
     }
 
     #[test]
@@ -1442,6 +1548,9 @@ mod tests {
             embedding: vec![0.0; 4],
             importance: 1.0,
             created_at_unix_ns: 0, // 1970 — extremely old
+            kind: None,
+            tags: Vec::new(),
+            provenance: None,
         };
         let eff = m.effective_importance(std::time::Duration::from_secs(60 * 60));
         assert!(eff < 1e-10, "expected near-zero decay, got {eff}");
