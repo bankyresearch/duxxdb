@@ -42,6 +42,14 @@ pub const DEFAULT_AUTO_COMPACT_RATIO: f32 = 0.20;
 /// [`MemoryStore::compact`] is unaffected by this floor.
 const AUTO_COMPACT_MIN_LIVE: usize = 64;
 
+/// Default time-to-live for idempotency keys (see
+/// [`MemoryStore::remember_idempotent`]). A retry within this window returns
+/// the original id instead of inserting a duplicate.
+pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Purge expired idempotency entries once the map exceeds this many keys.
+const IDEMPOTENCY_SOFT_CAP: usize = 10_000;
+
 /// A single stored memory.
 #[derive(Debug, Clone)]
 pub struct Memory {
@@ -122,6 +130,11 @@ struct Inner {
     /// Tombstone ratio at which `remember` auto-triggers `compact`.
     /// `None` disables auto-compaction. Default [`DEFAULT_AUTO_COMPACT_RATIO`].
     auto_compact_ratio: RwLock<Option<f32>>,
+    /// Idempotency cache: `idempotency_key -> (row_id, recorded_at_unix_ns)`.
+    /// A repeat `remember_idempotent` with a live key returns the original id.
+    idempotency: RwLock<HashMap<String, (u64, u128)>>,
+    /// TTL for idempotency keys. Default [`DEFAULT_IDEMPOTENCY_TTL`].
+    idempotency_ttl: RwLock<Duration>,
 }
 
 impl Drop for Inner {
@@ -192,6 +205,8 @@ impl MemoryStore {
                 evictions_total: std::sync::atomic::AtomicU64::new(0),
                 compactions_total: std::sync::atomic::AtomicU64::new(0),
                 auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
+                idempotency: RwLock::new(HashMap::new()),
+                idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
             }),
         }
     }
@@ -267,6 +282,8 @@ impl MemoryStore {
             evictions_total: std::sync::atomic::AtomicU64::new(0),
             compactions_total: std::sync::atomic::AtomicU64::new(0),
             auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
+            idempotency: RwLock::new(HashMap::new()),
+            idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
         });
         tracing::info!(memories = n, "loaded memories from storage");
         Ok(MemoryStore { inner })
@@ -566,6 +583,43 @@ impl MemoryStore {
         Ok(id)
     }
 
+    /// Like [`MemoryStore::remember`], but **idempotent** on `idem_key`: a
+    /// repeat call with the same key within the TTL returns the id of the
+    /// original insert instead of creating a duplicate. Lets clients retry a
+    /// write after a network blip without double-inserting.
+    ///
+    /// The check-and-insert is serialized under the idempotency lock, so two
+    /// concurrent calls with the same key still produce exactly one row.
+    pub fn remember_idempotent(
+        &self,
+        key: impl Into<String>,
+        text: impl Into<String>,
+        embedding: Vec<f32>,
+        idem_key: impl Into<String>,
+    ) -> Result<u64> {
+        let idem_key = idem_key.into();
+        let ttl_ns = self.inner.idempotency_ttl.read().as_nanos();
+        // Held across the check + insert so concurrent retries can't race.
+        let mut cache = self.inner.idempotency.write();
+        if let Some((id, ts)) = cache.get(&idem_key) {
+            if now_unix_ns().saturating_sub(*ts) < ttl_ns {
+                return Ok(*id);
+            }
+        }
+        let id = self.remember(key, text, embedding)?;
+        if cache.len() >= IDEMPOTENCY_SOFT_CAP {
+            let now = now_unix_ns();
+            cache.retain(|_, (_, ts)| now.saturating_sub(*ts) < ttl_ns);
+        }
+        cache.insert(idem_key, (id, now_unix_ns()));
+        Ok(id)
+    }
+
+    /// Set the idempotency-key TTL (default [`DEFAULT_IDEMPOTENCY_TTL`]).
+    pub fn set_idempotency_ttl(&self, ttl: Duration) {
+        *self.inner.idempotency_ttl.write() = ttl;
+    }
+
     /// Whether this store has a durable backing.
     pub fn is_persistent(&self) -> bool {
         self.inner.storage.is_some()
@@ -661,6 +715,8 @@ impl MemoryStore {
             evictions_total: std::sync::atomic::AtomicU64::new(0),
             compactions_total: std::sync::atomic::AtomicU64::new(0),
             auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
+            idempotency: RwLock::new(HashMap::new()),
+            idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
         });
         Ok(MemoryStore { inner })
     }
@@ -734,6 +790,39 @@ mod tests {
             *x /= n;
         }
         v
+    }
+
+    #[test]
+    fn remember_idempotent_dedupes_by_key() {
+        const DIM: usize = 16;
+        let s = MemoryStore::new(DIM);
+        let e = embed("refund order", DIM);
+
+        // Same idempotency key -> one row, same id returned.
+        let id1 = s
+            .remember_idempotent("u", "I want a refund", e.clone(), "req-abc")
+            .unwrap();
+        let id2 = s
+            .remember_idempotent("u", "I want a refund", e.clone(), "req-abc")
+            .unwrap();
+        assert_eq!(id1, id2, "retry must return the original id");
+        assert_eq!(s.len(), 1, "no duplicate row");
+
+        // A different key inserts a new row.
+        let id3 = s
+            .remember_idempotent("u", "different note", embed("weather", DIM), "req-xyz")
+            .unwrap();
+        assert_ne!(id3, id1);
+        assert_eq!(s.len(), 2);
+
+        // After the key expires, the same key inserts again.
+        s.set_idempotency_ttl(std::time::Duration::from_nanos(1));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id4 = s
+            .remember_idempotent("u", "I want a refund", e, "req-abc")
+            .unwrap();
+        assert_ne!(id4, id1, "expired key must not dedupe");
+        assert_eq!(s.len(), 3);
     }
 
     #[test]

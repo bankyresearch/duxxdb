@@ -286,10 +286,13 @@ impl Duxx for DuxxService {
                 self.dim
             )));
         }
-        let id = self
-            .memory
-            .remember(req.key, req.text, embedding)
-            .map_err(|e| Status::internal(format!("remember: {e}")))?;
+        let id = if req.idempotency_key.is_empty() {
+            self.memory.remember(req.key, req.text, embedding)
+        } else {
+            self.memory
+                .remember_idempotent(req.key, req.text, embedding, req.idempotency_key)
+        }
+        .map_err(|e| Status::internal(format!("remember: {e}")))?;
         Ok(Response::new(RememberResponse { id }))
     }
 
@@ -496,6 +499,7 @@ mod tests {
                 key: "alice".into(),
                 text: "I lost my wallet at the cafe".into(),
                 embedding: vec![],
+                idempotency_key: String::new(),
             }))
             .await
             .unwrap()
@@ -530,6 +534,7 @@ mod tests {
                 key: "u".into(),
                 text: format!("note {i}"),
                 embedding: vec![],
+                idempotency_key: String::new(),
             }))
             .await
             .unwrap();
@@ -545,6 +550,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remember_idempotency_key_dedupes() {
+        let svc = DuxxService::new();
+        let mk = || {
+            svc.remember(Request::new(RememberRequest {
+                key: "u".into(),
+                text: "I lost my wallet".into(),
+                embedding: vec![],
+                idempotency_key: "req-1".into(),
+            }))
+        };
+        let id1 = mk().await.unwrap().into_inner().id;
+        let id2 = mk().await.unwrap().into_inner().id;
+        assert_eq!(id1, id2);
+        assert_eq!(svc.memory.len(), 1);
+    }
+
+    #[tokio::test]
     async fn stats_reports_compaction_health() {
         let svc = DuxxService::new();
         svc.memory.set_auto_compact_ratio(None);
@@ -556,6 +578,7 @@ mod tests {
                 key: "u".into(),
                 text: format!("note {i}"),
                 embedding: vec![],
+                idempotency_key: String::new(),
             }))
             .await
             .unwrap();

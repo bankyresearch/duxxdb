@@ -957,6 +957,7 @@ impl Server {
             "GET" => self.cmd_get(&args),
             "DEL" => self.cmd_del(&args),
             "REMEMBER" => self.cmd_remember(&args),
+            "REMEMBER.IDEM" => self.cmd_remember_idem(&args),
             "RECALL" => self.cmd_recall(&args),
             "COMPACT" => self.cmd_compact(),
             "FORGET" => self.cmd_forget(&args),
@@ -1112,6 +1113,7 @@ impl Server {
             "GET",
             "DEL",
             "REMEMBER",
+            "REMEMBER.IDEM",
             "RECALL",
             "COMPACT",
             "FORGET",
@@ -1265,6 +1267,50 @@ impl Server {
             )));
         }
         match self.memory.remember(key, text, emb) {
+            Ok(id) => Response::Reply(RespValue::Integer(id as i64)),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
+    }
+
+    /// `REMEMBER.IDEM <idempotency_key> <key> <text...>` — idempotent write. A
+    /// retry with the same idempotency key within the TTL returns the original
+    /// id instead of inserting a duplicate.
+    fn cmd_remember_idem(&self, args: &[RespValue]) -> Response {
+        if args.len() < 4 {
+            return Response::Reply(err(
+                "ERR REMEMBER.IDEM expects: idempotency_key key text...",
+            ));
+        }
+        let idem_key = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => {
+                return Response::Reply(err("ERR REMEMBER.IDEM idempotency_key must be a string"))
+            }
+        };
+        let key = match arg_string(&args[2]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR REMEMBER.IDEM key must be a string")),
+        };
+        let parts: Vec<String> = args[3..]
+            .iter()
+            .filter_map(|v| arg_string(v).map(|s| s.to_string()))
+            .collect();
+        if parts.is_empty() {
+            return Response::Reply(err("ERR REMEMBER.IDEM text required"));
+        }
+        let text = parts.join(" ");
+        let emb = match self.embedder.embed(&text) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
+        };
+        if emb.len() != self.dim {
+            return Response::Reply(err(format!(
+                "ERR embedder dim {} != server dim {}",
+                emb.len(),
+                self.dim
+            )));
+        }
+        match self.memory.remember_idempotent(key, text, emb, idem_key) {
             Ok(id) => Response::Reply(RespValue::Integer(id as i64)),
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
@@ -3568,6 +3614,30 @@ mod tests {
         assert_eq!(del, RespValue::Integer(1));
         let get2 = dispatch_array(&s, vec![RespValue::bulk("GET"), RespValue::bulk("k")]);
         assert_eq!(get2, RespValue::Null);
+    }
+
+    #[test]
+    fn remember_idem_dedupes_by_key() {
+        let s = Server::new();
+        let call = |idem: &str| {
+            dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER.IDEM"),
+                    RespValue::bulk(idem),
+                    RespValue::bulk("u1"),
+                    RespValue::bulk("a wallet at the cafe"),
+                ],
+            )
+        };
+        let id1 = call("req-1");
+        let id2 = call("req-1");
+        assert_eq!(id1, id2, "same idempotency key must return the same id");
+        assert!(matches!(id1, RespValue::Integer(_)));
+        // A different key -> a new row.
+        let id3 = call("req-2");
+        assert_ne!(id1, id3);
+        assert_eq!(s.memory().len(), 2);
     }
 
     #[test]

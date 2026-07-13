@@ -87,7 +87,17 @@ impl MemoryStore {
         Ok(Self { inner })
     }
 
-    fn remember(&self, key: &str, text: &str, embedding: Vec<f32>) -> PyResult<u64> {
+    /// Store a memory. Pass ``idempotency_key`` to make retries safe: a repeat
+    /// call with the same key within the TTL returns the original id instead of
+    /// inserting a duplicate. New in duxxdb v0.4.1.
+    #[pyo3(signature = (key, text, embedding, idempotency_key = None))]
+    fn remember(
+        &self,
+        key: &str,
+        text: &str,
+        embedding: Vec<f32>,
+        idempotency_key: Option<&str>,
+    ) -> PyResult<u64> {
         if embedding.len() != self.inner.dim() {
             return Err(PyValueError::new_err(format!(
                 "embedding has dim {}, store expects {}",
@@ -95,9 +105,18 @@ impl MemoryStore {
                 self.inner.dim()
             )));
         }
-        self.inner
-            .remember(key.to_string(), text.to_string(), embedding)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        match idempotency_key {
+            Some(idem) => self.inner.remember_idempotent(
+                key.to_string(),
+                text.to_string(),
+                embedding,
+                idem.to_string(),
+            ),
+            None => self
+                .inner
+                .remember(key.to_string(), text.to_string(), embedding),
+        }
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     #[pyo3(signature = (key, query, embedding, k = 10))]
