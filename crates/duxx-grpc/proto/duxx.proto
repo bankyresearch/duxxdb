@@ -26,6 +26,10 @@ service Duxx {
     // of tombstones reclaimed and the post-compaction tombstone ratio.
     rpc Compact(CompactRequest) returns (CompactResponse);
 
+    // Erase memories by subject key (GDPR) or by age (retention). Returns the
+    // count removed; run Compact after for no recoverable trace.
+    rpc Erase(EraseRequest) returns (EraseResponse);
+
     // Subscribe to memory change events. Server streams a ChangeEvent
     // for every `remember` call whose channel matches the (optional)
     // glob pattern. An empty pattern matches all events.
@@ -125,6 +129,15 @@ message CompactRequest {}
 message CompactResponse {
     uint64 reclaimed = 1;
     float tombstone_ratio = 2;
+}
+
+message EraseRequest {
+    string key = 1;             // erase all memories under this key (GDPR subject)
+    double older_than_secs = 2; // OR purge rows older than this many seconds
+}
+
+message EraseResponse {
+    uint64 count = 1;
 }
 
 message StatsRequest {}

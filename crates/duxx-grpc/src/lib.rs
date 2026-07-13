@@ -29,9 +29,10 @@ pub mod pb {
 pub use pb::duxx::v1 as proto;
 use proto::duxx_server::{Duxx, DuxxServer};
 use proto::{
-    ChangeEvent, CompactRequest, CompactResponse, MemoryHit, PingRequest, PingResponse,
-    RecallRequest, RecallResponse, RememberBatchRequest, RememberBatchResponse, RememberRequest,
-    RememberResponse, ScanRequest, ScanResponse, StatsRequest, StatsResponse, SubscribeRequest,
+    ChangeEvent, CompactRequest, CompactResponse, EraseRequest, EraseResponse, MemoryHit,
+    PingRequest, PingResponse, RecallRequest, RecallResponse, RememberBatchRequest,
+    RememberBatchResponse, RememberRequest, RememberResponse, ScanRequest, ScanResponse,
+    StatsRequest, StatsResponse, SubscribeRequest,
 };
 
 pub const SERVER_NAME: &str = "duxxdb-grpc";
@@ -415,6 +416,26 @@ impl Duxx for DuxxService {
         }))
     }
 
+    async fn erase(
+        &self,
+        request: Request<EraseRequest>,
+    ) -> Result<Response<EraseResponse>, Status> {
+        let req = request.into_inner();
+        let count = if !req.key.is_empty() {
+            self.memory.forget_by_key(&req.key)
+        } else if req.older_than_secs > 0.0 {
+            self.memory
+                .forget_older_than(std::time::Duration::from_secs_f64(req.older_than_secs))
+        } else {
+            return Err(Status::invalid_argument(
+                "set either key or older_than_secs",
+            ));
+        };
+        Ok(Response::new(EraseResponse {
+            count: count as u64,
+        }))
+    }
+
     type SubscribeStream = SubscribeStream;
 
     async fn subscribe(
@@ -610,6 +631,31 @@ mod tests {
             .into_inner();
         assert_eq!(resp.reclaimed, 3);
         assert_eq!(resp.tombstone_ratio, 0.0);
+    }
+
+    #[tokio::test]
+    async fn erase_by_key_via_grpc() {
+        let svc = DuxxService::new();
+        for i in 0..5 {
+            svc.remember(Request::new(RememberRequest {
+                key: "alice".into(),
+                text: format!("note {i}"),
+                embedding: vec![],
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap();
+        }
+        let resp = svc
+            .erase(Request::new(EraseRequest {
+                key: "alice".into(),
+                older_than_secs: 0.0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.count, 5);
+        assert_eq!(svc.memory.len(), 0);
     }
 
     #[tokio::test]

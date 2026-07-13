@@ -246,6 +246,17 @@ impl McpServer {
                     }
                 },
                 {
+                    "name": "forget_by_key",
+                    "description": "Erase every memory stored under a key (GDPR subject erasure). Returns the count removed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "key": { "type": "string", "description": "User/agent partition key to erase." }
+                        },
+                        "required": ["key"]
+                    }
+                },
+                {
                     "name": "compact",
                     "description": "Rebuild the memory index from surviving rows, dropping tombstones left by forget/eviction. Restores recall quality. Returns rows reclaimed.",
                     "inputSchema": { "type": "object", "properties": {} }
@@ -321,6 +332,7 @@ impl McpServer {
             "remember" => self.tool_remember(&args)?,
             "recall" => self.tool_recall(&args)?,
             "forget" => self.tool_forget(&args)?,
+            "forget_by_key" => self.tool_forget_by_key(&args)?,
             "compact" => self.tool_compact()?,
             "session_set" => self.tool_session_set(&args)?,
             "session_get" => self.tool_session_get(&args)?,
@@ -414,6 +426,14 @@ impl McpServer {
             .and_then(Value::as_u64)
             .ok_or_else(|| invalid_params("missing 'id'"))?;
         Ok(json!({ "removed": self.store.forget(id) }))
+    }
+
+    fn tool_forget_by_key(&self, args: &Value) -> std::result::Result<Value, JsonRpcError> {
+        let key = args
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_params("missing 'key'"))?;
+        Ok(json!({ "erased": self.store.forget_by_key(key) }))
     }
 
     fn tool_compact(&self) -> std::result::Result<Value, JsonRpcError> {
