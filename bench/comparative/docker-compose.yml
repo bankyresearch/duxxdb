@@ -1,13 +1,17 @@
 # Network-served targets for the comparative bench.
 #
-#   docker compose -f docker-compose.yml up -d
-#   python bench.py --backend redis  --n 10000 --queries 200
-#   python bench.py --backend qdrant --n 10000 --queries 200
-#   python bench.py --backend pgvector --n 10000 --queries 200
+# Easiest path is the one-command runner, which starts these, launches the
+# disk-backed DuxxDB gRPC daemon, runs the sweep, and tears down:
 #
-# These are stubs — the corresponding Backend classes in bench.py are
-# TODO. Once written they let you measure DuxxDB-network latencies (via
-# the duxx-grpc daemon) against the same network-served peers.
+#   ./run.sh                 # or ./run.ps1 on Windows
+#
+# Or drive them manually:
+#
+#   docker compose -f docker-compose.yml up -d
+#   python bench.py --backend redis,qdrant,pgvector --n 10000 --queries 200
+#
+# The Backend classes for redis / qdrant / pgvector are implemented in
+# bench.py; see docs/BENCHMARKS.md for the methodology.
 
 services:
   redis-stack:

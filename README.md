@@ -304,10 +304,13 @@ embedder. Reproduce: `cargo bench -p duxx-bench`.
 | 1 000 docs | **166 µs** | 6.0 k QPS | 60× headroom |
 | 10 000 docs | **373 µs** | 2.7 k QPS | 27× headroom |
 
-Even over a localhost gRPC round-trip (Python client, dim 128, N=1k):
-recall p50 = **2.4 ms** — **30× faster** than embedded LanceDB on the
-same workload. Full numbers + caveats:
-[`bench/comparative/README.md`](bench/comparative/README.md).
+For a cross-system comparison — retrieval quality (recall@k / nDCG@k vs an
+exact ground truth), latency, and throughput under concurrent load, with
+DuxxDB run **disk-backed** against disk-backed Redis / Qdrant / pgvector — run
+the harness (`bench/comparative/run.sh`) and read the methodology in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). We don't publish an unqualified
+"Nx faster" headline: any speed claim carries its workload, dimensions,
+hardware, and the peer's configuration.
 
 ---
 
