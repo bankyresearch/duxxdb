@@ -420,6 +420,25 @@ You can also trigger it explicitly, and observe it.
 (integer) 4096
 ```
 
+**Deletion, retention & GDPR erasure.** Erase every memory for a subject, or
+purge by age; run `COMPACT` after for no recoverable trace.
+
+```bash
+> FORGET.KEY alice     # erase all of subject "alice" -> count removed
+> FORGET.OLDER 2592000 # purge anything older than 30 days -> count removed
+> COMPACT              # reclaim the erased vectors from the graph
+```
+
+```python
+n = store.forget_by_key("alice")            # GDPR subject erasure
+store.set_retention(30 * 24 * 3600)          # purge > 30 days on each write
+n = store.forget_older_than(30 * 24 * 3600)  # explicit purge, returns count
+store.compact()
+```
+
+The gRPC `Erase` RPC (`key` or `older_than_secs`) and the MCP `forget_by_key`
+tool expose the same operations.
+
 Configure the auto-compaction threshold from the server too:
 
 ```bash

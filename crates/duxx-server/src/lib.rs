@@ -963,6 +963,8 @@ impl Server {
             "MEMORY.SCAN" => self.cmd_scan(&args),
             "COMPACT" => self.cmd_compact(),
             "FORGET" => self.cmd_forget(&args),
+            "FORGET.KEY" => self.cmd_forget_key(&args),
+            "FORGET.OLDER" => self.cmd_forget_older(&args),
             "DOC.INGEST" => self.cmd_doc_ingest(&args),
             "DOC.SEARCH" => self.cmd_doc_search(&args),
             "DOC.LIST" => self.cmd_doc_list(),
@@ -1121,6 +1123,8 @@ impl Server {
             "MEMORY.SCAN",
             "COMPACT",
             "FORGET",
+            "FORGET.KEY",
+            "FORGET.OLDER",
             "SUBSCRIBE",
             "UNSUBSCRIBE",
             "PSUBSCRIBE",
@@ -1350,6 +1354,35 @@ impl Server {
         };
         let removed = self.memory.forget(id);
         Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `FORGET.KEY <key>` — erase every memory stored under `key` (GDPR subject
+    /// erasure). Returns the count removed. Run `COMPACT` after for no trace.
+    fn cmd_forget_key(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR FORGET.KEY expects 1 arg: key"));
+        }
+        let key = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR FORGET.KEY key must be a string")),
+        };
+        Response::Reply(RespValue::Integer(self.memory.forget_by_key(&key) as i64))
+    }
+
+    /// `FORGET.OLDER <seconds>` — purge every memory older than `seconds`
+    /// (retention/erasure). Returns the count removed.
+    fn cmd_forget_older(&self, args: &[RespValue]) -> Response {
+        if args.len() != 2 {
+            return Response::Reply(err("ERR FORGET.OLDER expects 1 arg: seconds"));
+        }
+        let secs = match arg_string(&args[1]).and_then(|s| s.parse::<f64>().ok()) {
+            Some(s) if s >= 0.0 => s,
+            _ => return Response::Reply(err("ERR FORGET.OLDER seconds must be a number")),
+        };
+        let removed = self
+            .memory
+            .forget_older_than(std::time::Duration::from_secs_f64(secs));
+        Response::Reply(RespValue::Integer(removed as i64))
     }
 
     /// `REMEMBER.BATCH <key> <text1> [text2 ...]` — bulk insert many memories
@@ -3723,6 +3756,37 @@ mod tests {
         let id3 = call("req-2");
         assert_ne!(id1, id3);
         assert_eq!(s.memory().len(), 2);
+    }
+
+    #[test]
+    fn forget_key_erases_all_under_key() {
+        let s = Server::new();
+        for i in 0..5 {
+            dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("alice"),
+                    RespValue::bulk(format!("note {i}")),
+                ],
+            );
+        }
+        for i in 0..3 {
+            dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("bob"),
+                    RespValue::bulk(format!("note {i}")),
+                ],
+            );
+        }
+        let r = dispatch_array(
+            &s,
+            vec![RespValue::bulk("FORGET.KEY"), RespValue::bulk("alice")],
+        );
+        assert_eq!(r, RespValue::Integer(5));
+        assert_eq!(s.memory().len(), 3);
     }
 
     #[test]

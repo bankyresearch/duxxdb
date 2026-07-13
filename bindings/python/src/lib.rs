@@ -176,6 +176,28 @@ impl MemoryStore {
         self.inner.forget(id)
     }
 
+    /// Erase every memory stored under ``key`` (GDPR subject erasure). Returns
+    /// the count removed; call ``compact()`` after for no recoverable trace.
+    /// New in duxxdb v0.4.1.
+    fn forget_by_key(&self, key: &str) -> usize {
+        self.inner.forget_by_key(key)
+    }
+
+    /// Purge every memory older than ``seconds``. Returns the count removed.
+    /// New in duxxdb v0.4.1.
+    fn forget_older_than(&self, seconds: f64) -> usize {
+        self.inner
+            .forget_older_than(Duration::from_secs_f64(seconds.max(0.0)))
+    }
+
+    /// Set a retention window in seconds: rows older than this are purged on
+    /// each write. Pass ``None`` to keep rows forever. New in duxxdb v0.4.1.
+    #[pyo3(signature = (seconds = None))]
+    fn set_retention(&self, seconds: Option<f64>) {
+        self.inner
+            .set_retention(seconds.map(|s| Duration::from_secs_f64(s.max(0.0))));
+    }
+
     /// Stable keyset pagination over all memories, ordered by id. Start with
     /// ``cursor=0``. Returns ``(next_cursor, hits)`` where ``next_cursor`` is
     /// ``None`` once the scan is exhausted; the scan is stable across

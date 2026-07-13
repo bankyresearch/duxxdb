@@ -137,6 +137,9 @@ struct Inner {
     idempotency: RwLock<HashMap<String, (u64, u128)>>,
     /// TTL for idempotency keys. Default [`DEFAULT_IDEMPOTENCY_TTL`].
     idempotency_ttl: RwLock<Duration>,
+    /// Optional retention window. When set, rows older than this are purged on
+    /// write (and reclaimable via `compact`). `None` = keep forever.
+    retention: RwLock<Option<Duration>>,
 }
 
 impl Drop for Inner {
@@ -209,6 +212,7 @@ impl MemoryStore {
                 auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
                 idempotency: RwLock::new(HashMap::new()),
                 idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
+                retention: RwLock::new(None),
             }),
         }
     }
@@ -286,6 +290,7 @@ impl MemoryStore {
             auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
             idempotency: RwLock::new(HashMap::new()),
             idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
+            retention: RwLock::new(None),
         });
         tracing::info!(memories = n, "loaded memories from storage");
         Ok(MemoryStore { inner })
@@ -399,6 +404,57 @@ impl MemoryStore {
             });
         }
         removed
+    }
+
+    /// Erase **every** memory stored under `key` (e.g. a user/subject id) and
+    /// return how many rows were removed. This is the GDPR "right to erasure"
+    /// primitive: the rows leave `by_id` + durable storage immediately (so they
+    /// can't be recalled), and their index entries are reclaimed on the next
+    /// [`MemoryStore::compact`] — call `compact` after for no recoverable trace.
+    pub fn forget_by_key(&self, key: &str) -> usize {
+        let ids: Vec<u64> = {
+            let by_id = self.inner.by_id.read();
+            by_id
+                .values()
+                .filter(|m| m.key == key)
+                .map(|m| m.id)
+                .collect()
+        };
+        ids.into_iter().filter(|&id| self.forget(id)).count()
+    }
+
+    /// Purge every memory older than `max_age`, returning the count removed.
+    /// Rows are ordered by id (== insertion time), so this only touches the
+    /// expired front of the store — `O(expired)`, not `O(n)`.
+    pub fn forget_older_than(&self, max_age: Duration) -> usize {
+        let cutoff = now_unix_ns().saturating_sub(max_age.as_nanos());
+        let ids: Vec<u64> = {
+            let by_id = self.inner.by_id.read();
+            by_id
+                .values()
+                .take_while(|m| m.created_at_unix_ns < cutoff)
+                .map(|m| m.id)
+                .collect()
+        };
+        ids.into_iter().filter(|&id| self.forget(id)).count()
+    }
+
+    /// Set an optional retention window. When set, rows older than `max_age`
+    /// are purged on every subsequent write. `None` keeps rows forever.
+    pub fn set_retention(&self, max_age: Option<Duration>) {
+        *self.inner.retention.write() = max_age;
+    }
+
+    /// The configured retention window, if any.
+    pub fn retention(&self) -> Option<Duration> {
+        *self.inner.retention.read()
+    }
+
+    /// Enforce the retention window (called after each write). No-op when unset.
+    fn enforce_retention(&self) {
+        if let Some(max_age) = *self.inner.retention.read() {
+            self.forget_older_than(max_age);
+        }
     }
 
     /// If the store is over its `max_rows` cap, evict the lowest
@@ -606,6 +662,7 @@ impl MemoryStore {
         tracing::debug!(id, key = %key, "remembered");
         // Phase 6.2: enforce the optional row cap. Cheap when no cap
         // is configured (single read of an Option<usize>).
+        self.enforce_retention();
         self.enforce_cap();
         // P0: if eviction (or prior forgets) left enough tombstones in the
         // graph, rebuild it now so recall quality doesn't rot. No-op unless
@@ -684,6 +741,7 @@ impl MemoryStore {
                 kind: ChangeKind::Insert,
             });
         }
+        self.enforce_retention();
         self.enforce_cap();
         self.maybe_auto_compact();
         Ok(ids)
@@ -823,6 +881,7 @@ impl MemoryStore {
             auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
             idempotency: RwLock::new(HashMap::new()),
             idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
+            retention: RwLock::new(None),
         });
         Ok(MemoryStore { inner })
     }
@@ -896,6 +955,62 @@ mod tests {
             *x /= n;
         }
         v
+    }
+
+    #[test]
+    fn forget_by_key_erases_and_compaction_reclaims() {
+        const DIM: usize = 16;
+        let s = MemoryStore::new(DIM);
+        s.set_auto_compact_ratio(None);
+        for i in 0..10 {
+            s.remember(
+                "alice",
+                format!("alice note {i}"),
+                embed(&format!("a{i}"), DIM),
+            )
+            .unwrap();
+        }
+        for i in 0..5 {
+            s.remember("bob", format!("bob note {i}"), embed(&format!("b{i}"), DIM))
+                .unwrap();
+        }
+        assert_eq!(s.len(), 15);
+
+        // Erase everything for subject "alice".
+        let erased = s.forget_by_key("alice");
+        assert_eq!(erased, 10);
+        assert_eq!(s.len(), 5, "only bob's rows remain");
+        // Erased rows can't be recalled even before compaction.
+        let hits = s
+            .recall("alice", "alice note", &embed("a1", DIM), 10)
+            .unwrap();
+        assert!(hits.iter().all(|h| h.memory.key != "alice"));
+
+        // Compaction physically reclaims the erased vectors from the graph.
+        let reclaimed = s.compact().unwrap();
+        assert_eq!(reclaimed, 10, "10 erased vectors reclaimed");
+        assert_eq!(s.inner.vector_index.read().len(), 5);
+        assert_eq!(s.tombstone_ratio(), 0.0);
+    }
+
+    #[test]
+    fn retention_purges_expired_rows_on_write() {
+        const DIM: usize = 8;
+        let s = MemoryStore::new(DIM);
+        // Very short retention so earlier rows are already expired by the time
+        // the next write enforces it.
+        s.set_retention(Some(std::time::Duration::from_millis(5)));
+        s.remember("u", "old", embed("old", DIM)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.remember("u", "new", embed("new", DIM)).unwrap();
+        // The old row was purged on the second write's retention pass.
+        assert_eq!(s.len(), 1);
+        // Explicit purge returns a count.
+        s.set_retention(None);
+        s.remember("u", "another", embed("another", DIM)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let purged = s.forget_older_than(std::time::Duration::from_millis(5));
+        assert!(purged >= 1);
     }
 
     #[test]
