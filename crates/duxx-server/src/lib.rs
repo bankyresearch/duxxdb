@@ -961,6 +961,7 @@ impl Server {
             "REMEMBER.BATCH" => self.cmd_remember_batch(&args),
             "REMEMBER.META" => self.cmd_remember_meta(&args),
             "RECALL" => self.cmd_recall(&args),
+            "RECALL.FILTER" => self.cmd_recall_filter(&args),
             "MEMORY.SCAN" => self.cmd_scan(&args),
             "COMPACT" => self.cmd_compact(),
             "FORGET" => self.cmd_forget(&args),
@@ -1122,6 +1123,7 @@ impl Server {
             "REMEMBER.BATCH",
             "REMEMBER.META",
             "RECALL",
+            "RECALL.FILTER",
             "MEMORY.SCAN",
             "COMPACT",
             "FORGET",
@@ -1635,6 +1637,88 @@ impl Server {
             Err(e) => return Response::Reply(err(format!("ERR {e}"))),
         };
         // Reply as an array of nested arrays: [id_int, score_str, text_str].
+        let arr: Vec<RespValue> = hits
+            .into_iter()
+            .map(|h| {
+                RespValue::Array(vec![
+                    RespValue::Integer(h.memory.id as i64),
+                    RespValue::bulk(format!("{:.6}", h.score)),
+                    RespValue::bulk(h.memory.text),
+                ])
+            })
+            .collect();
+        Response::Reply(RespValue::Array(arr))
+    }
+
+    /// `RECALL.FILTER <key> <json_filter> <query> [k]` — hybrid recall with a
+    /// structured pre-retrieval filter. `json_filter` is a JSON object with any
+    /// of `kind` (string), `tags_any` (string array), `within_secs` (number:
+    /// only memories created within the last N seconds). Same reply as `RECALL`.
+    fn cmd_recall_filter(&self, args: &[RespValue]) -> Response {
+        if args.len() < 4 {
+            return Response::Reply(err("ERR RECALL.FILTER expects: key json_filter query [k]"));
+        }
+        let key = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR RECALL.FILTER key must be a string")),
+        };
+        let parsed: serde_json::Value = match arg_string(&args[2]) {
+            Some(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR json_filter: {e}"))),
+            },
+            None => return Response::Reply(err("ERR RECALL.FILTER json_filter must be a string")),
+        };
+        let query = match arg_string(&args[3]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR RECALL.FILTER query must be a string")),
+        };
+        let k = if args.len() >= 5 {
+            arg_string(&args[4])
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(10)
+        } else {
+            10
+        };
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let filter = duxx_memory::RecallFilter {
+            kind: parsed
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            tags_any: parsed
+                .get("tags_any")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            min_created_at_unix_ns: parsed
+                .get("within_secs")
+                .and_then(|v| v.as_f64())
+                .map(|s| now_ns.saturating_sub((s * 1e9) as u128)),
+            max_created_at_unix_ns: None,
+        };
+        let qvec = match self.embedder.embed(query) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
+        };
+        if qvec.len() != self.dim {
+            return Response::Reply(err(format!(
+                "ERR embedder dim {} != server dim {}",
+                qvec.len(),
+                self.dim
+            )));
+        }
+        let hits = match self.memory.recall_filtered(key, query, &qvec, k, &filter) {
+            Ok(h) => h,
+            Err(e) => return Response::Reply(err(format!("ERR {e}"))),
+        };
         let arr: Vec<RespValue> = hits
             .into_iter()
             .map(|h| {
@@ -3824,6 +3908,46 @@ mod tests {
         let id3 = call("req-2");
         assert_ne!(id1, id3);
         assert_eq!(s.memory().len(), 2);
+    }
+
+    #[test]
+    fn recall_filter_restricts_by_kind() {
+        let s = Server::new();
+        for i in 0..6 {
+            let kind = if i % 2 == 0 { "semantic" } else { "episodic" };
+            dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER.META"),
+                    RespValue::bulk("u"),
+                    RespValue::bulk(format!(r#"{{"kind":"{kind}"}}"#)),
+                    RespValue::bulk(format!("{kind} refund note {i}")),
+                ],
+            );
+        }
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("RECALL.FILTER"),
+                RespValue::bulk("u"),
+                RespValue::bulk(r#"{"kind":"semantic"}"#),
+                RespValue::bulk("refund"),
+                RespValue::bulk("10"),
+            ],
+        );
+        let items = match r {
+            RespValue::Array(items) => items,
+            other => panic!("expected array, got {other:?}"),
+        };
+        assert!(!items.is_empty(), "filtered recall returned nothing");
+        for item in items {
+            if let RespValue::Array(inner) = item {
+                if let RespValue::BulkString(b) = &inner[2] {
+                    let text = std::str::from_utf8(b).unwrap();
+                    assert!(text.contains("semantic"), "non-semantic leaked: {text}");
+                }
+            }
+        }
     }
 
     #[test]

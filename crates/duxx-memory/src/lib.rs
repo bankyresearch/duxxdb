@@ -13,7 +13,7 @@ pub mod tool_cache;
 
 use duxx_core::Result;
 use duxx_index::{TextIndex, VectorIndex};
-use duxx_query::{hybrid_recall, RecallHit};
+use duxx_query::{hybrid_recall, hybrid_recall_filtered, RecallHit};
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
 use duxx_storage::Storage;
 use parking_lot::RwLock;
@@ -83,6 +83,45 @@ pub struct MemoryMeta {
     pub kind: Option<String>,
     pub tags: Vec<String>,
     pub provenance: Option<String>,
+}
+
+/// A structured pre-retrieval filter for [`MemoryStore::recall_filtered`].
+/// All set conditions must hold (AND); unset fields are ignored.
+#[derive(Debug, Clone, Default)]
+pub struct RecallFilter {
+    /// Exact `kind` match (e.g. only `"semantic"` memories).
+    pub kind: Option<String>,
+    /// Match if the memory carries **any** of these tags.
+    pub tags_any: Vec<String>,
+    /// Only memories created at/after this Unix-epoch nanosecond.
+    pub min_created_at_unix_ns: Option<u128>,
+    /// Only memories created at/before this Unix-epoch nanosecond.
+    pub max_created_at_unix_ns: Option<u128>,
+}
+
+impl RecallFilter {
+    /// Whether `m` satisfies every set condition.
+    pub fn matches(&self, m: &Memory) -> bool {
+        if let Some(kind) = &self.kind {
+            if m.kind.as_deref() != Some(kind.as_str()) {
+                return false;
+            }
+        }
+        if !self.tags_any.is_empty() && !self.tags_any.iter().any(|t| m.tags.contains(t)) {
+            return false;
+        }
+        if let Some(min) = self.min_created_at_unix_ns {
+            if m.created_at_unix_ns < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_created_at_unix_ns {
+            if m.created_at_unix_ns > max {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Current wall-clock time as Unix-epoch nanoseconds.
@@ -965,6 +1004,36 @@ impl MemoryStore {
         Ok(out)
     }
 
+    /// Hybrid recall restricted by a structured [`RecallFilter`] over metadata
+    /// (kind / tags / time window). The filter is applied **pre-RRF**, so the
+    /// returned `k` rows are all matching rather than a top-k trimmed to fewer.
+    pub fn recall_filtered(
+        &self,
+        _key: &str,
+        query_text: &str,
+        query_vec: &[f32],
+        k: usize,
+        filter: &RecallFilter,
+    ) -> Result<Vec<MemoryHit>> {
+        // Acquire in the same order as `recall`/`compact` (vector, text, by_id)
+        // to avoid a lock-order inversion.
+        let v = self.inner.vector_index.read();
+        let t = self.inner.text_index.read();
+        let by_id = self.inner.by_id.read();
+        let keep = |id: u64| by_id.get(&id).map(|m| filter.matches(m)).unwrap_or(false);
+        let hits: Vec<RecallHit> = hybrid_recall_filtered(&v, &t, query_vec, query_text, k, &keep)?;
+        let mut out = Vec::with_capacity(hits.len());
+        for h in hits {
+            if let Some(m) = by_id.get(&h.id) {
+                out.push(MemoryHit {
+                    memory: m.clone(),
+                    score: h.score,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Recall with importance-decay reranking.
     ///
     /// First runs hybrid recall, then multiplies each hit's RRF score
@@ -1010,6 +1079,49 @@ mod tests {
             *x /= n;
         }
         v
+    }
+
+    #[test]
+    fn recall_filtered_returns_only_matching() {
+        const DIM: usize = 16;
+        let s = MemoryStore::new(DIM);
+        for i in 0..10 {
+            s.remember_with(
+                "u",
+                format!("refund topic {i}"),
+                embed("refund order", DIM),
+                MemoryMeta {
+                    kind: Some(if i % 2 == 0 { "semantic" } else { "episodic" }.into()),
+                    tags: vec![if i < 5 { "billing" } else { "support" }.into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        // kind filter -> only semantic.
+        let f = RecallFilter {
+            kind: Some("semantic".into()),
+            ..Default::default()
+        };
+        let hits = s
+            .recall_filtered("u", "refund", &embed("refund", DIM), 10, &f)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits
+            .iter()
+            .all(|h| h.memory.kind.as_deref() == Some("semantic")));
+        // tag filter -> only billing.
+        let f = RecallFilter {
+            tags_any: vec!["billing".into()],
+            ..Default::default()
+        };
+        let hits = s
+            .recall_filtered("u", "refund", &embed("refund", DIM), 10, &f)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits
+            .iter()
+            .all(|h| h.memory.tags.contains(&"billing".to_string())));
     }
 
     #[test]

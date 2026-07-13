@@ -161,13 +161,20 @@ impl MemoryStore {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    #[pyo3(signature = (key, query, embedding, k = 10))]
+    /// Hybrid recall. Optional structured filter (applied pre-RRF):
+    /// ``kind`` (exact), ``tags_any`` (match any), ``within_secs`` (only
+    /// memories created within the last N seconds). New filters in v0.4.1.
+    #[pyo3(signature = (key, query, embedding, k = 10, kind = None, tags_any = None, within_secs = None))]
+    #[allow(clippy::too_many_arguments)]
     fn recall(
         &self,
         key: &str,
         query: &str,
         embedding: Vec<f32>,
         k: usize,
+        kind: Option<String>,
+        tags_any: Option<Vec<String>>,
+        within_secs: Option<f64>,
     ) -> PyResult<Vec<MemoryHit>> {
         if embedding.len() != self.inner.dim() {
             return Err(PyValueError::new_err(format!(
@@ -176,10 +183,25 @@ impl MemoryStore {
                 self.inner.dim()
             )));
         }
-        let hits = self
-            .inner
-            .recall(key, query, &embedding, k)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let has_filter = kind.is_some() || tags_any.is_some() || within_secs.is_some();
+        let hits = if has_filter {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let filter = duxx_memory::RecallFilter {
+                kind,
+                tags_any: tags_any.unwrap_or_default(),
+                min_created_at_unix_ns: within_secs
+                    .map(|s| now_ns.saturating_sub((s * 1e9) as u128)),
+                max_created_at_unix_ns: None,
+            };
+            self.inner
+                .recall_filtered(key, query, &embedding, k, &filter)
+        } else {
+            self.inner.recall(key, query, &embedding, k)
+        }
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(hits
             .into_iter()
             .map(|h| MemoryHit {

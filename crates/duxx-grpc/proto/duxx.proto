@@ -83,6 +83,10 @@ message RecallRequest {
     // Optional. If empty, the server's configured embedder is used.
     repeated float embedding = 3;
     uint32 k = 4;  // 0 -> default 10
+    // Optional structured pre-retrieval filter (empty/zero fields ignored).
+    string filter_kind = 5;
+    repeated string filter_tags_any = 6;
+    double filter_within_secs = 7;  // only memories created within the last N seconds
 }
 
 message RecallResponse {
