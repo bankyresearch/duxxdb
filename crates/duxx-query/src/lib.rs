@@ -79,6 +79,35 @@ pub fn hybrid_recall(
     Ok(rrf_fuse(vec![v_hits, t_hits], DEFAULT_RRF_K, k))
 }
 
+/// Hybrid recall with a **pre-fusion** candidate filter.
+///
+/// `keep(id)` is applied to each retriever's results *before* RRF fusion and
+/// truncation to `k`, so the `k` returned rows are all matching — a structured
+/// filter (kind / tags / time window) restricts candidates rather than
+/// post-filtering a fixed top-k down to fewer. Over-fetches more per retriever
+/// than the unfiltered path so selective filters still fill `k`.
+pub fn hybrid_recall_filtered(
+    vector_index: &VectorIndex,
+    text_index: &TextIndex,
+    query_vec: &[f32],
+    query_text: &str,
+    k: usize,
+    keep: &dyn Fn(u64) -> bool,
+) -> Result<Vec<RecallHit>> {
+    let per = (k * 8).max(128);
+    let v_hits: Vec<(u64, f32)> = vector_index
+        .search(query_vec, per)
+        .into_iter()
+        .filter(|(id, _)| keep(*id))
+        .collect();
+    let t_hits: Vec<(u64, f32)> = text_index
+        .search(query_text, per)
+        .into_iter()
+        .filter(|(id, _)| keep(*id))
+        .collect();
+    Ok(rrf_fuse(vec![v_hits, t_hits], DEFAULT_RRF_K, k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -230,11 +230,76 @@ fn bench_recall_after_churn(c: &mut Criterion) {
     group.finish();
 }
 
+/// #41: overhead of a structured pre-retrieval filter vs plain recall. The
+/// filter restricts candidates (here, `kind == "semantic"`) before RRF fusion.
+fn bench_recall_filtered(c: &mut Criterion) {
+    use duxx_memory::{MemoryMeta, RecallFilter};
+    let query_text = "refund delivery issue";
+    let query_vec = embed(query_text);
+    const N: usize = 5_000;
+
+    let store = MemoryStore::with_capacity(DIM, N);
+    let topics = [
+        "refund order delivery shipping",
+        "weather forecast tomorrow rain",
+        "login password account security",
+        "billing invoice payment receipt",
+    ];
+    for i in 0..N {
+        let text = format!("doc {i} about {}", topics[i % topics.len()]);
+        let emb = embed(&text);
+        store
+            .remember_with(
+                "u",
+                text,
+                emb,
+                MemoryMeta {
+                    kind: Some(if i % 2 == 0 { "semantic" } else { "episodic" }.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let filter = RecallFilter {
+        kind: Some("semantic".into()),
+        ..Default::default()
+    };
+
+    let mut group = c.benchmark_group("recall_filtered");
+    group.sample_size(20);
+    group.bench_function("unfiltered", |b| {
+        b.iter(|| {
+            black_box(
+                store
+                    .recall("u", black_box(query_text), black_box(&query_vec), 10)
+                    .unwrap(),
+            );
+        });
+    });
+    group.bench_function("filtered_kind", |b| {
+        b.iter(|| {
+            black_box(
+                store
+                    .recall_filtered(
+                        "u",
+                        black_box(query_text),
+                        black_box(&query_vec),
+                        10,
+                        &filter,
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_recall,
     bench_insert,
     bench_bulk_insert,
-    bench_recall_after_churn
+    bench_recall_after_churn,
+    bench_recall_filtered
 );
 criterion_main!(benches);

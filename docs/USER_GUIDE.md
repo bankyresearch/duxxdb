@@ -501,6 +501,33 @@ while cursor is not None:
 The gRPC `Scan` RPC (`cursor` / `limit` → `memories` / `next_cursor` /
 `has_more`) exposes the same operation.
 
+### 3.9 Metadata & structured filtered recall
+
+Attach `importance` (feeds eviction), `kind`, `tags`, and `provenance` at write
+time; they round-trip through recall. Then filter recall **before** fusion by
+`kind`, `tags`, or a time window — so the top-`k` are all matching, not a
+top-`k` trimmed down.
+
+```python
+store.remember("u", "refund approved", emb,
+               importance=5.0, kind="semantic", tags=["billing"], provenance="crm:1")
+
+# Only semantic memories tagged "billing", created in the last 90 days.
+hits = store.recall("u", "refund", emb, k=10,
+                    kind="semantic", tags_any=["billing"], within_secs=90*24*3600)
+for h in hits:
+    print(h.id, h.kind, h.tags, h.importance)
+```
+
+```bash
+# RESP — write with metadata, then filtered recall (JSON filter).
+> REMEMBER.META u '{"importance":5.0,"kind":"semantic","tags":["billing"]}' refund approved
+> RECALL.FILTER u '{"kind":"semantic","tags_any":["billing"],"within_secs":7776000}' refund 10
+```
+
+gRPC carries the same via `RememberRequest` metadata fields and `RecallRequest`
+`filter_kind` / `filter_tags_any` / `filter_within_secs`.
+
 ---
 
 ## 4. Configuration

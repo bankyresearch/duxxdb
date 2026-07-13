@@ -375,10 +375,27 @@ impl Duxx for DuxxService {
             )));
         }
         let k = if req.k == 0 { 10 } else { req.k as usize };
-        let hits = self
-            .memory
-            .recall(&req.key, &req.query, &embedding, k)
-            .map_err(|e| Status::internal(format!("recall: {e}")))?;
+        let has_filter = !req.filter_kind.is_empty()
+            || !req.filter_tags_any.is_empty()
+            || req.filter_within_secs > 0.0;
+        let hits = if has_filter {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let filter = duxx_memory::RecallFilter {
+                kind: (!req.filter_kind.is_empty()).then_some(req.filter_kind),
+                tags_any: req.filter_tags_any,
+                min_created_at_unix_ns: (req.filter_within_secs > 0.0)
+                    .then(|| now_ns.saturating_sub((req.filter_within_secs * 1e9) as u128)),
+                max_created_at_unix_ns: None,
+            };
+            self.memory
+                .recall_filtered(&req.key, &req.query, &embedding, k, &filter)
+        } else {
+            self.memory.recall(&req.key, &req.query, &embedding, k)
+        }
+        .map_err(|e| Status::internal(format!("recall: {e}")))?;
         let pb_hits: Vec<MemoryHit> = hits
             .into_iter()
             .map(|h| MemoryHit {
@@ -619,6 +636,7 @@ mod tests {
                 query: "wallet".into(),
                 embedding: vec![],
                 k: 5,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -657,6 +675,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_filter_by_kind_via_grpc() {
+        let svc = DuxxService::new();
+        for i in 0..6 {
+            let kind = if i % 2 == 0 { "semantic" } else { "episodic" };
+            svc.remember(Request::new(RememberRequest {
+                key: "u".into(),
+                text: format!("{kind} refund {i}"),
+                kind: kind.into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        }
+        let hits = svc
+            .recall(Request::new(RecallRequest {
+                key: "u".into(),
+                query: "refund".into(),
+                k: 10,
+                filter_kind: "semantic".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .hits;
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| h.kind == "semantic"));
+    }
+
+    #[tokio::test]
     async fn remember_with_metadata_round_trips_via_grpc() {
         let svc = DuxxService::new();
         svc.remember(Request::new(RememberRequest {
@@ -676,6 +724,7 @@ mod tests {
                 query: "refund".into(),
                 embedding: vec![],
                 k: 5,
+                ..Default::default()
             }))
             .await
             .unwrap()
