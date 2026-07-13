@@ -407,6 +407,7 @@ impl Duxx for DuxxService {
                 kind: h.memory.kind.unwrap_or_default(),
                 tags: h.memory.tags,
                 provenance: h.memory.provenance.unwrap_or_default(),
+                access_count: h.memory.access_count,
             })
             .collect();
         Ok(Response::new(RecallResponse { hits: pb_hits }))
@@ -431,6 +432,7 @@ impl Duxx for DuxxService {
                 kind: m.kind.unwrap_or_default(),
                 tags: m.tags,
                 provenance: m.provenance.unwrap_or_default(),
+                access_count: m.access_count,
             })
             .collect();
         Ok(Response::new(ScanResponse {
