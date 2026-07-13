@@ -14,6 +14,10 @@ service Duxx {
     // Top-k hybrid recall (vector + BM25, RRF-fused).
     rpc Recall(RecallRequest) returns (RecallResponse);
 
+    // Stable keyset pagination over all memories (ordered by id). Start with
+    // cursor 0; `has_more=false` marks the end.
+    rpc Scan(ScanRequest) returns (ScanResponse);
+
     // Rebuild the index from surviving rows, dropping tombstones left by
     // forgotten/evicted rows. Restores recall quality. Returns the number
     // of tombstones reclaimed and the post-compaction tombstone ratio.
@@ -56,6 +60,17 @@ message RecallRequest {
 
 message RecallResponse {
     repeated MemoryHit hits = 1;
+}
+
+message ScanRequest {
+    uint64 cursor = 1;  // 0 to start
+    uint32 limit = 2;   // 0 -> default 10
+}
+
+message ScanResponse {
+    repeated MemoryHit memories = 1;  // score is unused (0) for scans
+    uint64 next_cursor = 2;
+    bool has_more = 3;                // false once the scan is exhausted
 }
 
 message MemoryHit {

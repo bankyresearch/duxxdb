@@ -959,6 +959,7 @@ impl Server {
             "REMEMBER" => self.cmd_remember(&args),
             "REMEMBER.IDEM" => self.cmd_remember_idem(&args),
             "RECALL" => self.cmd_recall(&args),
+            "MEMORY.SCAN" => self.cmd_scan(&args),
             "COMPACT" => self.cmd_compact(),
             "FORGET" => self.cmd_forget(&args),
             "DOC.INGEST" => self.cmd_doc_ingest(&args),
@@ -1115,6 +1116,7 @@ impl Server {
             "REMEMBER",
             "REMEMBER.IDEM",
             "RECALL",
+            "MEMORY.SCAN",
             "COMPACT",
             "FORGET",
             "SUBSCRIBE",
@@ -1346,6 +1348,44 @@ impl Server {
         };
         let removed = self.memory.forget(id);
         Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `MEMORY.SCAN <cursor> [count]` — stable keyset pagination over all
+    /// memories. Start with cursor `0`. Reply is `[next_cursor, [[id, key,
+    /// text], ...]]`; `next_cursor` is empty once the scan is exhausted.
+    fn cmd_scan(&self, args: &[RespValue]) -> Response {
+        if args.len() < 2 {
+            return Response::Reply(err("ERR MEMORY.SCAN expects: cursor [count]"));
+        }
+        let cursor = match arg_string(&args[1]).and_then(|s| s.parse::<u64>().ok()) {
+            Some(c) => c,
+            None => {
+                return Response::Reply(err(
+                    "ERR MEMORY.SCAN cursor must be an integer (0 to start)",
+                ))
+            }
+        };
+        let count = args
+            .get(2)
+            .and_then(arg_string)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10);
+        let (page, next) = self.memory.scan(cursor, count);
+        let items: Vec<RespValue> = page
+            .into_iter()
+            .map(|m| {
+                RespValue::Array(vec![
+                    RespValue::Integer(m.id as i64),
+                    RespValue::bulk(m.key),
+                    RespValue::bulk(m.text),
+                ])
+            })
+            .collect();
+        let next_cursor = next.map(|c| c.to_string()).unwrap_or_default();
+        Response::Reply(RespValue::Array(vec![
+            RespValue::bulk(next_cursor),
+            RespValue::Array(items),
+        ]))
     }
 
     fn cmd_subscribe(&self, args: &[RespValue]) -> Response {
@@ -3638,6 +3678,51 @@ mod tests {
         let id3 = call("req-2");
         assert_ne!(id1, id3);
         assert_eq!(s.memory().len(), 2);
+    }
+
+    #[test]
+    fn memory_scan_pages_all_rows() {
+        let s = Server::new();
+        for i in 0..25 {
+            dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("u"),
+                    RespValue::bulk(format!("m{i}")),
+                ],
+            );
+        }
+        let mut count = 0usize;
+        let mut cursor = "0".to_string();
+        let mut pages = 0;
+        loop {
+            let r = dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("MEMORY.SCAN"),
+                    RespValue::bulk(cursor.clone()),
+                    RespValue::bulk("10"),
+                ],
+            );
+            let mut a = match r {
+                RespValue::Array(a) => a,
+                other => panic!("expected array, got {other:?}"),
+            };
+            let items = a.pop().unwrap();
+            let next = a.pop().unwrap();
+            if let RespValue::Array(items) = items {
+                count += items.len();
+            }
+            pages += 1;
+            assert!(pages <= 10, "cursor did not terminate");
+            match next {
+                RespValue::BulkString(b) if b.is_empty() => break,
+                RespValue::BulkString(b) => cursor = String::from_utf8(b).unwrap(),
+                other => panic!("unexpected cursor {other:?}"),
+            }
+        }
+        assert_eq!(count, 25, "scan must page every row exactly once");
     }
 
     #[test]

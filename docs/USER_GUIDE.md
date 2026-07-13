@@ -441,6 +441,28 @@ Observability: the metrics endpoint exports `duxx_resp_memory_compactions`
 (count) and `duxx_resp_memory_tombstone_ratio` (gauge) — a sawtooth on the
 ratio is auto-compaction doing its job.
 
+### 3.7 Paging through all memories (stable cursor)
+
+`MEMORY.SCAN` walks every memory in id order with a **stable keyset cursor** —
+new writes during the scan never cause a row to be skipped or returned twice.
+Start with cursor `0`; an empty `next_cursor` marks the end.
+
+```bash
+# RESP: reply is [next_cursor, [[id, key, text], ...]]
+> MEMORY.SCAN 0 100
+> MEMORY.SCAN 100 100     # pass the returned cursor to continue
+```
+
+```python
+cursor, hits = store.scan(0, 100)
+while cursor is not None:
+    cursor, page = store.scan(cursor, 100)
+    hits += page
+```
+
+The gRPC `Scan` RPC (`cursor` / `limit` → `memories` / `next_cursor` /
+`has_more`) exposes the same operation.
+
 ---
 
 ## 4. Configuration
