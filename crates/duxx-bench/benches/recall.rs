@@ -131,6 +131,7 @@ fn bench_bulk_insert(c: &mut Criterion) {
 
     for &n in &[100usize, 1_000] {
         group.throughput(Throughput::Elements(n as u64));
+        // One-at-a-time loop of remember().
         group.bench_with_input(BenchmarkId::new("remember_n", n), &n, |b, &n| {
             b.iter_batched(
                 || MemoryStore::with_capacity(DIM, n.max(2_000)),
@@ -140,6 +141,27 @@ fn bench_bulk_insert(c: &mut Criterion) {
                         let emb = embed(&text);
                         store.remember("user", text, emb).unwrap();
                     }
+                    black_box(&store);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+        // Single remember_batch() — parallel HNSW build + one tantivy commit.
+        group.bench_with_input(BenchmarkId::new("remember_batch_n", n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let store = MemoryStore::with_capacity(DIM, n.max(2_000));
+                    let items: Vec<(String, String, Vec<f32>)> = (0..n)
+                        .map(|i| {
+                            let text = format!("doc {i} about topic {}", i % 16);
+                            let emb = embed(&text);
+                            ("user".to_string(), text, emb)
+                        })
+                        .collect();
+                    (store, items)
+                },
+                |(store, items)| {
+                    store.remember_batch(items).unwrap();
                     black_box(&store);
                 },
                 criterion::BatchSize::SmallInput,

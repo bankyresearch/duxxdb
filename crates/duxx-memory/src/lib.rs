@@ -614,6 +614,81 @@ impl MemoryStore {
         Ok(id)
     }
 
+    /// Bulk insert `(key, text, embedding)` items in one call. Assigns a
+    /// contiguous id block, builds the vector graph with **parallel** HNSW
+    /// insertion, and commits the text index **once** — far faster than a loop
+    /// of [`MemoryStore::remember`] for initial loads and rebuilds. Returns the
+    /// assigned ids in input order.
+    pub fn remember_batch(&self, items: Vec<(String, String, Vec<f32>)>) -> Result<Vec<u64>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (_, _, emb) in &items {
+            if emb.len() != self.inner.dim {
+                return Err(duxx_core::Error::Storage(format!(
+                    "embedding has dim {} but store expects {}",
+                    emb.len(),
+                    self.inner.dim
+                )));
+            }
+        }
+        // Reserve a contiguous id block.
+        let start = {
+            let mut n = self.inner.next_id.write();
+            let s = *n;
+            *n += items.len() as u64;
+            s
+        };
+        let ids: Vec<u64> = (0..items.len() as u64).map(|i| start + i).collect();
+        let now = now_unix_ns();
+        let mems: Vec<Memory> = ids
+            .iter()
+            .zip(items)
+            .map(|(id, (key, text, emb))| Memory {
+                id: *id,
+                key,
+                text,
+                embedding: emb,
+                importance: 1.0,
+                created_at_unix_ns: now,
+            })
+            .collect();
+
+        // 1. Durable storage first (so a failure leaves no phantom index rows).
+        if let Some(s) = &self.inner.storage {
+            for m in &mems {
+                let bytes = bincode::serialize(&StoredMemory::from(m)).map_err(|e| {
+                    duxx_core::Error::Storage(format!("encode memory id={}: {e}", m.id))
+                })?;
+                s.put(m.id, &bytes)?;
+            }
+        }
+        // 2. Indices — parallel HNSW + single tantivy commit.
+        let vec_items: Vec<(u64, Vec<f32>)> =
+            mems.iter().map(|m| (m.id, m.embedding.clone())).collect();
+        let text_items: Vec<(u64, String)> = mems.iter().map(|m| (m.id, m.text.clone())).collect();
+        self.inner.vector_index.write().insert_batch(&vec_items)?;
+        self.inner.text_index.write().insert_batch(&text_items)?;
+        // 3. In-memory cache + change events.
+        {
+            let mut by_id = self.inner.by_id.write();
+            for m in &mems {
+                by_id.insert(m.id, m.clone());
+            }
+        }
+        for m in &mems {
+            self.inner.bus.publish(ChangeEvent {
+                table: "memory".to_string(),
+                key: Some(m.key.clone()),
+                row_id: m.id,
+                kind: ChangeKind::Insert,
+            });
+        }
+        self.enforce_cap();
+        self.maybe_auto_compact();
+        Ok(ids)
+    }
+
     /// Like [`MemoryStore::remember`], but **idempotent** on `idem_key`: a
     /// repeat call with the same key within the TTL returns the id of the
     /// original insert instead of creating a duplicate. Lets clients retry a
@@ -821,6 +896,34 @@ mod tests {
             *x /= n;
         }
         v
+    }
+
+    #[test]
+    fn remember_batch_inserts_contiguously_and_recalls() {
+        const DIM: usize = 16;
+        let s = MemoryStore::new(DIM);
+        let items: Vec<(String, String, Vec<f32>)> = (0..50)
+            .map(|i| {
+                let t = format!("note {i} about topic {}", i % 5);
+                ("u".to_string(), t.clone(), embed(&t, DIM))
+            })
+            .collect();
+        let ids = s.remember_batch(items).unwrap();
+        assert_eq!(ids.len(), 50);
+        assert_eq!(s.len(), 50);
+        // Contiguous id block.
+        assert_eq!(ids, (ids[0]..ids[0] + 50).collect::<Vec<u64>>());
+        // A batched row round-trips through recall.
+        let hits = s
+            .recall(
+                "u",
+                "note 7 topic 2",
+                &embed("note 7 about topic 2", DIM),
+                5,
+            )
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().any(|h| h.memory.text.contains("note 7")));
     }
 
     #[test]

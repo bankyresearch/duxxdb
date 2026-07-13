@@ -114,6 +114,23 @@ impl TextIndex {
         Ok(())
     }
 
+    /// Add many documents under a single writer lock and **one** commit — much
+    /// cheaper than a loop of [`TextIndex::insert`] for bulk loads.
+    pub fn insert_batch(&mut self, items: &[(u64, String)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut w = self.writer.lock();
+        for (id, text) in items {
+            w.add_document(doc!(self.id_field => *id, self.text_field => text.clone()))
+                .map_err(|e| Error::Index(format!("add_document: {e}")))?;
+        }
+        w.commit()
+            .map_err(|e| Error::Index(format!("commit: {e}")))?;
+        self.pending.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Rebuild the index over exactly `survivors`, dropping every other
     /// document. Counterpart to `VectorIndex::rebuild` — called by
     /// `MemoryStore::compact` so the BM25 postings stop referencing

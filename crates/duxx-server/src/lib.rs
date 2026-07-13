@@ -958,6 +958,7 @@ impl Server {
             "DEL" => self.cmd_del(&args),
             "REMEMBER" => self.cmd_remember(&args),
             "REMEMBER.IDEM" => self.cmd_remember_idem(&args),
+            "REMEMBER.BATCH" => self.cmd_remember_batch(&args),
             "RECALL" => self.cmd_recall(&args),
             "MEMORY.SCAN" => self.cmd_scan(&args),
             "COMPACT" => self.cmd_compact(),
@@ -1115,6 +1116,7 @@ impl Server {
             "DEL",
             "REMEMBER",
             "REMEMBER.IDEM",
+            "REMEMBER.BATCH",
             "RECALL",
             "MEMORY.SCAN",
             "COMPACT",
@@ -1348,6 +1350,49 @@ impl Server {
         };
         let removed = self.memory.forget(id);
         Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
+    }
+
+    /// `REMEMBER.BATCH <key> <text1> [text2 ...]` — bulk insert many memories
+    /// under one key in a single call (parallel index build). Returns an array
+    /// of the assigned ids in order.
+    fn cmd_remember_batch(&self, args: &[RespValue]) -> Response {
+        if args.len() < 3 {
+            return Response::Reply(err("ERR REMEMBER.BATCH expects: key text [text ...]"));
+        }
+        let key = match arg_string(&args[1]) {
+            Some(s) => s.to_string(),
+            None => return Response::Reply(err("ERR REMEMBER.BATCH key must be a string")),
+        };
+        let mut items: Vec<(String, String, Vec<f32>)> = Vec::with_capacity(args.len() - 2);
+        for a in &args[2..] {
+            let text = match arg_string(a) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let emb = match self.embedder.embed(&text) {
+                Ok(v) => v,
+                Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
+            };
+            if emb.len() != self.dim {
+                return Response::Reply(err(format!(
+                    "ERR embedder dim {} != server dim {}",
+                    emb.len(),
+                    self.dim
+                )));
+            }
+            items.push((key.clone(), text, emb));
+        }
+        if items.is_empty() {
+            return Response::Reply(err("ERR REMEMBER.BATCH text required"));
+        }
+        match self.memory.remember_batch(items) {
+            Ok(ids) => Response::Reply(RespValue::Array(
+                ids.into_iter()
+                    .map(|id| RespValue::Integer(id as i64))
+                    .collect(),
+            )),
+            Err(e) => Response::Reply(err(format!("ERR {e}"))),
+        }
     }
 
     /// `MEMORY.SCAN <cursor> [count]` — stable keyset pagination over all
@@ -3678,6 +3723,24 @@ mod tests {
         let id3 = call("req-2");
         assert_ne!(id1, id3);
         assert_eq!(s.memory().len(), 2);
+    }
+
+    #[test]
+    fn remember_batch_inserts_all() {
+        let s = Server::new();
+        let mut cmd = vec![RespValue::bulk("REMEMBER.BATCH"), RespValue::bulk("u")];
+        for i in 0..20 {
+            cmd.push(RespValue::bulk(format!("note {i}")));
+        }
+        let r = dispatch_array(&s, cmd);
+        match r {
+            RespValue::Array(ids) => {
+                assert_eq!(ids.len(), 20);
+                assert!(ids.iter().all(|v| matches!(v, RespValue::Integer(_))));
+            }
+            other => panic!("expected id array, got {other:?}"),
+        }
+        assert_eq!(s.memory().len(), 20);
     }
 
     #[test]

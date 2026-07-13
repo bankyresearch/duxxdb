@@ -119,6 +119,27 @@ impl MemoryStore {
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Bulk insert ``(key, text, embedding)`` tuples in one call — builds the
+    /// vector graph in parallel and commits the text index once, so it's far
+    /// faster than a loop of ``remember`` for initial loads. Returns the
+    /// assigned ids. New in duxxdb v0.4.1.
+    ///
+    /// >>> ids = store.remember_batch([("u", "hello", emb0), ("u", "world", emb1)])
+    fn remember_batch(&self, items: Vec<(String, String, Vec<f32>)>) -> PyResult<Vec<u64>> {
+        for (_, _, emb) in &items {
+            if emb.len() != self.inner.dim() {
+                return Err(PyValueError::new_err(format!(
+                    "an embedding has dim {}, store expects {}",
+                    emb.len(),
+                    self.inner.dim()
+                )));
+            }
+        }
+        self.inner
+            .remember_batch(items)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     #[pyo3(signature = (key, query, embedding, k = 10))]
     fn recall(
         &self,

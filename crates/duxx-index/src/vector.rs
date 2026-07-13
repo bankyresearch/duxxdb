@@ -211,6 +211,38 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Insert many `(id, vector)` pairs at once, building the graph with
+    /// `hnsw_rs`'s **parallel** insertion (rayon under the hood). Much faster
+    /// than a loop of [`VectorIndex::insert`] for bulk loads and index
+    /// rebuilds. Ids are appended in the given order.
+    pub fn insert_batch(&mut self, items: &[(u64, Vec<f32>)]) -> Result<()> {
+        for (id, v) in items {
+            if v.len() != self.dim {
+                return Err(Error::Index(format!(
+                    "insert_batch: id={id} vector dim mismatch: expected {}, got {}",
+                    self.dim,
+                    v.len()
+                )));
+            }
+        }
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.inner.write();
+        let start = inner.next_internal;
+        let data: Vec<(&Vec<f32>, usize)> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| (v, start + i))
+            .collect();
+        inner.hnsw.parallel_insert(&data);
+        for (id, _) in items {
+            inner.id_map.push(*id);
+        }
+        inner.next_internal += items.len();
+        Ok(())
+    }
+
     /// Rebuild the graph from scratch over exactly `survivors`, dropping
     /// every point not listed.
     ///
@@ -237,11 +269,15 @@ impl VectorIndex {
         }
         let capacity = self.capacity.max(survivors.len()).max(1);
         let fresh = Hnsw::new(M, capacity, MAX_LAYERS, EF_CONSTRUCTION, DistCosine);
-        let mut id_map = Vec::with_capacity(survivors.len());
-        for (internal, (id, v)) in survivors.iter().enumerate() {
-            id_map.push(*id);
-            fresh.insert((v, internal));
-        }
+        // Parallel build (rayon) — much faster than a sequential insert loop,
+        // so compaction rebuilds stay cheap on large stores.
+        let data: Vec<(&Vec<f32>, usize)> = survivors
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| (v, i))
+            .collect();
+        fresh.parallel_insert(&data);
+        let id_map: Vec<u64> = survivors.iter().map(|(id, _)| *id).collect();
         let mut inner = self.inner.write();
         inner.hnsw = fresh;
         inner.next_internal = survivors.len();

@@ -441,7 +441,26 @@ Observability: the metrics endpoint exports `duxx_resp_memory_compactions`
 (count) and `duxx_resp_memory_tombstone_ratio` (gauge) — a sawtooth on the
 ratio is auto-compaction doing its job.
 
-### 3.7 Paging through all memories (stable cursor)
+### 3.7 Bulk ingest (batch writes)
+
+For initial loads, `remember_batch` inserts many memories in one call — it
+builds the HNSW graph with **parallel** insertion and commits the text index
+**once**, so it's far faster than a loop of `remember` (see the `bulk_insert`
+bench: `remember_batch_n` vs `remember_n`).
+
+```python
+ids = store.remember_batch([("u", "hello", emb0), ("u", "world", emb1), ...])
+```
+
+```bash
+# RESP: many texts under one key -> array of ids
+> REMEMBER.BATCH u "first note" "second note" "third note"
+```
+
+The gRPC `RememberBatch` RPC takes a repeated `RememberItem {key, text,
+embedding}`.
+
+### 3.8 Paging through all memories (stable cursor)
 
 `MEMORY.SCAN` walks every memory in id order with a **stable keyset cursor** —
 new writes during the scan never cause a row to be skipped or returned twice.
