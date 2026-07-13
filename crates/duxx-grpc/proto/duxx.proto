@@ -102,6 +102,7 @@ message StatsResponse {
     // Memory-store compaction health (mirrors the Prometheus gauges).
     float tombstone_ratio = 5;  // (indexed - live) / live
     uint64 compactions = 6;     // graph compactions performed (manual + auto)
+    uint32 protocol_version = 7; // DuxxDB command-schema version
 }
 
 message PingRequest {

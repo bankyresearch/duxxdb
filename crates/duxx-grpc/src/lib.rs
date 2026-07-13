@@ -257,6 +257,7 @@ impl Duxx for DuxxService {
             version: SERVER_VERSION.to_string(),
             tombstone_ratio: self.memory.tombstone_ratio(),
             compactions: self.memory.compactions_total(),
+            protocol_version: duxx_core::PROTOCOL_VERSION,
         }))
     }
 
@@ -568,6 +569,7 @@ mod tests {
         assert_eq!(s.memories, 2);
         assert!(s.tombstone_ratio > 0.0, "ratio={}", s.tombstone_ratio);
         assert_eq!(s.compactions, 0);
+        assert_eq!(s.protocol_version, duxx_core::PROTOCOL_VERSION);
 
         svc.compact(Request::new(CompactRequest {})).await.unwrap();
         let s2 = svc

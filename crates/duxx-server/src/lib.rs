@@ -1091,6 +1091,9 @@ impl Server {
             RespValue::bulk(SERVER_VERSION),
             RespValue::bulk("proto"),
             RespValue::Integer(2),
+            // DuxxDB command-schema version (distinct from RESP `proto`).
+            RespValue::bulk("duxx_protocol"),
+            RespValue::Integer(duxx_core::PROTOCOL_VERSION as i64),
             RespValue::bulk("mode"),
             RespValue::bulk("standalone"),
         ]))
@@ -3405,6 +3408,25 @@ mod tests {
         let s = Server::new();
         let r = dispatch_array(&s, vec![RespValue::bulk("PING")]);
         assert_eq!(r, simple("PONG"));
+    }
+
+    #[test]
+    fn hello_reports_duxx_protocol_version() {
+        let s = Server::new();
+        let r = dispatch_array(&s, vec![RespValue::bulk("HELLO")]);
+        let items = match r {
+            RespValue::Array(items) => items,
+            other => panic!("expected array, got {other:?}"),
+        };
+        // Find the "duxx_protocol" field and assert it matches the constant.
+        let pos = items
+            .iter()
+            .position(|v| matches!(v, RespValue::BulkString(b) if b == b"duxx_protocol"))
+            .expect("HELLO must include duxx_protocol");
+        assert_eq!(
+            items[pos + 1],
+            RespValue::Integer(duxx_core::PROTOCOL_VERSION as i64)
+        );
     }
 
     /// P0: `COMPACT` over RESP rebuilds the memory index, returning the number
