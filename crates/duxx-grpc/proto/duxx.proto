@@ -11,6 +11,9 @@ service Duxx {
     // Store a memory. Returns the assigned id.
     rpc Remember(RememberRequest) returns (RememberResponse);
 
+    // Bulk-store many memories in one call (parallel index build).
+    rpc RememberBatch(RememberBatchRequest) returns (RememberBatchResponse);
+
     // Top-k hybrid recall (vector + BM25, RRF-fused).
     rpc Recall(RecallRequest) returns (RecallResponse);
 
@@ -48,6 +51,21 @@ message RememberRequest {
 
 message RememberResponse {
     uint64 id = 1;
+}
+
+message RememberItem {
+    string key = 1;
+    string text = 2;
+    // Optional. If empty, the server's configured embedder is used.
+    repeated float embedding = 3;
+}
+
+message RememberBatchRequest {
+    repeated RememberItem items = 1;
+}
+
+message RememberBatchResponse {
+    repeated uint64 ids = 1;
 }
 
 message RecallRequest {

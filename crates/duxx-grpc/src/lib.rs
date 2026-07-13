@@ -30,8 +30,8 @@ pub use pb::duxx::v1 as proto;
 use proto::duxx_server::{Duxx, DuxxServer};
 use proto::{
     ChangeEvent, CompactRequest, CompactResponse, MemoryHit, PingRequest, PingResponse,
-    RecallRequest, RecallResponse, RememberRequest, RememberResponse, ScanRequest, ScanResponse,
-    StatsRequest, StatsResponse, SubscribeRequest,
+    RecallRequest, RecallResponse, RememberBatchRequest, RememberBatchResponse, RememberRequest,
+    RememberResponse, ScanRequest, ScanResponse, StatsRequest, StatsResponse, SubscribeRequest,
 };
 
 pub const SERVER_NAME: &str = "duxxdb-grpc";
@@ -294,6 +294,45 @@ impl Duxx for DuxxService {
         }
         .map_err(|e| Status::internal(format!("remember: {e}")))?;
         Ok(Response::new(RememberResponse { id }))
+    }
+
+    async fn remember_batch(
+        &self,
+        request: Request<RememberBatchRequest>,
+    ) -> Result<Response<RememberBatchResponse>, Status> {
+        let req = request.into_inner();
+        if req.items.is_empty() {
+            return Ok(Response::new(RememberBatchResponse { ids: vec![] }));
+        }
+        let mut items = Vec::with_capacity(req.items.len());
+        for it in req.items {
+            if it.key.is_empty() {
+                return Err(Status::invalid_argument("key is required"));
+            }
+            if it.text.is_empty() {
+                return Err(Status::invalid_argument("text is required"));
+            }
+            let emb = if it.embedding.is_empty() {
+                self.embedder
+                    .embed(&it.text)
+                    .map_err(|e| Status::internal(format!("embed: {e}")))?
+            } else {
+                it.embedding
+            };
+            if emb.len() != self.dim {
+                return Err(Status::invalid_argument(format!(
+                    "embedding has dim {}, server expects {}",
+                    emb.len(),
+                    self.dim
+                )));
+            }
+            items.push((it.key, it.text, emb));
+        }
+        let ids = self
+            .memory
+            .remember_batch(items)
+            .map_err(|e| Status::internal(format!("remember_batch: {e}")))?;
+        Ok(Response::new(RememberBatchResponse { ids }))
     }
 
     async fn recall(
@@ -571,6 +610,27 @@ mod tests {
             .into_inner();
         assert_eq!(resp.reclaimed, 3);
         assert_eq!(resp.tombstone_ratio, 0.0);
+    }
+
+    #[tokio::test]
+    async fn remember_batch_via_grpc() {
+        use proto::RememberItem;
+        let svc = DuxxService::new();
+        let items: Vec<RememberItem> = (0..20)
+            .map(|i| RememberItem {
+                key: "u".into(),
+                text: format!("note {i}"),
+                embedding: vec![],
+            })
+            .collect();
+        let ids = svc
+            .remember_batch(Request::new(RememberBatchRequest { items }))
+            .await
+            .unwrap()
+            .into_inner()
+            .ids;
+        assert_eq!(ids.len(), 20);
+        assert_eq!(svc.memory.len(), 20);
     }
 
     #[tokio::test]
