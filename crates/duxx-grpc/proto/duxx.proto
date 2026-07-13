@@ -38,6 +38,8 @@ message RememberRequest {
     string text = 2;
     // Optional. If empty, the server's configured embedder is used.
     repeated float embedding = 3;
+    // Optional idempotency key: a repeat within the TTL returns the original id.
+    string idempotency_key = 4;
 }
 
 message RememberResponse {
