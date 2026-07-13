@@ -528,6 +528,31 @@ for h in hits:
 gRPC carries the same via `RememberRequest` metadata fields and `RecallRequest`
 `filter_kind` / `filter_tags_any` / `filter_within_secs`.
 
+### 3.10 Usage-reinforced retention
+
+Write-time `importance` is only a *prior* — a guess the caller makes before
+knowing whether the memory turns out to be useful. DuxxDB reinforces it from
+behaviour: every `recall` that returns a row bumps its `access_count`, and
+cap-eviction ranks on a **utility** score, not raw importance:
+
+```text
+utility = effective_importance * (1 + access_count * recall_recency)
+```
+
+So a memory written with a modest `importance` that the agent keeps recalling
+will outlive a high-`importance` memory that is never actually used — a bad
+guess self-corrects instead of silently pinning dead weight. A never-recalled
+row scores exactly its `effective_importance`, so nothing changes until a row
+earns its keep. `access_count` is returned on every hit (gRPC / Python), so you
+can observe what the store is actually leaning on.
+
+Reinforcement is an in-memory signal (no storage write on the read path) and is
+on by default; disable it for a strictly read-only recall path:
+
+```python
+store.set_reinforce_on_recall(False)   # recall no longer mutates usage
+```
+
 ---
 
 ## 4. Configuration
@@ -663,7 +688,7 @@ Env vars override defaults but lose to explicit CLI flags:
 | **Native TLS** | ✅ Phase 6.2 | `--tls-cert PATH --tls-key PATH` on RESP and gRPC. rustls-backed. `redis-cli --tls` / `grpcurl` work. |
 | **mTLS (client cert auth)** | ✅ | Add `--tls-client-ca PATH` / `DUXX_TLS_CLIENT_CA` on RESP or gRPC. |
 | **Protocol resource limits** | ✅ | Configure RESP bulk, array, line, input-buffer, nesting, connection, and command-rate limits with CLI flags or `DUXX_MAX_*`. |
-| **Memory cap + eviction** | ✅ Phase 6.2 | `--max-memories N`. Lowest *effective* (decayed) importance row evicted on overflow. |
+| **Memory cap + eviction** | ✅ Phase 6.2 | `--max-memories N`. Lowest-*utility* row evicted on overflow — decayed importance reinforced by recall usage, so a frequently-recalled memory outlives an unused high-importance one (see §3.10). |
 | **Deletion-safe recall (compaction)** | ✅ | Auto-rebuilds the HNSW + BM25 indices when the tombstone ratio crosses 0.20 (configurable); also `COMPACT` (RESP), `compact()` (Python/MCP/gRPC). Metrics: `duxx_resp_memory_compactions`, `duxx_resp_memory_tombstone_ratio`. |
 | Multi-tenancy | ⚠ no isolation in process | One `--storage dir:./tenant-X` daemon per tenant for now |
 | Multi-tenant shared daemon | ⚠ core RESP only | Tenant-scoped `DUXX_AUTH_KEYS` namespace memory/session keys and cost filters for tenant-safe commands. Extended Phase 7 registries should still run per tenant until full row-level isolation lands. |

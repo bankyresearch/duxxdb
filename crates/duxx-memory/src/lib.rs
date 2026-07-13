@@ -71,6 +71,10 @@ pub struct Memory {
     pub tags: Vec<String>,
     /// Optional provenance: where this memory came from (source id / URL).
     pub provenance: Option<String>,
+    /// Times this memory has been returned by `recall` (usage reinforcement).
+    pub access_count: u64,
+    /// Wall-clock of the last recall (Unix-epoch ns; `0` = never recalled).
+    pub last_recalled_unix_ns: u128,
 }
 
 /// Optional metadata supplied to [`MemoryStore::remember_with`]. Everything is
@@ -146,6 +150,37 @@ impl Memory {
         let half = half_life.as_secs_f32().max(1e-3);
         self.importance * 2.0_f32.powf(-age_secs / half)
     }
+
+    /// Usage-reinforced retention score for eviction.
+    ///
+    /// Caller-supplied `importance` is only a *prior*. Actual retention is
+    /// reinforced by behaviour: each `recall` that returns this row bumps
+    /// `access_count` and `last_recalled_unix_ns`, and this score rewards that
+    /// use — decaying the reward as the last recall recedes (same half-life as
+    /// importance):
+    ///
+    /// ```text
+    /// utility = effective_importance * (1 + access_count * recall_recency)
+    /// recall_recency = 2^(-age_since_last_recall / half_life)   (0 if never recalled)
+    /// ```
+    ///
+    /// A never-recalled row has `utility == effective_importance`, so existing
+    /// importance-only behaviour is preserved exactly until a row earns its
+    /// keep. A low-`importance` row recalled repeatedly can outrank a
+    /// high-`importance` row that is never used — so a bad write-time guess
+    /// self-corrects instead of failing silently.
+    pub fn utility(&self, half_life: Duration) -> f32 {
+        let base = self.effective_importance(half_life);
+        if self.access_count == 0 || self.last_recalled_unix_ns == 0 {
+            return base;
+        }
+        let now = now_unix_ns();
+        let age_ns = now.saturating_sub(self.last_recalled_unix_ns);
+        let age_secs = age_ns as f32 / 1.0e9;
+        let half = half_life.as_secs_f32().max(1e-3);
+        let recall_recency = 2.0_f32.powf(-age_secs / half);
+        base * (1.0 + self.access_count as f32 * recall_recency)
+    }
 }
 
 /// Recall result — a memory paired with its (decayed) score.
@@ -197,6 +232,9 @@ struct Inner {
     /// Optional retention window. When set, rows older than this are purged on
     /// write (and reclaimable via `compact`). `None` = keep forever.
     retention: RwLock<Option<Duration>>,
+    /// Whether `recall` reinforces returned rows (bumps usage → utility).
+    /// Default `true`. Disable for a strictly read-only recall path.
+    reinforce_on_recall: RwLock<bool>,
 }
 
 impl Drop for Inner {
@@ -238,6 +276,12 @@ struct StoredMemory {
     tags: Vec<String>,
     #[serde(default)]
     provenance: Option<String>,
+    // Usage reinforcement (Phase: usage-reinforced utility). `#[serde(default)]`
+    // so rows written before this shipped restore as never-recalled.
+    #[serde(default)]
+    access_count: u64,
+    #[serde(default)]
+    last_recalled_unix_ns: u128,
 }
 
 impl From<&Memory> for StoredMemory {
@@ -252,6 +296,8 @@ impl From<&Memory> for StoredMemory {
             kind: m.kind.clone(),
             tags: m.tags.clone(),
             provenance: m.provenance.clone(),
+            access_count: m.access_count,
+            last_recalled_unix_ns: m.last_recalled_unix_ns,
         }
     }
 }
@@ -281,6 +327,7 @@ impl MemoryStore {
                 idempotency: RwLock::new(HashMap::new()),
                 idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
                 retention: RwLock::new(None),
+                reinforce_on_recall: RwLock::new(true),
             }),
         }
     }
@@ -330,6 +377,8 @@ impl MemoryStore {
                 kind: stored.kind,
                 tags: stored.tags,
                 provenance: stored.provenance,
+                access_count: stored.access_count,
+                last_recalled_unix_ns: stored.last_recalled_unix_ns,
             };
             store.inner.by_id.write().insert(id, mem);
             if id > max_id {
@@ -362,6 +411,7 @@ impl MemoryStore {
             idempotency: RwLock::new(HashMap::new()),
             idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
             retention: RwLock::new(None),
+            reinforce_on_recall: RwLock::new(true),
         });
         tracing::info!(memories = n, "loaded memories from storage");
         Ok(MemoryStore { inner })
@@ -528,9 +578,11 @@ impl MemoryStore {
         }
     }
 
-    /// If the store is over its `max_rows` cap, evict the lowest
-    /// effective-importance rows until back at the cap. No-op when
-    /// no cap is set or the store is already under it.
+    /// If the store is over its `max_rows` cap, evict the lowest-**utility**
+    /// rows until back at the cap. Utility folds usage reinforcement into the
+    /// importance prior (see [`Memory::utility`]), so a frequently-recalled row
+    /// with a modest write-time `importance` outlives a high-`importance` row
+    /// that is never used. No-op when no cap is set or already under it.
     fn enforce_cap(&self) {
         let cap = match *self.inner.max_rows.read() {
             Some(c) => c,
@@ -542,14 +594,13 @@ impl MemoryStore {
         }
         let half_life = *self.inner.evict_half_life.read();
 
-        // Snapshot (id, effective_importance) under the read lock,
-        // then sort ascending. We drop the read lock before forget()
-        // takes the write lock.
+        // Snapshot (id, utility) under the read lock, then sort ascending.
+        // We drop the read lock before forget() takes the write lock.
         let mut scored: Vec<(u64, f32)> = {
             let by_id = self.inner.by_id.read();
             by_id
                 .values()
-                .map(|m| (m.id, m.effective_importance(half_life)))
+                .map(|m| (m.id, m.utility(half_life)))
                 .collect()
         };
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -727,6 +778,8 @@ impl MemoryStore {
             kind: meta.kind,
             tags: meta.tags,
             provenance: meta.provenance,
+            access_count: 0,
+            last_recalled_unix_ns: 0,
         };
         // Write through to durable storage BEFORE inserting into the
         // in-memory cache. If the persistence write fails, we don't
@@ -799,6 +852,8 @@ impl MemoryStore {
                 kind: None,
                 tags: Vec::new(),
                 provenance: None,
+                access_count: 0,
+                last_recalled_unix_ns: 0,
             })
             .collect();
 
@@ -945,6 +1000,8 @@ impl MemoryStore {
                 kind: stored.kind,
                 tags: stored.tags,
                 provenance: stored.provenance,
+                access_count: stored.access_count,
+                last_recalled_unix_ns: stored.last_recalled_unix_ns,
             };
             by_id.insert(id, mem);
             if id > max_id {
@@ -976,12 +1033,28 @@ impl MemoryStore {
             idempotency: RwLock::new(HashMap::new()),
             idempotency_ttl: RwLock::new(DEFAULT_IDEMPOTENCY_TTL),
             retention: RwLock::new(None),
+            reinforce_on_recall: RwLock::new(true),
         });
         Ok(MemoryStore { inner })
     }
 
     /// Hybrid recall (vector + BM25, RRF-fused).
     pub fn recall(
+        &self,
+        key: &str,
+        query_text: &str,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        let out = self.recall_raw(key, query_text, query_vec, k)?;
+        self.reinforce(out.iter().map(|h| h.memory.id));
+        Ok(out)
+    }
+
+    /// Hybrid recall without usage reinforcement — the shared core of
+    /// [`recall`] and [`recall_decayed`] so a reranked call reinforces the
+    /// final `k` rows exactly once, not its wider candidate set.
+    fn recall_raw(
         &self,
         _key: &str,
         query_text: &str,
@@ -1002,6 +1075,35 @@ impl MemoryStore {
             }
         }
         Ok(out)
+    }
+
+    /// Record that `ids` were just recalled: bump `access_count` and stamp
+    /// `last_recalled_unix_ns`. This is what makes the utility score behavioural
+    /// — a row that earns recalls is retained even if its write-time importance
+    /// was a low guess. In-memory only (a hot signal, not a durable write), so
+    /// it never turns a read into a storage round-trip; counts reset to their
+    /// last persisted value (0) on process restart. No-op when disabled via
+    /// [`set_reinforce_on_recall`](Self::set_reinforce_on_recall). Takes only a
+    /// brief `by_id` write lock and holds no other lock, so it cannot invert
+    /// the recall/compact ordering.
+    fn reinforce<I: IntoIterator<Item = u64>>(&self, ids: I) {
+        if !*self.inner.reinforce_on_recall.read() {
+            return;
+        }
+        let now = now_unix_ns();
+        let mut by_id = self.inner.by_id.write();
+        for id in ids {
+            if let Some(m) = by_id.get_mut(&id) {
+                m.access_count = m.access_count.saturating_add(1);
+                m.last_recalled_unix_ns = now;
+            }
+        }
+    }
+
+    /// Enable/disable usage reinforcement on recall (default: enabled). Disable
+    /// for a strictly read-only recall path with no `by_id` write lock.
+    pub fn set_reinforce_on_recall(&self, enabled: bool) {
+        *self.inner.reinforce_on_recall.write() = enabled;
     }
 
     /// Hybrid recall restricted by a structured [`RecallFilter`] over metadata
@@ -1031,6 +1133,10 @@ impl MemoryStore {
                 });
             }
         }
+        drop(by_id);
+        drop(t);
+        drop(v);
+        self.reinforce(out.iter().map(|h| h.memory.id));
         Ok(out)
     }
 
@@ -1046,7 +1152,7 @@ impl MemoryStore {
         k: usize,
         half_life: std::time::Duration,
     ) -> Result<Vec<MemoryHit>> {
-        let mut hits = self.recall(key, query_text, query_vec, k * 2)?;
+        let mut hits = self.recall_raw(key, query_text, query_vec, k * 2)?;
         for h in &mut hits {
             h.score *= h.memory.effective_importance(half_life);
         }
@@ -1056,6 +1162,7 @@ impl MemoryStore {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         hits.truncate(k);
+        self.reinforce(hits.iter().map(|h| h.memory.id));
         Ok(hits)
     }
 }
@@ -1172,6 +1279,74 @@ mod tests {
         assert!(
             s.inner.by_id.read().contains_key(&vip),
             "high-importance memory must survive eviction"
+        );
+    }
+
+    #[test]
+    fn usage_reinforced_memory_survives_over_unused_high_importance() {
+        // The write-time importance guess self-corrects: a modest-importance
+        // row that gets recalled repeatedly outranks a high-importance row that
+        // is never actually used, so eviction keeps what the agent relies on.
+        const DIM: usize = 8;
+        let s = MemoryStore::new(DIM);
+        s.set_eviction_half_life(std::time::Duration::from_secs(3600));
+        // Cap of 1: the next insert forces exactly one eviction (lowest utility).
+        s.set_max_rows(Some(1));
+
+        // A modest-importance "workhorse" (importance defaults to 1.0)...
+        let workhorse = s
+            .remember("u", "workhorse note", embed("workhorse", DIM))
+            .unwrap();
+        // ...that the agent recalls again and again — each recall reinforces it.
+        for _ in 0..10 {
+            let hits = s
+                .recall("u", "workhorse", &embed("workhorse", DIM), 5)
+                .unwrap();
+            assert!(hits.iter().any(|h| h.memory.id == workhorse));
+        }
+
+        // A high-importance memory that is never recalled. Inserting it trips
+        // the cap, so the lowest-utility row is evicted on the spot.
+        let vip = s
+            .remember_with(
+                "u",
+                "vip note",
+                embed("vip", DIM),
+                MemoryMeta {
+                    importance: Some(5.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let live = s.inner.by_id.read();
+        assert!(
+            live.contains_key(&workhorse),
+            "a low-importance memory recalled many times must survive eviction"
+        );
+        assert!(
+            !live.contains_key(&vip),
+            "a high-importance memory never recalled must be the one evicted"
+        );
+        assert!(
+            live.get(&workhorse).unwrap().access_count >= 10,
+            "recalls must be recorded as usage"
+        );
+    }
+
+    #[test]
+    fn reinforcement_can_be_disabled() {
+        const DIM: usize = 8;
+        let s = MemoryStore::new(DIM);
+        s.set_reinforce_on_recall(false);
+        let id = s.remember("u", "note", embed("note", DIM)).unwrap();
+        for _ in 0..5 {
+            s.recall("u", "note", &embed("note", DIM), 5).unwrap();
+        }
+        assert_eq!(
+            s.inner.by_id.read().get(&id).unwrap().access_count,
+            0,
+            "disabled reinforcement must not mutate usage"
         );
     }
 
@@ -1663,6 +1838,8 @@ mod tests {
             kind: None,
             tags: Vec::new(),
             provenance: None,
+            access_count: 0,
+            last_recalled_unix_ns: 0,
         };
         let eff = m.effective_importance(std::time::Duration::from_secs(60 * 60));
         assert!(eff < 1e-10, "expected near-zero decay, got {eff}");

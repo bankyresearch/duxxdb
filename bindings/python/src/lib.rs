@@ -213,6 +213,7 @@ impl MemoryStore {
                 kind: h.memory.kind,
                 tags: h.memory.tags,
                 provenance: h.memory.provenance,
+                access_count: h.memory.access_count,
             })
             .collect())
     }
@@ -245,6 +246,15 @@ impl MemoryStore {
             .set_retention(seconds.map(|s| Duration::from_secs_f64(s.max(0.0))));
     }
 
+    /// Enable/disable usage reinforcement on ``recall`` (default: enabled). When
+    /// enabled, each recall bumps the returned rows' ``access_count`` so a
+    /// frequently-used memory resists eviction even if its write-time
+    /// ``importance`` was low. Disable for strictly read-only recall.
+    /// New in duxxdb v0.4.1.
+    fn set_reinforce_on_recall(&self, enabled: bool) {
+        self.inner.set_reinforce_on_recall(enabled);
+    }
+
     /// Stable keyset pagination over all memories, ordered by id. Start with
     /// ``cursor=0``. Returns ``(next_cursor, hits)`` where ``next_cursor`` is
     /// ``None`` once the scan is exhausted; the scan is stable across
@@ -267,6 +277,7 @@ impl MemoryStore {
                 kind: m.kind,
                 tags: m.tags,
                 provenance: m.provenance,
+                access_count: m.access_count,
             })
             .collect();
         (next, hits)
@@ -387,6 +398,8 @@ struct MemoryHit {
     tags: Vec<String>,
     #[pyo3(get)]
     provenance: Option<String>,
+    #[pyo3(get)]
+    access_count: u64,
 }
 
 #[pymethods]

@@ -114,6 +114,8 @@ message MemoryHit {
     string kind = 6;
     repeated string tags = 7;
     string provenance = 8;
+    // Times this memory has been recalled (usage reinforcement). 0 for scans.
+    uint64 access_count = 9;
 }
 
 message SubscribeRequest {
