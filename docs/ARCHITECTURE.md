@@ -262,6 +262,11 @@ On reopen, if the on-disk indices match the row count they are loaded directly
 | gRPC | `duxx-grpc` (tonic) | Streaming `Subscribe`, gRPC health |
 | MCP stdio | `duxx-mcp` | Claude / Cline / any MCP agent |
 
+All three servers report a single **protocol version** (`duxx_core::PROTOCOL_VERSION`)
+— on RESP `HELLO` (`duxx_protocol`), gRPC `Stats` (`protocol_version`), and MCP
+`initialize` (`serverInfo.duxxProtocol`). Additive changes don't bump it; a
+breaking change to a stable command's wire shape does, with a deprecation window.
+
 ---
 
 ## 11. Reactive subscriptions (`duxx-reactive`)

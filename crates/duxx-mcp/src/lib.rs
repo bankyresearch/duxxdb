@@ -195,6 +195,8 @@ impl McpServer {
             "serverInfo": {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
+                // DuxxDB command-schema version (distinct from the MCP spec version).
+                "duxxProtocol": duxx_core::PROTOCOL_VERSION,
             },
             "capabilities": {
                 "tools": { "listChanged": false },
@@ -568,6 +570,10 @@ mod tests {
         );
         assert_eq!(resp["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert_eq!(resp["result"]["serverInfo"]["name"], SERVER_NAME);
+        assert_eq!(
+            resp["result"]["serverInfo"]["duxxProtocol"],
+            duxx_core::PROTOCOL_VERSION
+        );
     }
 
     #[test]
