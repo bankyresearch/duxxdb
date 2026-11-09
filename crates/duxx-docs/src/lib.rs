@@ -243,7 +243,7 @@ impl DocumentStore {
     /// carrying a citation to its source object.
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<SearchHit>> {
         let qvec = self.embedder.embed(query)?;
-        let hits = self.memory.recall("", query, &qvec, k)?;
+        let hits = self.memory.recall_all_keys(query, &qvec, k)?;
         let chunks = self.chunks.read();
         Ok(hits
             .into_iter()
