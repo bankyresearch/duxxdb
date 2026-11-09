@@ -13,7 +13,7 @@ pub mod tool_cache;
 
 use duxx_core::Result;
 use duxx_index::{TextIndex, VectorIndex};
-use duxx_query::{hybrid_recall_filtered, rrf_fuse, RecallHit, DEFAULT_RRF_K};
+use duxx_query::{hybrid_recall_scoped, rrf_fuse, RecallHit, DEFAULT_RRF_K};
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
 use duxx_storage::Storage;
 use parking_lot::RwLock;
@@ -1111,8 +1111,14 @@ impl MemoryStore {
             true
         };
         let keep = |id: u64| by_id.get(&id).map(in_scope).unwrap_or(false);
+        // Plain recall keeps the candidate depth of unscoped hybrid recall.
+        let per = if filter.is_some() {
+            (k * 8).max(128)
+        } else {
+            (k * 3).max(32)
+        };
         let mut hits: Vec<RecallHit> =
-            hybrid_recall_filtered(&v, &t, query_vec, query_text, k, &keep)?;
+            hybrid_recall_scoped(&v, &t, query_vec, query_text, k, per, &keep)?;
         if hits.len() < k && (key.is_some() || filter.is_some()) {
             let mut ranked: Vec<(u64, f32)> = by_id
                 .values()

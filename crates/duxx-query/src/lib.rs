@@ -94,7 +94,29 @@ pub fn hybrid_recall_filtered(
     k: usize,
     keep: &dyn Fn(u64) -> bool,
 ) -> Result<Vec<RecallHit>> {
-    let per = (k * 8).max(128);
+    hybrid_recall_scoped(
+        vector_index,
+        text_index,
+        query_vec,
+        query_text,
+        k,
+        (k * 8).max(128),
+        keep,
+    )
+}
+
+/// Hybrid recall that fetches `per` candidates from each index and keeps those
+/// `keep` accepts. Callers choose `per`; a filter that rejects most rows needs
+/// a larger one.
+pub fn hybrid_recall_scoped(
+    vector_index: &VectorIndex,
+    text_index: &TextIndex,
+    query_vec: &[f32],
+    query_text: &str,
+    k: usize,
+    per: usize,
+    keep: &dyn Fn(u64) -> bool,
+) -> Result<Vec<RecallHit>> {
     let v_hits: Vec<(u64, f32)> = vector_index
         .search(query_vec, per)
         .into_iter()
