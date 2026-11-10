@@ -13,7 +13,7 @@ pub mod tool_cache;
 
 use duxx_core::Result;
 use duxx_index::{TextIndex, VectorIndex};
-use duxx_query::{hybrid_recall, hybrid_recall_filtered, RecallHit};
+use duxx_query::{hybrid_recall_scoped, rrf_fuse, RecallHit, DEFAULT_RRF_K};
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
 use duxx_storage::Storage;
 use parking_lot::RwLock;
@@ -1038,7 +1038,7 @@ impl MemoryStore {
         Ok(MemoryStore { inner })
     }
 
-    /// Hybrid recall (vector + BM25, RRF-fused).
+    /// Hybrid recall (vector + BM25, RRF-fused) over the memories stored under `key`.
     pub fn recall(
         &self,
         key: &str,
@@ -1056,15 +1056,83 @@ impl MemoryStore {
     /// final `k` rows exactly once, not its wider candidate set.
     fn recall_raw(
         &self,
-        _key: &str,
+        key: &str,
         query_text: &str,
         query_vec: &[f32],
         k: usize,
     ) -> Result<Vec<MemoryHit>> {
+        self.recall_core(Some(key), query_text, query_vec, k, None)
+    }
+
+    /// Hybrid recall across every key, for callers that own the whole store
+    /// (such as the document store, which uses one key per document).
+    pub fn recall_all_keys(
+        &self,
+        query_text: &str,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        let out = self.recall_core(None, query_text, query_vec, k, None)?;
+        self.reinforce(out.iter().map(|h| h.memory.id));
+        Ok(out)
+    }
+
+    /// Shared recall path. `key` and `filter` are enforced on every candidate, so
+    /// a caller can never receive another key's rows.
+    ///
+    /// The indexes are global and return a fixed-size candidate list, which a
+    /// small key can be crowded out of. When too few candidates survive, the
+    /// vector ranking is redone directly over the rows in scope, so a key with
+    /// three memories in a store of millions still finds them. That scan is
+    /// O(rows) and only runs for selective scopes.
+    fn recall_core(
+        &self,
+        key: Option<&str>,
+        query_text: &str,
+        query_vec: &[f32],
+        k: usize,
+        filter: Option<&RecallFilter>,
+    ) -> Result<Vec<MemoryHit>> {
+        // Same lock order as `compact`: vector, text, by_id.
         let v = self.inner.vector_index.read();
         let t = self.inner.text_index.read();
-        let hits: Vec<RecallHit> = hybrid_recall(&v, &t, query_vec, query_text, k)?;
         let by_id = self.inner.by_id.read();
+        let in_scope = |m: &Memory| {
+            if let Some(key) = key {
+                if m.key != key {
+                    return false;
+                }
+            }
+            if let Some(filter) = filter {
+                if !filter.matches(m) {
+                    return false;
+                }
+            }
+            true
+        };
+        let keep = |id: u64| by_id.get(&id).map(in_scope).unwrap_or(false);
+        // Plain recall keeps the candidate depth of unscoped hybrid recall.
+        let per = if filter.is_some() {
+            (k * 8).max(128)
+        } else {
+            (k * 3).max(32)
+        };
+        let mut hits: Vec<RecallHit> =
+            hybrid_recall_scoped(&v, &t, query_vec, query_text, k, per, &keep)?;
+        if hits.len() < k && (key.is_some() || filter.is_some()) {
+            let mut ranked: Vec<(u64, f32)> = by_id
+                .values()
+                .filter(|m| in_scope(m))
+                .map(|m| (m.id, duxx_index::cosine(query_vec, &m.embedding)))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let text: Vec<(u64, f32)> = t
+                .search(query_text, (k * 8).max(128))
+                .into_iter()
+                .filter(|(id, _)| keep(*id))
+                .collect();
+            hits = rrf_fuse(vec![ranked, text], DEFAULT_RRF_K, k);
+        }
         let mut out = Vec::with_capacity(hits.len());
         for h in hits {
             if let Some(m) = by_id.get(&h.id) {
@@ -1111,31 +1179,13 @@ impl MemoryStore {
     /// returned `k` rows are all matching rather than a top-k trimmed to fewer.
     pub fn recall_filtered(
         &self,
-        _key: &str,
+        key: &str,
         query_text: &str,
         query_vec: &[f32],
         k: usize,
         filter: &RecallFilter,
     ) -> Result<Vec<MemoryHit>> {
-        // Acquire in the same order as `recall`/`compact` (vector, text, by_id)
-        // to avoid a lock-order inversion.
-        let v = self.inner.vector_index.read();
-        let t = self.inner.text_index.read();
-        let by_id = self.inner.by_id.read();
-        let keep = |id: u64| by_id.get(&id).map(|m| filter.matches(m)).unwrap_or(false);
-        let hits: Vec<RecallHit> = hybrid_recall_filtered(&v, &t, query_vec, query_text, k, &keep)?;
-        let mut out = Vec::with_capacity(hits.len());
-        for h in hits {
-            if let Some(m) = by_id.get(&h.id) {
-                out.push(MemoryHit {
-                    memory: m.clone(),
-                    score: h.score,
-                });
-            }
-        }
-        drop(by_id);
-        drop(t);
-        drop(v);
+        let out = self.recall_core(Some(key), query_text, query_vec, k, Some(filter))?;
         self.reinforce(out.iter().map(|h| h.memory.id));
         Ok(out)
     }
@@ -1164,6 +1214,72 @@ impl MemoryStore {
         hits.truncate(k);
         self.reinforce(hits.iter().map(|h| h.memory.id));
         Ok(hits)
+    }
+}
+
+#[cfg(test)]
+mod key_scope_tests {
+    use super::*;
+
+    const DIM: usize = 8;
+
+    fn vector(seed: u64) -> Vec<f32> {
+        (0..DIM)
+            .map(|i| ((seed + 1) as f32 * (i + 1) as f32).sin())
+            .collect()
+    }
+
+    #[test]
+    fn recall_never_returns_another_keys_rows() {
+        let s = MemoryStore::new(DIM);
+        s.remember("alice", "my wallet is blue", vector(1)).unwrap();
+        s.remember("bob", "my wallet is red", vector(1)).unwrap();
+
+        let hits = s.recall("alice", "wallet", &vector(1), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory.key, "alice");
+        assert!(s
+            .recall("nobody", "wallet", &vector(1), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn filtered_recall_is_scoped_to_the_key_too() {
+        let s = MemoryStore::new(DIM);
+        s.remember("alice", "my wallet", vector(1)).unwrap();
+        s.remember("bob", "my wallet", vector(1)).unwrap();
+        let hits = s
+            .recall_filtered("bob", "wallet", &vector(1), 10, &RecallFilter::default())
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory.key, "bob");
+    }
+
+    #[test]
+    fn a_small_key_is_found_when_a_large_key_fills_the_candidates() {
+        let s = MemoryStore::new(DIM);
+        for i in 0..600 {
+            s.remember("big", format!("wallet note {i}"), vector(i))
+                .unwrap();
+        }
+        s.remember("small", "unrelated words", vector(9_999))
+            .unwrap();
+
+        let hits = s.recall("small", "wallet", &vector(3), 5).unwrap();
+        assert_eq!(hits.len(), 1, "the only row in scope must come back");
+        assert_eq!(hits[0].memory.key, "small");
+    }
+
+    #[test]
+    fn recall_all_keys_spans_keys() {
+        let s = MemoryStore::new(DIM);
+        s.remember("a", "shared phrase", vector(1)).unwrap();
+        s.remember("b", "shared phrase", vector(1)).unwrap();
+        assert_eq!(
+            s.recall_all_keys("shared", &vector(1), 10).unwrap().len(),
+            2
+        );
     }
 }
 

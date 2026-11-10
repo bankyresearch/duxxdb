@@ -201,7 +201,10 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("DUXX_EMBEDDER").ok())
         .unwrap_or_else(|| "hash:32".to_string());
     let storage_spec = storage_spec.or_else(|| std::env::var("DUXX_STORAGE").ok());
-    let phase7_storage = phase7_storage.or_else(|| std::env::var("DUXX_PHASE7_STORAGE").ok());
+    let phase7_storage = resolve_phase7_storage(
+        phase7_storage.or_else(|| std::env::var("DUXX_PHASE7_STORAGE").ok()),
+        storage_spec.as_deref(),
+    );
 
     tracing::info!(
         version = duxx_server::SERVER_VERSION,
@@ -442,6 +445,19 @@ async fn main() -> anyhow::Result<()> {
 /// Parse a `--storage` spec and open the named byte-keyed backend.
 /// `dir:` is handled separately upstream because it constructs a
 /// full `MemoryStore` rather than a `Storage`.
+/// Lifecycle data (traces, prompts, datasets, evals, replays, costs) follows
+/// `--storage dir:<path>` into `<path>/phase7` unless a spec is given explicitly.
+/// `--phase7-storage memory` opts back out.
+fn resolve_phase7_storage(explicit: Option<String>, storage: Option<&str>) -> Option<String> {
+    explicit.or_else(|| {
+        let dir = storage?.strip_prefix("dir:")?;
+        Some(format!(
+            "dir:{}",
+            std::path::Path::new(dir).join("phase7").display()
+        ))
+    })
+}
+
 fn open_storage(spec: &str) -> anyhow::Result<Arc<dyn duxx_storage::Storage>> {
     let (kind, rest) = spec.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("storage spec must be 'kind:path' (e.g. 'redb:./data/duxx.redb')")
@@ -487,7 +503,8 @@ fn print_help() {
     println!("                         'off' to disable)");
     println!("  --phase7-storage SPEC  Persist Phase 7 primitives (trace / prompts /");
     println!("                         datasets / evals / replay / cost). New in v0.2.0.");
-    println!("                         Defaults to in-memory.");
+    println!("                         Defaults to <dir>/phase7 with --storage dir:<dir>,");
+    println!("                         otherwise in-memory. 'memory' opts out.");
     println!("  --max-bulk-bytes N     Max bytes in one RESP bulk string");
     println!("  --max-array-items N    Max items in one RESP array");
     println!("  --max-line-bytes N     Max bytes in one RESP line before CRLF");
@@ -525,4 +542,25 @@ fn print_help() {
     println!("     DUXX_MAX_BULK_BYTES, DUXX_MAX_ARRAY_ITEMS, DUXX_MAX_LINE_BYTES,");
     println!("     DUXX_MAX_INPUT_BUFFER_BYTES, DUXX_MAX_NESTING_DEPTH,");
     println!("     OPENAI_API_KEY, COHERE_API_KEY");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_phase7_storage;
+    use std::path::Path;
+
+    #[test]
+    fn phase7_follows_dir_storage_unless_told_otherwise() {
+        let expected = format!("dir:{}", Path::new("/data").join("phase7").display());
+        assert_eq!(
+            resolve_phase7_storage(None, Some("dir:/data")).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            resolve_phase7_storage(Some("memory".into()), Some("dir:/data")).as_deref(),
+            Some("memory")
+        );
+        assert_eq!(resolve_phase7_storage(None, Some("redb:/x.redb")), None);
+        assert_eq!(resolve_phase7_storage(None, None), None);
+    }
 }

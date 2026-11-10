@@ -948,7 +948,7 @@ impl Server {
 
         match cmd.as_str() {
             "PING" => self.cmd_ping(&args),
-            "HELLO" => self.cmd_hello(&args),
+            "HELLO" => self.cmd_hello(&args, auth),
             "AUTH" => self.cmd_auth(&args, auth),
             "COMMAND" => self.cmd_command(),
             "INFO" => self.cmd_info(),
@@ -1088,22 +1088,54 @@ impl Server {
         }
     }
 
-    fn cmd_hello(&self, _args: &[RespValue]) -> Response {
-        // Minimal HELLO reply: server info as a flat array.
-        // (Full RESP3 Map type would be richer; RESP2 array is fine for now.)
-        Response::Reply(RespValue::Array(vec![
-            RespValue::bulk("server"),
-            RespValue::bulk(SERVER_NAME),
-            RespValue::bulk("version"),
-            RespValue::bulk(SERVER_VERSION),
-            RespValue::bulk("proto"),
-            RespValue::Integer(2),
+    /// `HELLO [protover [AUTH user token] [SETNAME name]]`.
+    ///
+    /// Clients that ask for protocol 3 expect the reply as a map (redis-py 6+
+    /// does by default). All other replies are RESP2 types, which RESP3 clients
+    /// accept. Pub/sub still uses RESP2 message frames.
+    fn cmd_hello(&self, args: &[RespValue], auth: &mut security::AuthState) -> Response {
+        let proto = match args.get(1) {
+            None => 2,
+            Some(v) => match arg_string(v).and_then(|s| s.parse::<i64>().ok()) {
+                Some(p) if p == 2 || p == 3 => p,
+                _ => return Response::Reply(err("NOPROTO unsupported protocol version")),
+            },
+        };
+        let mut i = 2;
+        while i < args.len() {
+            let option = arg_string(&args[i]).map(|s| s.to_ascii_uppercase());
+            match option.as_deref() {
+                Some("AUTH") if i + 2 < args.len() => {
+                    let credentials = [args[i].clone(), args[i + 1].clone(), args[i + 2].clone()];
+                    if let Response::Reply(reply @ RespValue::Error(_)) =
+                        self.cmd_auth(&credentials, auth)
+                    {
+                        return Response::Reply(reply);
+                    }
+                    i += 3;
+                }
+                Some("SETNAME") if i + 1 < args.len() => i += 2,
+                _ => return Response::Reply(err("ERR syntax error in HELLO")),
+            }
+        }
+        let fields = vec![
+            (RespValue::bulk("server"), RespValue::bulk(SERVER_NAME)),
+            (RespValue::bulk("version"), RespValue::bulk(SERVER_VERSION)),
+            (RespValue::bulk("proto"), RespValue::Integer(proto)),
             // DuxxDB command-schema version (distinct from RESP `proto`).
-            RespValue::bulk("duxx_protocol"),
-            RespValue::Integer(duxx_core::PROTOCOL_VERSION as i64),
-            RespValue::bulk("mode"),
-            RespValue::bulk("standalone"),
-        ]))
+            (
+                RespValue::bulk("duxx_protocol"),
+                RespValue::Integer(duxx_core::PROTOCOL_VERSION as i64),
+            ),
+            (RespValue::bulk("mode"), RespValue::bulk("standalone")),
+            (RespValue::bulk("role"), RespValue::bulk("master")),
+            (RespValue::bulk("modules"), RespValue::Array(vec![])),
+        ];
+        Response::Reply(if proto == 3 {
+            RespValue::Map(fields)
+        } else {
+            RespValue::Array(fields.into_iter().flat_map(|(k, v)| [k, v]).collect())
+        })
     }
 
     fn cmd_command(&self) -> Response {
@@ -3724,6 +3756,61 @@ mod tests {
         let s = Server::new();
         let r = dispatch_array(&s, vec![RespValue::bulk("PING")]);
         assert_eq!(r, simple("PONG"));
+    }
+
+    #[test]
+    fn hello_3_replies_with_a_map_carrying_proto_3() {
+        let s = Server::new();
+        let r = dispatch_array(&s, vec![RespValue::bulk("HELLO"), RespValue::bulk("3")]);
+        let pairs = match r {
+            RespValue::Map(pairs) => pairs,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert!(pairs
+            .iter()
+            .any(|(k, v)| *k == RespValue::bulk("proto") && *v == RespValue::Integer(3)));
+
+        let mut wire = Vec::new();
+        RespValue::Map(vec![(RespValue::bulk("a"), RespValue::Integer(1))]).write_to(&mut wire);
+        assert_eq!(wire, b"%1\r\n$1\r\na\r\n:1\r\n");
+    }
+
+    #[test]
+    fn hello_rejects_unknown_protocols_and_options() {
+        let s = Server::new();
+        for args in [vec!["HELLO", "9"], vec!["HELLO", "3", "BOGUS"]] {
+            let r = dispatch_array(&s, args.into_iter().map(RespValue::bulk).collect());
+            assert!(matches!(r, RespValue::Error(_)), "got {r:?}");
+        }
+    }
+
+    #[test]
+    fn recall_over_resp_is_isolated_per_key() {
+        let s = Server::new();
+        for (key, text) in [("alice", "my wallet"), ("bob", "my wallet")] {
+            dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk(key),
+                    RespValue::bulk(text),
+                ],
+            );
+        }
+        let rows = |key: &str| match dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk(key),
+                RespValue::bulk("wallet"),
+                RespValue::bulk("10"),
+            ],
+        ) {
+            RespValue::Array(items) => items.len(),
+            other => panic!("expected array, got {other:?}"),
+        };
+        assert_eq!(rows("alice"), 1);
+        assert_eq!(rows("nobody"), 0);
     }
 
     #[test]

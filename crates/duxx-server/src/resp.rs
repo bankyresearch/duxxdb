@@ -121,6 +121,8 @@ pub enum RespValue {
     Integer(i64),
     BulkString(Vec<u8>),
     Array(Vec<RespValue>),
+    /// RESP3 map. Only sent to clients that asked for protocol 3 with `HELLO 3`.
+    Map(Vec<(RespValue, RespValue)>),
     Null,
 }
 
@@ -161,6 +163,15 @@ impl RespValue {
                 out.extend_from_slice(items.len().to_string().as_bytes());
                 out.extend_from_slice(b"\r\n");
                 for v in items {
+                    v.write_to(out);
+                }
+            }
+            RespValue::Map(pairs) => {
+                out.push(b'%');
+                out.extend_from_slice(pairs.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                for (k, v) in pairs {
+                    k.write_to(out);
                     v.write_to(out);
                 }
             }
