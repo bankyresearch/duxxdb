@@ -394,7 +394,7 @@ impl McpServer {
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
         let qvec = self
             .embedder
-            .embed(query)
+            .embed_query(query)
             .map_err(|e| internal(format!("embed: {e}")))?;
         if qvec.len() != self.dim {
             return Err(internal(format!(

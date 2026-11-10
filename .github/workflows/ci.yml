@@ -82,6 +82,15 @@ jobs:
       - name: cargo clippy --workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The in-process model code (Candle) is behind features that the
+      # workspace build above leaves off; lint it too so it keeps
+      # compiling. The model tests themselves download ~1 GB and are
+      # #[ignore]d — see crates/duxx-embed/README.md.
+      - name: cargo clippy (local models)
+        run: >
+          cargo clippy -p duxx-embed -p duxx-rerank -p duxx-server --all-targets
+          --features duxx-server/local-models -- -D warnings
+
   # -----------------------------------------------------------------
   # Supply-chain guard: fail builds on known RustSec advisories.
   # -----------------------------------------------------------------

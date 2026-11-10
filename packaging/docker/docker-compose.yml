@@ -43,7 +43,17 @@ services:
     environment:
       DUXX_STORAGE: "dir:/var/lib/duxxdb"
       DUXX_PHASE7_STORAGE: "dir:/var/lib/duxxdb/phase7"
+      # Real multilingual embeddings / reranking, in-process:
+      #   DUXX_EMBEDDER=local:multilingual-e5-small  DUXX_RERANKER=local:mmarco-minilm-l12
+      # Weights download once into DUXX_MODEL_DIR (on this volume). An
+      # existing store refuses a different embedder: re-embed into a new
+      # volume (crates/duxx-embed/README.md, "Switching embedders").
+      # Each model needs ~0.75 GB resident (~1.1-1.5 GB while loading):
+      # with both, raise deploy.resources.limits.memory below to >= 2.5G.
+      # The first start downloads ~1 GB before the port opens.
       DUXX_EMBEDDER: "${DUXX_EMBEDDER:-hash:32}"
+      DUXX_RERANKER: "${DUXX_RERANKER-}"
+      DUXX_MODEL_DIR: "/var/lib/duxxdb/models"
       DUXX_TOKEN: "${DUXX_TOKEN:?DUXX_TOKEN is required for production. See .env.example.}"
       DUXX_AUTH_KEYS: "${DUXX_AUTH_KEYS-}"
       DUXX_AUDIT_LOG: "${DUXX_AUDIT_LOG-}"

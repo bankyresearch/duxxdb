@@ -1,0 +1,38 @@
+[package]
+name = "duxx-rerank"
+description = "Rerankers for DuxxDB — multilingual cross-encoders running in-process on Candle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Cross-encoder inference on Candle (pure Rust, CPU). Without it the
+# crate still provides the `Reranker` trait, `from_spec`, and the toy
+# `overlap` reranker, so callers can compile against it unconditionally.
+local = [
+    "dep:duxx-embed",
+    "duxx-embed/local",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:serde",
+]
+
+[dependencies]
+duxx-core.workspace = true
+tracing.workspace = true
+duxx-embed = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[[example]]
+name = "bench_models"
+required-features = ["local"]

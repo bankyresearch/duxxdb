@@ -242,7 +242,7 @@ impl DocumentStore {
     /// Hybrid search (vector + BM25 + RRF) across all ingested chunks, each hit
     /// carrying a citation to its source object.
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<SearchHit>> {
-        let qvec = self.embedder.embed(query)?;
+        let qvec = self.embedder.embed_query(query)?;
         let hits = self.memory.recall("", query, &qvec, k)?;
         let chunks = self.chunks.read();
         Ok(hits

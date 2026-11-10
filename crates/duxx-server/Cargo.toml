@@ -58,12 +58,22 @@ enable = true
 start = false
 restart-after-upgrade = true
 
+[features]
+default = []
+# In-process models on Candle (pure Rust, CPU): the `local:<model>`
+# embedder spec and cross-encoder reranking (RERANK, RECALL ... RERANK n).
+# The official Docker image builds with `local-models`.
+local-embed = ["duxx-embed/local"]
+local-rerank = ["duxx-rerank/local"]
+local-models = ["local-embed", "local-rerank"]
+
 [dependencies]
 duxx-core.workspace = true
 duxx-memory.workspace = true
 duxx-reactive.workspace = true
 duxx-storage.workspace = true
 duxx-embed = { workspace = true, features = ["http"] }
+duxx-rerank.workspace = true
 duxx-trace.workspace = true
 duxx-prompts.workspace = true
 duxx-datasets.workspace = true

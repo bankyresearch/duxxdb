@@ -41,6 +41,10 @@ impl Embedder for HashEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
+
+    fn id(&self) -> String {
+        format!("hash:{}", self.dim)
+    }
 }
 
 #[cfg(test)]

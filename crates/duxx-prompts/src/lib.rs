@@ -771,7 +771,7 @@ impl PromptRegistry {
         let query_vec = self
             .inner
             .embedder
-            .embed(query)
+            .embed_query(query)
             .map_err(|e| PromptError::Embed(e.to_string()))?;
         let raw = self.inner.vector_index.read().search(&query_vec, k);
         let id_to_key = self.inner.id_to_key.read();

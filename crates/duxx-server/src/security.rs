@@ -401,6 +401,7 @@ pub fn required_role(command: &str) -> Role {
         | "GET"
         | "RECALL"
         | "RECALL.FILTER"
+        | "RERANK"
         | "MEMORY.SCAN"
         | "SUBSCRIBE"
         | "UNSUBSCRIBE"

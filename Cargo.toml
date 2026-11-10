@@ -12,6 +12,7 @@ members = [
     "crates/duxx-cli",
     "crates/duxx-bench",
     "crates/duxx-embed",
+    "crates/duxx-rerank",
     "crates/duxx-grpc",
     "crates/duxx-coldtier",
     "crates/duxx-trace",
@@ -119,6 +120,7 @@ duxx-query = { path = "crates/duxx-query", version = "0.4.0" }
 duxx-memory = { path = "crates/duxx-memory", version = "0.4.0" }
 duxx-reactive = { path = "crates/duxx-reactive", version = "0.4.0" }
 duxx-embed = { path = "crates/duxx-embed", version = "0.4.0" }
+duxx-rerank = { path = "crates/duxx-rerank", version = "0.4.0" }
 duxx-trace = { path = "crates/duxx-trace", version = "0.4.0" }
 duxx-prompts = { path = "crates/duxx-prompts", version = "0.4.0" }
 duxx-datasets = { path = "crates/duxx-datasets", version = "0.4.0" }
@@ -131,6 +133,16 @@ duxx-docs = { path = "crates/duxx-docs", version = "0.4.0" }
 # HTTP client for OpenAI / Cohere embedders. rustls-tls = no OpenSSL native build,
 # blocking = sync API matches our embedder trait.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+
+# Local transformer inference (duxx-embed `local`, duxx-rerank `local`).
+# Candle is Hugging Face's pure-Rust tensor library: CPU kernels use the
+# `gemm` crate (NEON on aarch64, AVX on x86_64); no Python, no libtorch,
+# no ONNX runtime. `tokenizers` runs the models' own tokenizer.json;
+# `fancy-regex` keeps it pure Rust (no oniguruma C build).
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 # Durable storage backend. Pure Rust, ACID, MVCC, no FFI.
 redb = "2"
@@ -147,6 +159,15 @@ lto = "thin"
 codegen-units = 1
 debug = 1
 opt-level = 3
+
+# candle-transformers carries ~100 model implementations; DuxxDB uses two
+# (BERT, XLM-R), and their hot loops live in candle-core / gemm. Compiling
+# it with the profile above needs >1.5 GB per rustc and gets OOM-killed on
+# small build hosts, so build it cheaply — no measurable inference cost.
+[profile.release.package.candle-transformers]
+opt-level = 2
+codegen-units = 16
+debug = 0
 
 [profile.bench]
 lto = "thin"

@@ -100,4 +100,8 @@ impl Embedder for CohereEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
+
+    fn id(&self) -> String {
+        format!("cohere:{}", self.model)
+    }
 }

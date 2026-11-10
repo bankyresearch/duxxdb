@@ -3,7 +3,21 @@
 # Multi-stage:
 #   1. `builder`  — full Rust toolchain, builds release binaries.
 #   2. `runtime`  — minimal debian-slim with binaries + ca-certs
-#                  (so the OpenAI/Cohere HTTPS clients can verify TLS).
+#                  (so the OpenAI/Cohere HTTPS clients and the model
+#                  downloader can verify TLS).
+#
+# The image is built with the `local-models` feature: a multilingual
+# embedder (`local:multilingual-e5-small`) and cross-encoder reranker
+# (`local:mmarco-minilm-l12`) run in-process on Candle (pure Rust, CPU).
+# Weights download once, on first use, into DUXX_MODEL_DIR
+# (/var/lib/duxxdb/models — on the data volume, so restarts reuse them):
+#   docker run --rm -p 6379:6379 -v duxxdb-data:/var/lib/duxxdb \
+#     -e DUXX_STORAGE=dir:/var/lib/duxxdb \
+#     -e DUXX_EMBEDDER=local:multilingual-e5-small \
+#     -e DUXX_RERANKER=local:mmarco-minilm-l12 \
+#     duxxdb:latest
+# Changing the embedder of an existing store is refused; see
+# crates/duxx-embed/README.md ("Switching embedders").
 #
 # Build:
 #   docker build -t duxxdb:latest .
@@ -51,13 +65,15 @@ COPY rust-toolchain.toml* ./
 RUN cargo fetch
 
 # Build everything ops needs at runtime: RESP, gRPC, MCP, cold-tier export,
-# and offline snapshot/restore.
+# and offline snapshot/restore. `local-models` compiles the Candle
+# embedder + reranker into duxx-server (feature unification also gives
+# duxx-grpc / duxx-mcp the `local:` embedder spec).
 RUN cargo build --release \
       -p duxx-server \
       -p duxx-grpc \
       -p duxx-mcp \
       -p duxx-coldtier \
-      --features duxx-embed/http
+      --features duxx-embed/http,duxx-server/local-models
 
 # ---------------------------------------------------------------- runtime ----
 FROM debian:bookworm-slim AS runtime
@@ -84,8 +100,11 @@ RUN useradd --system --uid 10001 --home /var/lib/duxxdb --shell /usr/sbin/nologi
  && mkdir -p /var/lib/duxxdb /etc/duxxdb \
  && chown -R duxxdb:duxxdb /var/lib/duxxdb /etc/duxxdb
 
-# Default config; overrideable via -e at run time.
+# Default config; overrideable via -e at run time. The default embedder
+# stays hash:32 so existing deployments keep their vector space; opt in
+# to the real models with DUXX_EMBEDDER / DUXX_RERANKER.
 ENV DUXX_EMBEDDER=hash:32 \
+    DUXX_MODEL_DIR=/var/lib/duxxdb/models \
     RUST_LOG=info
 
 USER duxxdb
@@ -95,7 +114,9 @@ EXPOSE 6379 9100
 
 # HEALTHCHECK uses redis-cli PING; works pre-AUTH thanks to Phase 6.1
 # allowlist (PING is permitted before AUTH).
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+# The start period covers a first-run model download (~0.5 GB per
+# local model) before the listener opens.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=300s --retries=3 \
   CMD redis-cli -h 127.0.0.1 -p 6379 PING | grep -q PONG || exit 1
 
 # tini reaps zombies and forwards SIGTERM/SIGINT to duxx-server, which
