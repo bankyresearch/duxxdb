@@ -874,7 +874,7 @@ impl DatasetRegistry {
         let query_vec = self
             .inner
             .embedder
-            .embed(query)
+            .embed_query(query)
             .map_err(|e| DatasetError::Embed(e.to_string()))?;
         // Over-fetch when filtering.
         let fetch_k = if name_filter.is_some() { k * 5 } else { k };

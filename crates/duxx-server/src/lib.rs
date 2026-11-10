@@ -42,6 +42,7 @@ use duxx_replay::{
     InvocationKind as ReplayInvocationKind, OverrideKind as ReplayOverrideKind, ReplayInvocation,
     ReplayMode, ReplayOverride, ReplayRegistry,
 };
+use duxx_rerank::Reranker;
 use duxx_storage::Backend;
 use duxx_trace::{Span, SpanKind, SpanStatus, TraceSearch, TraceStore};
 use resp::RespValue;
@@ -83,6 +84,14 @@ pub struct Server {
     audit_trail: security::AuditTrail,
     embedder: Arc<dyn Embedder>,
     dim: usize,
+    /// Optional second-stage reranker (a cross-encoder) behind `RERANK`
+    /// and `RECALL … RERANK n`. `None` → those reply with an error.
+    reranker: Option<Arc<dyn Reranker>>,
+    /// True when commands may run a local model (in-process embedder or
+    /// reranker): the connection loop then runs dispatch through
+    /// `block_in_place` so long CPU-bound inference does not stall
+    /// other connections scheduled on the same tokio worker.
+    inference_offload: bool,
     /// Optional API-key catalog. When non-empty, every connection must
     /// `AUTH <token>` before any non-PING command. An empty catalog
     /// keeps localhost/demo mode unauthenticated.
@@ -166,8 +175,10 @@ impl Server {
             memory: MemoryStore::with_capacity(dim, 100_000),
             sessions: SessionStore::new(),
             audit_trail: security::AuditTrail::new(1000),
+            inference_offload: embedder.id().starts_with("local:"),
             embedder,
             dim,
+            reranker: None,
             auth: security::AuthCatalog::default(),
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
@@ -332,11 +343,15 @@ impl Server {
         }
 
         let embedder = self.embedder.clone();
+        // Set in the `dir:` branch; every other branch returns early.
+        let phase7_marker: Option<std::path::PathBuf>;
         let (backends, index_dirs): (Phase7Backends, Phase7IndexDirs) =
             if let Some(dir_spec) = trimmed.strip_prefix("dir:") {
                 let dir = std::path::PathBuf::from(dir_spec);
                 std::fs::create_dir_all(&dir)
                     .map_err(|e| anyhow::anyhow!("phase7-storage dir create: {e}"))?;
+                check_embedder_marker(&dir.join(EMBEDDER_MARKER), embedder.as_ref())?;
+                phase7_marker = Some(dir.join(EMBEDDER_MARKER));
                 let mk = |name: &str| -> anyhow::Result<Arc<dyn Backend>> {
                     let path = dir.join(name);
                     let spec = format!("redb:{}", path.display());
@@ -420,7 +435,23 @@ impl Server {
         self.costs =
             CostLedger::open_with_index_dir(embedder.clone(), costs_b, costs_hnsw_dir.as_deref())
                 .map_err(|e| anyhow::anyhow!("CostLedger::open: {e}"))?;
+        if let Some(marker) = phase7_marker {
+            write_embedder_marker(&marker, embedder.as_ref())?;
+        }
         Ok(self)
+    }
+
+    /// Attach a second-stage reranker, enabling `RERANK` and the
+    /// `RERANK n` option of `RECALL` / `RECALL.FILTER`.
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
+        self.inference_offload |= reranker.id().starts_with("local:");
+        self.reranker = Some(reranker);
+        self
+    }
+
+    /// Identity of the configured embedder (e.g. `hash:32`).
+    pub fn embedder_id(&self) -> String {
+        self.embedder.id()
     }
 
     /// Build with an embedder AND a durable storage backend (redb,
@@ -445,8 +476,10 @@ impl Server {
             memory,
             sessions: SessionStore::new(),
             audit_trail: security::AuditTrail::new(1000),
+            inference_offload: embedder.id().starts_with("local:"),
             embedder,
             dim,
+            reranker: None,
             auth: security::AuthCatalog::default(),
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
@@ -473,7 +506,12 @@ impl Server {
         dir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Self> {
         let dim = embedder.dim();
-        let memory = MemoryStore::open_at(dim, 100_000, dir)?;
+        let dir = dir.as_ref();
+        let marker = dir.join(EMBEDDER_MARKER);
+        check_embedder_marker(&marker, embedder.as_ref())?;
+        let memory = MemoryStore::open_at(dim, 100_000, dir)
+            .map_err(|e| explain_open_error(e, &marker, embedder.as_ref()))?;
+        write_embedder_marker(&marker, embedder.as_ref())?;
         let prompts = PromptRegistry::new(embedder.clone());
         let datasets = DatasetRegistry::new(embedder.clone());
         let evals = EvalRegistry::new(embedder.clone());
@@ -487,8 +525,10 @@ impl Server {
             memory,
             sessions: SessionStore::new(),
             audit_trail: security::AuditTrail::new(1000),
+            inference_offload: embedder.id().starts_with("local:"),
             embedder,
             dim,
+            reranker: None,
             auth: security::AuthCatalog::default(),
             active_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: None,
@@ -716,8 +756,17 @@ impl Server {
                                 return Ok(());
                             }
                         }
-                        let action =
-                            self.dispatch_with_auth_state(v, state.is_subscribed(), &mut auth);
+                        let subscribed = state.is_subscribed();
+                        let action = if self.inference_offload && runs_inference(&v) {
+                            // A local model can hold this thread for
+                            // tens to hundreds of ms; tell tokio so it
+                            // moves the worker's other tasks elsewhere.
+                            offload_blocking(|| {
+                                self.dispatch_with_auth_state(v, subscribed, &mut auth)
+                            })
+                        } else {
+                            self.dispatch_with_auth_state(v, subscribed, &mut auth)
+                        };
                         match action {
                             Response::Reply(value) => {
                                 value.write_to(&mut out);
@@ -962,6 +1011,7 @@ impl Server {
             "REMEMBER.META" => self.cmd_remember_meta(&args),
             "RECALL" => self.cmd_recall(&args),
             "RECALL.FILTER" => self.cmd_recall_filter(&args),
+            "RERANK" => self.cmd_rerank(&args),
             "MEMORY.SCAN" => self.cmd_scan(&args),
             "COMPACT" => self.cmd_compact(),
             "FORGET" => self.cmd_forget(&args),
@@ -1124,6 +1174,7 @@ impl Server {
             "REMEMBER.META",
             "RECALL",
             "RECALL.FILTER",
+            "RERANK",
             "MEMORY.SCAN",
             "COMPACT",
             "FORGET",
@@ -1199,7 +1250,12 @@ impl Server {
 
     fn cmd_info(&self) -> Response {
         let info = format!(
-            "# Server\r\nserver:{SERVER_NAME}\r\nversion:{SERVER_VERSION}\r\n# Stats\r\nmemories:{}\r\nsessions:{}\r\ndim:{}\r\n",
+            "# Server\r\nserver:{SERVER_NAME}\r\nversion:{SERVER_VERSION}\r\nembedder:{}\r\nreranker:{}\r\n# Stats\r\nmemories:{}\r\nsessions:{}\r\ndim:{}\r\n",
+            self.embedder.id(),
+            self.reranker
+                .as_ref()
+                .map(|r| r.id())
+                .unwrap_or_else(|| "none".to_string()),
             self.memory.len(),
             self.sessions.len(),
             self.dim
@@ -1466,16 +1522,15 @@ impl Server {
             Some(s) => s.to_string(),
             None => return Response::Reply(err("ERR REMEMBER.BATCH key must be a string")),
         };
-        let mut items: Vec<(String, String, Vec<f32>)> = Vec::with_capacity(args.len() - 2);
-        for a in &args[2..] {
-            let text = match arg_string(a) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            let emb = match self.embedder.embed(&text) {
-                Ok(v) => v,
-                Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
-            };
+        let texts: Vec<&str> = args[2..].iter().filter_map(arg_string).collect();
+        // One batched call: local models pad and run the whole batch
+        // through the network together instead of one text at a time.
+        let embs = match self.embedder.embed_batch(&texts) {
+            Ok(v) => v,
+            Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
+        };
+        let mut items: Vec<(String, String, Vec<f32>)> = Vec::with_capacity(texts.len());
+        for (text, emb) in texts.into_iter().zip(embs) {
             if emb.len() != self.dim {
                 return Response::Reply(err(format!(
                     "ERR embedder dim {} != server dim {}",
@@ -1483,7 +1538,7 @@ impl Server {
                     self.dim
                 )));
             }
-            items.push((key.clone(), text, emb));
+            items.push((key.clone(), text.to_string(), emb));
         }
         if items.is_empty() {
             return Response::Reply(err("ERR REMEMBER.BATCH text required"));
@@ -1604,7 +1659,7 @@ impl Server {
 
     fn cmd_recall(&self, args: &[RespValue]) -> Response {
         if args.len() < 3 {
-            return Response::Reply(err("ERR RECALL expects: key query [k]"));
+            return Response::Reply(err("ERR RECALL expects: key query [k] [RERANK n]"));
         }
         let key = match arg_string(&args[1]) {
             Some(s) => s,
@@ -1621,7 +1676,11 @@ impl Server {
         } else {
             10
         };
-        let qvec = match self.embedder.embed(query) {
+        let rerank_n = match self.rerank_option(args.get(4..).unwrap_or(&[]), k) {
+            Ok(n) => n,
+            Err(e) => return Response::Reply(e),
+        };
+        let qvec = match self.embedder.embed_query(query) {
             Ok(v) => v,
             Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
         };
@@ -1632,9 +1691,13 @@ impl Server {
                 self.dim
             )));
         }
-        let hits = match self.memory.recall(key, query, &qvec, k) {
+        let hits = match self.memory.recall(key, query, &qvec, rerank_n.unwrap_or(k)) {
             Ok(h) => h,
             Err(e) => return Response::Reply(err(format!("ERR {e}"))),
+        };
+        let hits = match self.apply_rerank(query, hits, k, rerank_n) {
+            Ok(h) => h,
+            Err(e) => return Response::Reply(e),
         };
         // Reply as an array of nested arrays: [id_int, score_str, text_str].
         let arr: Vec<RespValue> = hits
@@ -1656,7 +1719,9 @@ impl Server {
     /// only memories created within the last N seconds). Same reply as `RECALL`.
     fn cmd_recall_filter(&self, args: &[RespValue]) -> Response {
         if args.len() < 4 {
-            return Response::Reply(err("ERR RECALL.FILTER expects: key json_filter query [k]"));
+            return Response::Reply(err(
+                "ERR RECALL.FILTER expects: key json_filter query [k] [RERANK n]",
+            ));
         }
         let key = match arg_string(&args[1]) {
             Some(s) => s,
@@ -1679,6 +1744,10 @@ impl Server {
                 .unwrap_or(10)
         } else {
             10
+        };
+        let rerank_n = match self.rerank_option(args.get(5..).unwrap_or(&[]), k) {
+            Ok(n) => n,
+            Err(e) => return Response::Reply(e),
         };
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1704,7 +1773,7 @@ impl Server {
                 .map(|s| now_ns.saturating_sub((s * 1e9) as u128)),
             max_created_at_unix_ns: None,
         };
-        let qvec = match self.embedder.embed(query) {
+        let qvec = match self.embedder.embed_query(query) {
             Ok(v) => v,
             Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
         };
@@ -1715,9 +1784,17 @@ impl Server {
                 self.dim
             )));
         }
-        let hits = match self.memory.recall_filtered(key, query, &qvec, k, &filter) {
+        let hits =
+            match self
+                .memory
+                .recall_filtered(key, query, &qvec, rerank_n.unwrap_or(k), &filter)
+            {
+                Ok(h) => h,
+                Err(e) => return Response::Reply(err(format!("ERR {e}"))),
+            };
+        let hits = match self.apply_rerank(query, hits, k, rerank_n) {
             Ok(h) => h,
-            Err(e) => return Response::Reply(err(format!("ERR {e}"))),
+            Err(e) => return Response::Reply(e),
         };
         let arr: Vec<RespValue> = hits
             .into_iter()
@@ -1730,6 +1807,108 @@ impl Server {
             })
             .collect();
         Response::Reply(RespValue::Array(arr))
+    }
+
+    /// Parse the optional `RERANK n` tail of `RECALL` / `RECALL.FILTER`
+    /// (`rest` = the arguments after `k`). Returns how many first-stage
+    /// candidates to rerank (at least `k`, at most [`MAX_RERANK_DOCS`]),
+    /// or `None` when the option is absent. Other trailing arguments
+    /// are ignored, as before.
+    fn rerank_option(&self, rest: &[RespValue], k: usize) -> Result<Option<usize>, RespValue> {
+        let Some(pos) = rest
+            .iter()
+            .position(|a| arg_string(a).is_some_and(|s| s.eq_ignore_ascii_case("RERANK")))
+        else {
+            return Ok(None);
+        };
+        let n = match rest
+            .get(pos + 1)
+            .and_then(arg_string)
+            .map(str::parse::<usize>)
+        {
+            Some(Ok(n)) if n > 0 => n,
+            _ => return Err(err("ERR RERANK needs a positive candidate count n")),
+        };
+        if self.reranker.is_none() {
+            return Err(err(NO_RERANKER));
+        }
+        Ok(Some(n.max(k).min(MAX_RERANK_DOCS)))
+    }
+
+    /// Reorder first-stage hits by the reranker's score and keep the
+    /// best `k`. Each hit's `score` becomes the reranker score in `[0, 1]`.
+    fn apply_rerank(
+        &self,
+        query: &str,
+        hits: Vec<duxx_memory::MemoryHit>,
+        k: usize,
+        rerank_n: Option<usize>,
+    ) -> Result<Vec<duxx_memory::MemoryHit>, RespValue> {
+        if rerank_n.is_none() || hits.is_empty() {
+            return Ok(hits);
+        }
+        let Some(reranker) = self.reranker.as_ref() else {
+            return Err(err(NO_RERANKER));
+        };
+        let texts: Vec<&str> = hits.iter().map(|h| h.memory.text.as_str()).collect();
+        let ranked = reranker
+            .rerank(query, &texts, k)
+            .map_err(|e| err(format!("ERR rerank: {e}")))?;
+        let mut slots: Vec<Option<duxx_memory::MemoryHit>> = hits.into_iter().map(Some).collect();
+        Ok(ranked
+            .into_iter()
+            .filter_map(|(i, score)| {
+                slots.get_mut(i).and_then(Option::take).map(|mut h| {
+                    h.score = score;
+                    h
+                })
+            })
+            .collect())
+    }
+
+    /// `RERANK <query> <k> <doc> [doc ...]` — score each document's
+    /// relevance to `query` with the configured cross-encoder. Reply: up
+    /// to `k` `[index, score]` pairs, best first, where `index` is the
+    /// document's 0-based position in the call and `score` a string in
+    /// `[0, 1]`.
+    fn cmd_rerank(&self, args: &[RespValue]) -> Response {
+        if args.len() < 4 {
+            return Response::Reply(err("ERR RERANK expects: query k doc [doc ...]"));
+        }
+        let Some(reranker) = self.reranker.as_ref() else {
+            return Response::Reply(err(NO_RERANKER));
+        };
+        let query = match arg_string(&args[1]) {
+            Some(s) => s,
+            None => return Response::Reply(err("ERR RERANK query must be a string")),
+        };
+        let k = match arg_string(&args[2]).and_then(|s| s.parse::<usize>().ok()) {
+            Some(k) if k > 0 => k,
+            _ => return Response::Reply(err("ERR RERANK k must be a positive integer")),
+        };
+        let docs: Option<Vec<&str>> = args[3..].iter().map(arg_string).collect();
+        let Some(docs) = docs else {
+            return Response::Reply(err("ERR RERANK documents must be strings"));
+        };
+        if docs.len() > MAX_RERANK_DOCS {
+            return Response::Reply(err(format!(
+                "ERR RERANK accepts at most {MAX_RERANK_DOCS} documents per call"
+            )));
+        }
+        match reranker.rerank(query, &docs, k) {
+            Ok(ranked) => Response::Reply(RespValue::Array(
+                ranked
+                    .into_iter()
+                    .map(|(i, score)| {
+                        RespValue::Array(vec![
+                            RespValue::Integer(i as i64),
+                            RespValue::bulk(format!("{score:.6}")),
+                        ])
+                    })
+                    .collect(),
+            )),
+            Err(e) => Response::Reply(err(format!("ERR rerank: {e}"))),
+        }
     }
 
     // ---------------------------------------------------------------- DOC.* (documents)
@@ -2623,7 +2802,7 @@ impl Server {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        let qvec = match self.embedder.embed(query) {
+        let qvec = match self.embedder.embed_query(query) {
             Ok(v) => v,
             Err(e) => return Response::Reply(err(format!("ERR embed: {e}"))),
         };
@@ -3672,6 +3851,136 @@ fn push_pmessage(pattern: &str, channel: &str, event: &ChangeEvent) -> RespValue
 
 fn simple(s: &str) -> RespValue {
     RespValue::SimpleString(s.to_string())
+}
+
+/// Most documents one `RERANK` call (or `RECALL … RERANK n`) will score.
+pub const MAX_RERANK_DOCS: usize = 1000;
+
+const NO_RERANKER: &str = "ERR no reranker configured: start duxx-server with \
+     --reranker local:mmarco-minilm-l12 (or DUXX_RERANKER)";
+
+/// File recording which embedder wrote a persistent store's vectors.
+/// Lives inside `dir:` storage directories (and the Phase 7 directory);
+/// for `redb:<file>` storage it is `<file>.embedder.json`.
+pub const EMBEDDER_MARKER: &str = "embedder.json";
+
+/// Refuse to open a store whose marker names a different embedder (or
+/// dimension) than `embedder`. A missing marker passes: stores created
+/// before markers existed adopt the current embedder on first open,
+/// after the row-level dimension check has passed.
+pub fn check_embedder_marker(
+    marker: &std::path::Path,
+    embedder: &dyn Embedder,
+) -> anyhow::Result<()> {
+    let raw = match std::fs::read_to_string(marker) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => anyhow::bail!("read {}: {e}", marker.display()),
+    };
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("parse {}: {e}", marker.display()))?;
+    let old_id = v.get("embedder").and_then(|x| x.as_str()).unwrap_or("?");
+    let old_dim = v.get("dim").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let (new_id, new_dim) = (embedder.id(), embedder.dim());
+    if old_id == new_id && old_dim == new_dim {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "embedder mismatch: this store's vectors were written by `{old_id}` ({old_dim}-d) \
+         but the server is configured with `{new_id}` ({new_dim}-d). Vectors from different \
+         embedders are not comparable, so DuxxDB will not mix them. Either restart with the \
+         original embedder, or re-embed: start the new embedder on a new, empty storage \
+         directory and re-ingest (see crates/duxx-embed/README.md, \"Switching embedders\"). \
+         Marker file: {}",
+        marker.display()
+    )
+}
+
+/// Record `embedder` as the writer of the store at `marker` (no-op if
+/// the marker already exists — [`check_embedder_marker`] vetted it).
+pub fn write_embedder_marker(
+    marker: &std::path::Path,
+    embedder: &dyn Embedder,
+) -> anyhow::Result<()> {
+    if marker.exists() {
+        return Ok(());
+    }
+    let body = serde_json::json!({
+        "embedder": embedder.id(),
+        "dim": embedder.dim(),
+        "written_by": format!("duxxdb {SERVER_VERSION}"),
+    });
+    std::fs::write(marker, format!("{body:#}\n"))
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", marker.display()))
+}
+
+/// Turn a store-open failure caused by vectors of another dimension
+/// (a store from before markers, opened with a new embedder) into an
+/// actionable message.
+pub fn explain_open_error(
+    e: duxx_core::Error,
+    marker: &std::path::Path,
+    embedder: &dyn Embedder,
+) -> anyhow::Error {
+    let msg = e.to_string();
+    // Row check (duxx-memory) or HNSW dump check (duxx-index).
+    if msg.contains("but store expects") || msg.contains("persisted hnsw dim") {
+        anyhow::anyhow!(
+            "{msg}: the store was written by another embedder than `{}` ({}-d). \
+             Restart with the original embedder, or re-embed into a new, empty storage \
+             directory (see crates/duxx-embed/README.md, \"Switching embedders\"). \
+             Marker file (written once the store opens): {}",
+            embedder.id(),
+            embedder.dim(),
+            marker.display()
+        )
+    } else {
+        anyhow::Error::new(e)
+    }
+}
+
+/// Commands that never touch an embedder or reranker; everything else
+/// may run a local model and is offloaded when one is configured.
+fn runs_inference(v: &RespValue) -> bool {
+    let RespValue::Array(items) = v else {
+        return false;
+    };
+    let Some(name) = items.first().and_then(arg_string) else {
+        return false;
+    };
+    let name = name.to_ascii_uppercase();
+    !matches!(
+        name.as_str(),
+        "PING"
+            | "HELLO"
+            | "AUTH"
+            | "COMMAND"
+            | "INFO"
+            | "QUIT"
+            | "SET"
+            | "GET"
+            | "DEL"
+            | "MEMORY.SCAN"
+            | "FORGET"
+            | "FORGET.KEY"
+            | "FORGET.OLDER"
+            | "COMPACT"
+            | "SUBSCRIBE"
+            | "UNSUBSCRIBE"
+            | "PSUBSCRIBE"
+            | "PUNSUBSCRIBE"
+    ) && !name.starts_with("TRACE.")
+}
+
+/// Run CPU-heavy work on a multi-threaded tokio runtime without starving
+/// the worker's other tasks; runs inline anywhere else.
+fn offload_blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 fn err(s: impl Into<String>) -> RespValue {
@@ -5914,5 +6223,284 @@ mod tests {
             }
             other => panic!("expected array, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------ reranking + embedder markers
+
+    fn bulk_str(v: &RespValue) -> String {
+        match v {
+            RespValue::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+            other => panic!("expected bulk string, got {other:?}"),
+        }
+    }
+
+    fn with_overlap() -> Server {
+        Server::new().with_reranker(Arc::new(duxx_rerank::OverlapReranker))
+    }
+
+    #[test]
+    fn rerank_returns_index_score_pairs_best_first() {
+        let s = with_overlap();
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("RERANK"),
+                RespValue::bulk("kerala monsoon"),
+                RespValue::bulk("2"),
+                RespValue::bulk("the cat sat"),
+                RespValue::bulk("monsoon reaches kerala in june"),
+                RespValue::bulk("kerala tourism"),
+            ],
+        );
+        let RespValue::Array(items) = r else {
+            panic!("expected array, got {r:?}")
+        };
+        assert_eq!(items.len(), 2);
+        let RespValue::Array(first) = &items[0] else {
+            panic!()
+        };
+        assert_eq!(first[0], RespValue::Integer(1));
+        assert_eq!(bulk_str(&first[1]), "1.000000");
+        let RespValue::Array(second) = &items[1] else {
+            panic!()
+        };
+        assert_eq!(second[0], RespValue::Integer(2));
+        assert_eq!(bulk_str(&second[1]), "0.500000");
+    }
+
+    #[test]
+    fn rerank_errors_without_reranker_or_bad_args() {
+        let s = Server::new();
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("RERANK"),
+                RespValue::bulk("q"),
+                RespValue::bulk("1"),
+                RespValue::bulk("doc"),
+            ],
+        );
+        assert!(
+            matches!(&r, RespValue::Error(e) if e.contains("no reranker")),
+            "{r:?}"
+        );
+        let s = with_overlap();
+        for bad in [
+            vec!["RERANK", "q", "1"],
+            vec!["RERANK", "q", "0", "doc"],
+            vec!["RERANK", "q", "x", "doc"],
+        ] {
+            let r = dispatch_array(&s, bad.iter().map(|a| RespValue::bulk(*a)).collect());
+            assert!(matches!(r, RespValue::Error(_)), "{bad:?} -> {r:?}");
+        }
+    }
+
+    #[test]
+    fn recall_rerank_option_reorders_candidates() {
+        let s = with_overlap();
+        let texts = [
+            "refund policy for damaged items",
+            "shipping takes five days",
+            "lost wallet at the station",
+            "how to request a refund for a lost parcel",
+            "store opening hours",
+        ];
+        for t in texts {
+            dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("u"),
+                    RespValue::bulk(t),
+                ],
+            );
+        }
+        let query = "refund lost parcel";
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u"),
+                RespValue::bulk(query),
+                RespValue::bulk("2"),
+                RespValue::bulk("RERANK"),
+                RespValue::bulk("5"),
+            ],
+        );
+        let RespValue::Array(items) = r else {
+            panic!("expected array, got {r:?}")
+        };
+        assert_eq!(items.len(), 2, "k caps the reranked reply");
+        let RespValue::Array(top) = &items[0] else {
+            panic!()
+        };
+        assert_eq!(
+            bulk_str(&top[2]),
+            "how to request a refund for a lost parcel"
+        );
+        assert_eq!(bulk_str(&top[1]), "1.000000");
+
+        // Same through RECALL.FILTER.
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("RECALL.FILTER"),
+                RespValue::bulk("u"),
+                RespValue::bulk("{}"),
+                RespValue::bulk(query),
+                RespValue::bulk("1"),
+                RespValue::bulk("rerank"),
+                RespValue::bulk("5"),
+            ],
+        );
+        let RespValue::Array(items) = r else {
+            panic!("expected array, got {r:?}")
+        };
+        let RespValue::Array(top) = &items[0] else {
+            panic!()
+        };
+        assert_eq!(
+            bulk_str(&top[2]),
+            "how to request a refund for a lost parcel"
+        );
+
+        // A bad count and a missing reranker are reported, not ignored.
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u"),
+                RespValue::bulk(query),
+                RespValue::bulk("2"),
+                RespValue::bulk("RERANK"),
+            ],
+        );
+        assert!(matches!(r, RespValue::Error(_)), "{r:?}");
+        let plain = Server::new();
+        let r = dispatch_array(
+            &plain,
+            vec![
+                RespValue::bulk("RECALL"),
+                RespValue::bulk("u"),
+                RespValue::bulk(query),
+                RespValue::bulk("2"),
+                RespValue::bulk("RERANK"),
+                RespValue::bulk("5"),
+            ],
+        );
+        assert!(
+            matches!(&r, RespValue::Error(e) if e.contains("no reranker")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn info_reports_embedder_and_reranker() {
+        let r = dispatch_array(&with_overlap(), vec![RespValue::bulk("INFO")]);
+        let info = bulk_str(&r);
+        assert!(info.contains("embedder:hash:32\r\n"), "{info}");
+        assert!(info.contains("reranker:overlap\r\n"), "{info}");
+        let info = bulk_str(&dispatch_array(
+            &Server::new(),
+            vec![RespValue::bulk("INFO")],
+        ));
+        assert!(info.contains("reranker:none\r\n"), "{info}");
+    }
+
+    #[test]
+    fn remember_batch_embeds_in_one_batch() {
+        let s = Server::new();
+        let r = dispatch_array(
+            &s,
+            vec![
+                RespValue::bulk("REMEMBER.BATCH"),
+                RespValue::bulk("u"),
+                RespValue::bulk("alpha beta"),
+                RespValue::bulk("gamma"),
+            ],
+        );
+        let RespValue::Array(ids) = r else {
+            panic!("expected array, got {r:?}")
+        };
+        assert_eq!(ids.len(), 2);
+        assert_eq!(s.memory.len(), 2);
+    }
+
+    #[test]
+    fn persistent_store_refuses_a_different_embedder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let e32: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(32));
+        {
+            let s = Server::open_at(e32.clone(), &path).unwrap();
+            dispatch_array(
+                &s,
+                vec![
+                    RespValue::bulk("REMEMBER"),
+                    RespValue::bulk("u"),
+                    RespValue::bulk("hello world"),
+                ],
+            );
+        }
+        let marker = path.join(EMBEDDER_MARKER);
+        let body = std::fs::read_to_string(&marker).unwrap();
+        assert!(body.contains("\"embedder\": \"hash:32\""), "{body}");
+
+        // Different embedder → refused with the re-embed pointer.
+        let e16: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(16));
+        let msg = Server::open_at(e16.clone(), &path).unwrap_err().to_string();
+        assert!(msg.contains("embedder mismatch"), "{msg}");
+        assert!(msg.contains("hash:32") && msg.contains("hash:16"), "{msg}");
+        assert!(msg.contains("Switching embedders"), "{msg}");
+
+        // Same embedder → reopens with its data.
+        {
+            let s = Server::open_at(e32.clone(), &path).unwrap();
+            assert_eq!(s.memory.len(), 1);
+        }
+
+        // A store from before markers existed: the row-level dimension
+        // check fires and is explained; no wrong marker is written.
+        std::fs::remove_file(&marker).unwrap();
+        let msg = Server::open_at(e16, &path).unwrap_err().to_string();
+        assert!(msg.contains("Switching embedders"), "{msg}");
+        assert!(!marker.exists());
+        // Reopening with the original embedder adopts it.
+        {
+            let s = Server::open_at(e32, &path).unwrap();
+            assert_eq!(s.memory.len(), 1);
+        }
+        assert!(std::fs::read_to_string(&marker)
+            .unwrap()
+            .contains("hash:32"));
+    }
+
+    #[test]
+    fn phase7_dir_refuses_a_different_embedder() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = format!("dir:{}", dir.path().join("p7").display());
+        Server::new().with_phase7_storage(&spec).unwrap();
+        let other = Server::with_provider(Arc::new(HashEmbedder::new(8)));
+        let msg = other.with_phase7_storage(&spec).unwrap_err().to_string();
+        assert!(msg.contains("embedder mismatch"), "{msg}");
+    }
+
+    #[test]
+    fn only_model_commands_are_offloaded() {
+        let cmd = |name: &str| RespValue::Array(vec![RespValue::bulk(name), RespValue::bulk("x")]);
+        for c in [
+            "RERANK",
+            "RECALL",
+            "recall.filter",
+            "REMEMBER.BATCH",
+            "PROMPT.SEARCH",
+        ] {
+            assert!(runs_inference(&cmd(c)), "{c}");
+        }
+        for c in ["PING", "get", "MEMORY.SCAN", "TRACE.GET", "INFO"] {
+            assert!(!runs_inference(&cmd(c)), "{c}");
+        }
+        // Outside a multi-thread runtime the closure just runs inline.
+        assert_eq!(offload_blocking(|| 7), 7);
     }
 }

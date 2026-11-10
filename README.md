@@ -371,7 +371,8 @@ duxxdb/
 │   ├── duxx-query/            RRF, hybrid recall
 │   ├── duxx-memory/           MEMORY / TOOL_CACHE / SESSION + decay + compact
 │   ├── duxx-reactive/         ChangeBus pub/sub
-│   ├── duxx-embed/            hash + OpenAI + Cohere embedders
+│   ├── duxx-embed/            hash · local Candle (multilingual-e5) · OpenAI · Cohere
+│   ├── duxx-rerank/           cross-encoder reranking on Candle (RERANK)
 │   ├── duxx-trace/            agent trace store (Phase 7.1)
 │   ├── duxx-prompts/          versioned prompt registry (Phase 7.2)
 │   ├── duxx-datasets/         versioned eval datasets (Phase 7.3)

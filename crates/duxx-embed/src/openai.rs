@@ -113,4 +113,8 @@ impl Embedder for OpenAIEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
+
+    fn id(&self) -> String {
+        format!("openai:{}", self.model)
+    }
 }

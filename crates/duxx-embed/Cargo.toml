@@ -1,6 +1,6 @@
 [package]
 name = "duxx-embed"
-description = "Embedding providers for DuxxDB — hash (toy), OpenAI, Cohere."
+description = "Embedding providers for DuxxDB — hash (toy), local Candle models (multilingual-e5), OpenAI, Cohere."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,19 @@ openai = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 cohere = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 # Convenience: enable both HTTP providers.
 http = ["openai", "cohere"]
+# In-process transformer inference with Hugging Face Candle (pure Rust,
+# CPU). Adds the `local:<model>` embedder spec and the shared model
+# download/loading helpers that `duxx-rerank` builds on.
+local = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+]
 
 [dependencies]
 duxx-core.workspace = true
@@ -22,3 +35,8 @@ tracing.workspace = true
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }

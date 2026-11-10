@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mut addr = String::from("127.0.0.1:6379");
     let mut embedder_spec: Option<String> = None;
+    let mut reranker_spec: Option<String> = None;
     let mut storage_spec: Option<String> = None;
     let mut token: Option<String> = None;
     let mut auth_key_entries: Vec<String> = Vec::new();
@@ -65,6 +66,12 @@ async fn main() -> anyhow::Result<()> {
                 embedder_spec = Some(
                     args.next()
                         .ok_or_else(|| anyhow::anyhow!("--embedder needs a value"))?,
+                );
+            }
+            "--reranker" => {
+                reranker_spec = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--reranker needs a value"))?,
                 );
             }
             "--storage" | "-s" => {
@@ -200,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
     let embedder_spec = embedder_spec
         .or_else(|| std::env::var("DUXX_EMBEDDER").ok())
         .unwrap_or_else(|| "hash:32".to_string());
+    let reranker_spec = reranker_spec.or_else(|| std::env::var("DUXX_RERANKER").ok());
     let storage_spec = storage_spec.or_else(|| std::env::var("DUXX_STORAGE").ok());
     let phase7_storage = phase7_storage.or_else(|| std::env::var("DUXX_PHASE7_STORAGE").ok());
 
@@ -207,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         version = duxx_server::SERVER_VERSION,
         %addr,
         embedder = %embedder_spec,
+        reranker = ?reranker_spec,
         storage = ?storage_spec,
         phase7_storage = ?phase7_storage,
         "starting duxx-server"
@@ -224,16 +233,42 @@ async fn main() -> anyhow::Result<()> {
         Some(spec) if spec.starts_with("dir:") => {
             let path = &spec[4..];
             std::fs::create_dir_all(path)?;
-            duxx_server::Server::open_at(embedder, path)?
+            duxx_server::Server::open_at(embedder.clone(), path)?
         }
         // memory:_, redb:./file -- byte-keyed Storage; rows persist,
         // indices are rebuilt from rows on open.
         Some(spec) => {
+            // redb:<file> keeps its embedder marker beside the file.
+            let marker = spec
+                .strip_prefix("redb:")
+                .map(|f| std::path::PathBuf::from(format!("{f}.{}", duxx_server::EMBEDDER_MARKER)));
+            if let Some(m) = &marker {
+                duxx_server::check_embedder_marker(m, embedder.as_ref())?;
+            }
             let storage = open_storage(spec)?;
-            duxx_server::Server::with_provider_and_storage(embedder, storage)?
+            let server = duxx_server::Server::with_provider_and_storage(embedder.clone(), storage)
+                .map_err(|e| match (&marker, e.downcast::<duxx_core::Error>()) {
+                    (Some(m), Ok(core)) => {
+                        duxx_server::explain_open_error(core, m, embedder.as_ref())
+                    }
+                    (_, Ok(core)) => anyhow::Error::new(core),
+                    (_, Err(other)) => other,
+                })?;
+            if let Some(m) = &marker {
+                duxx_server::write_embedder_marker(m, embedder.as_ref())?;
+            }
+            server
         }
-        None => duxx_server::Server::with_provider(embedder),
+        None => duxx_server::Server::with_provider(embedder.clone()),
     };
+    tracing::info!(embedder = %embedder.id(), dim = embedder.dim(), "embedder ready");
+
+    if let Some(spec) = reranker_spec.as_deref() {
+        if let Some(r) = duxx_rerank::from_spec(Some(spec))? {
+            tracing::info!(reranker = %r.id(), "reranker ready");
+            server = server.with_reranker(Arc::from(r));
+        }
+    }
 
     if let Some(p7) = phase7_storage.as_deref() {
         server = server.with_phase7_storage(p7)?;
@@ -469,6 +504,8 @@ fn print_help() {
     println!("OPTIONS:");
     println!("  --addr HOST:PORT       Listen address       (default 127.0.0.1:6379)");
     println!("  --embedder SPEC        Embedder spec        (default hash:32)");
+    println!("  --reranker SPEC        Reranker for RERANK / RECALL ... RERANK n");
+    println!("                         (default none; e.g. local:mmarco-minilm-l12)");
     println!("  --storage SPEC         Storage backend      (default in-memory only)");
     println!("  --token TOKEN          Require AUTH <TOKEN> from every client");
     println!("                         (default: no auth -- localhost-only safe)");
@@ -504,6 +541,22 @@ fn print_help() {
     println!("  openai:text-embedding-3-small       requires OPENAI_API_KEY (1536-d)");
     println!("  openai:text-embedding-3-large       requires OPENAI_API_KEY (3072-d)");
     println!("  cohere:embed-english-v3.0           requires COHERE_API_KEY  (1024-d)");
+    println!("  local:multilingual-e5-small         in-process Candle model, 384-d, ~100");
+    println!("                                      languages; downloads once to DUXX_MODEL_DIR");
+    println!("                                      (needs the local-embed build feature)");
+    println!("  Changing the embedder of a persistent store is refused; re-embed into a");
+    println!("  new storage dir (crates/duxx-embed/README.md, \"Switching embedders\").");
+    println!();
+    println!("RERANKER SPECS:");
+    println!("  local:mmarco-minilm-l12[,max_tokens=N]  multilingual cross-encoder (default 128");
+    println!("                                      tokens per pair; needs local-rerank feature)");
+    println!(
+        "  local:mmarco-minilm-l6              6-layer variant, about 2x faster
+                                      (CPU-bound: rerank tens of candidates, not
+                                      hundreds; see crates/duxx-rerank/README.md)"
+    );
+    println!("  local:bge-reranker-base             larger XLM-R base cross-encoder");
+    println!("  overlap                             toy query-term overlap (tests/demos)");
     println!();
     println!("STORAGE SPECS:");
     println!("  memory:<ignored>                    in-memory only (lost on exit)");
@@ -524,5 +577,6 @@ fn print_help() {
     println!("     DUXX_MAX_MEMORIES,");
     println!("     DUXX_MAX_BULK_BYTES, DUXX_MAX_ARRAY_ITEMS, DUXX_MAX_LINE_BYTES,");
     println!("     DUXX_MAX_INPUT_BUFFER_BYTES, DUXX_MAX_NESTING_DEPTH,");
+    println!("     DUXX_RERANKER, DUXX_MODEL_DIR, DUXX_MODEL_OFFLINE, RAYON_NUM_THREADS,");
     println!("     OPENAI_API_KEY, COHERE_API_KEY");
 }

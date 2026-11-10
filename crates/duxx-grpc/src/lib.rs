@@ -362,7 +362,7 @@ impl Duxx for DuxxService {
         }
         let embedding = if req.embedding.is_empty() {
             self.embedder
-                .embed(&req.query)
+                .embed_query(&req.query)
                 .map_err(|e| Status::internal(format!("embed: {e}")))?
         } else {
             req.embedding
