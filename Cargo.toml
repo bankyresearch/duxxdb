@@ -106,10 +106,10 @@ tempfile = "3"
 # anywhere, and Spark/DuckDB/Polars all read it natively. Delta Lake
 # wrapping is a follow-up via the `deltalake` crate when we need
 # transaction-log / time-travel semantics.
-arrow = "53"
-arrow-array = "53"
-arrow-schema = "53"
-parquet = { version = "53", default-features = false, features = ["arrow", "snap"] }
+arrow = "60"
+arrow-array = "60"
+arrow-schema = "60"
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
 
 # Internal crates (consumed by siblings)
 duxx-core = { path = "crates/duxx-core", version = "0.4.0" }
