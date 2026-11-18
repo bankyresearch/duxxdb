@@ -31,7 +31,7 @@ members = [
 exclude = ["bindings/node"]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.75"
 authors = ["DuxxDB Contributors"]
@@ -112,21 +112,21 @@ arrow-schema = "60"
 parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
 
 # Internal crates (consumed by siblings)
-duxx-core = { path = "crates/duxx-core", version = "0.4.2" }
-duxx-storage = { path = "crates/duxx-storage", version = "0.4.2" }
-duxx-index = { path = "crates/duxx-index", version = "0.4.2" }
-duxx-query = { path = "crates/duxx-query", version = "0.4.2" }
-duxx-memory = { path = "crates/duxx-memory", version = "0.4.2" }
-duxx-reactive = { path = "crates/duxx-reactive", version = "0.4.2" }
-duxx-embed = { path = "crates/duxx-embed", version = "0.4.2" }
-duxx-trace = { path = "crates/duxx-trace", version = "0.4.2" }
-duxx-prompts = { path = "crates/duxx-prompts", version = "0.4.2" }
-duxx-datasets = { path = "crates/duxx-datasets", version = "0.4.2" }
-duxx-eval = { path = "crates/duxx-eval", version = "0.4.2" }
-duxx-replay = { path = "crates/duxx-replay", version = "0.4.2" }
-duxx-cost = { path = "crates/duxx-cost", version = "0.4.2" }
-duxx-token = { path = "crates/duxx-token", version = "0.4.2" }
-duxx-docs = { path = "crates/duxx-docs", version = "0.4.2" }
+duxx-core = { path = "crates/duxx-core", version = "0.4.3" }
+duxx-storage = { path = "crates/duxx-storage", version = "0.4.3" }
+duxx-index = { path = "crates/duxx-index", version = "0.4.3" }
+duxx-query = { path = "crates/duxx-query", version = "0.4.3" }
+duxx-memory = { path = "crates/duxx-memory", version = "0.4.3" }
+duxx-reactive = { path = "crates/duxx-reactive", version = "0.4.3" }
+duxx-embed = { path = "crates/duxx-embed", version = "0.4.3" }
+duxx-trace = { path = "crates/duxx-trace", version = "0.4.3" }
+duxx-prompts = { path = "crates/duxx-prompts", version = "0.4.3" }
+duxx-datasets = { path = "crates/duxx-datasets", version = "0.4.3" }
+duxx-eval = { path = "crates/duxx-eval", version = "0.4.3" }
+duxx-replay = { path = "crates/duxx-replay", version = "0.4.3" }
+duxx-cost = { path = "crates/duxx-cost", version = "0.4.3" }
+duxx-token = { path = "crates/duxx-token", version = "0.4.3" }
+duxx-docs = { path = "crates/duxx-docs", version = "0.4.3" }
 
 # HTTP client for OpenAI / Cohere embedders. rustls-tls = no OpenSSL native build,
 # blocking = sync API matches our embedder trait.
