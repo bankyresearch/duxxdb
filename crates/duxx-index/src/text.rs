@@ -11,19 +11,143 @@
 use duxx_core::{Error, Result};
 use parking_lot::Mutex;
 use std::path::Path;
+use std::str::CharIndices;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tantivy::{
     collector::TopDocs,
     directory::MmapDirectory,
     doc,
-    query::QueryParser,
-    schema::{Field, Schema, Value, FAST, INDEXED, STORED, TEXT},
-    Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument,
+    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    schema::{
+        Field, IndexRecordOption, Schema, TextFieldIndexing, Value, FAST, INDEXED, STORED, TEXT,
+    },
+    tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenStream, Tokenizer},
+    Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, TantivyError, Term,
 };
 
 /// Default insert count between forced commits.
 pub const DEFAULT_COMMIT_EVERY: usize = 100;
+
+/// Name under which the [`TextTokenizer::Words`] analyzer is registered.
+pub const WORDS_TOKENIZER: &str = "duxx_words";
+
+/// How the text field splits text into terms. Chosen with the
+/// `DUXX_TEXT_TOKENIZER` environment variable (see [`TextTokenizer::from_env`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextTokenizer {
+    /// tantivy's default analyzer, as in 0.4.2 and earlier: a word ends at
+    /// every character that is not alphanumeric, words of 40 bytes or more
+    /// are dropped, and words are lower-cased.
+    Default,
+    /// Words keep their combining marks and joiners. Indian scripts write
+    /// a virama (्), a nukta (़) and zero-width joiners inside words; the
+    /// default analyzer splits there, so "शिक्षा" is indexed as "शिक" and
+    /// "षा" and a query for either fragment matches it. Words up to 100
+    /// bytes are kept (an Indian-script letter takes three bytes in UTF-8,
+    /// so the default 40-byte limit dropped long Malayalam or Tamil words).
+    /// Latin text splits exactly as before.
+    Words,
+}
+
+impl TextTokenizer {
+    /// `DUXX_TEXT_TOKENIZER=words` selects [`TextTokenizer::Words`]; unset or
+    /// anything else keeps [`TextTokenizer::Default`].
+    pub fn from_env() -> Self {
+        match std::env::var("DUXX_TEXT_TOKENIZER") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("words") => TextTokenizer::Words,
+            _ => TextTokenizer::Default,
+        }
+    }
+
+    /// The tokenizer name stored in the index schema.
+    pub fn name(self) -> &'static str {
+        match self {
+            TextTokenizer::Default => "default",
+            TextTokenizer::Words => WORDS_TOKENIZER,
+        }
+    }
+}
+
+/// Whether `c` belongs inside a word for [`TextTokenizer::Words`]: letters
+/// and digits, every combining character of the Indian scripts (U+0900 to
+/// U+0DFF, apart from the danda, the double danda and the abbreviation
+/// sign, which end sentences and words), and the zero-width non-joiner and
+/// joiner (U+200C, U+200D).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || (('\u{0900}'..='\u{0DFF}').contains(&c)
+            && !matches!(c, '\u{0964}' | '\u{0965}' | '\u{0970}'))
+        || c == '\u{200C}'
+        || c == '\u{200D}'
+}
+
+/// Splits text into words made of [`is_word_char`] characters.
+#[derive(Clone, Default)]
+pub struct WordsTokenizer {
+    token: Token,
+}
+
+/// Token stream of [`WordsTokenizer`].
+pub struct WordsTokenStream<'a> {
+    text: &'a str,
+    chars: CharIndices<'a>,
+    token: &'a mut Token,
+}
+
+impl Tokenizer for WordsTokenizer {
+    type TokenStream<'a> = WordsTokenStream<'a>;
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> WordsTokenStream<'a> {
+        self.token.reset();
+        WordsTokenStream {
+            text,
+            chars: text.char_indices(),
+            token: &mut self.token,
+        }
+    }
+}
+
+impl WordsTokenStream<'_> {
+    fn search_token_end(&mut self) -> usize {
+        self.chars
+            .find(|(_, c)| !is_word_char(*c))
+            .map(|(offset, _)| offset)
+            .unwrap_or(self.text.len())
+    }
+}
+
+impl TokenStream for WordsTokenStream<'_> {
+    fn advance(&mut self) -> bool {
+        self.token.text.clear();
+        self.token.position = self.token.position.wrapping_add(1);
+        while let Some((offset_from, c)) = self.chars.next() {
+            if is_word_char(c) {
+                let offset_to = self.search_token_end();
+                self.token.offset_from = offset_from;
+                self.token.offset_to = offset_to;
+                self.token.text.push_str(&self.text[offset_from..offset_to]);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn token(&self) -> &Token {
+        self.token
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.token
+    }
+}
+
+/// The analyzer registered as [`WORDS_TOKENIZER`].
+pub fn words_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(WordsTokenizer::default())
+        .filter(RemoveLongFilter::limit(100))
+        .filter(LowerCaser)
+        .build()
+}
 
 /// BM25 full-text index, in-memory, Send + Sync.
 pub struct TextIndex {
@@ -50,7 +174,13 @@ impl TextIndex {
     }
 
     fn try_with(commit_every: usize) -> Result<Self> {
-        let (id_field, text_field, schema) = build_schema();
+        Self::in_ram_with(commit_every, TextTokenizer::from_env())
+    }
+
+    /// In-RAM index with an explicit tokenizer instead of the one
+    /// `DUXX_TEXT_TOKENIZER` names.
+    pub fn in_ram_with(commit_every: usize, tokenizer: TextTokenizer) -> Result<Self> {
+        let (id_field, text_field, schema) = build_schema(tokenizer);
         let index = Index::create_in_ram(schema);
         Self::from_index(index, id_field, text_field, commit_every)
     }
@@ -59,19 +189,72 @@ impl TextIndex {
     /// created if missing. Reopening an existing dir restores the
     /// previously written state — the writer queue is empty, so the
     /// caller can immediately commit new docs without rebuild.
+    ///
+    /// The tokenizer comes from `DUXX_TEXT_TOKENIZER`. When the index on
+    /// disk was built with another tokenizer, it is recreated empty: the
+    /// text index is derived from the rows, and `MemoryStore::open_at`
+    /// refills it from the row store because its count no longer matches.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_commit_every(dir, DEFAULT_COMMIT_EVERY)
     }
 
     pub fn open_with_commit_every(dir: impl AsRef<Path>, commit_every: usize) -> Result<Self> {
-        std::fs::create_dir_all(dir.as_ref())
+        Self::open_with(dir, commit_every, TextTokenizer::from_env())
+    }
+
+    /// [`TextIndex::open_with_commit_every`] with an explicit tokenizer.
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        commit_every: usize,
+        tokenizer: TextTokenizer,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)
             .map_err(|e| Error::Index(format!("create tantivy dir: {e}")))?;
-        let (id_field, text_field, schema) = build_schema();
-        let mmap = MmapDirectory::open(dir.as_ref())
-            .map_err(|e| Error::Index(format!("tantivy mmap dir: {e}")))?;
-        let index = Index::open_or_create(mmap, schema)
-            .map_err(|e| Error::Index(format!("tantivy open_or_create: {e}")))?;
+        let (id_field, text_field, schema) = build_schema(tokenizer);
+        let mmap =
+            MmapDirectory::open(dir).map_err(|e| Error::Index(format!("tantivy mmap dir: {e}")))?;
+        let index = match Index::open_or_create(mmap, schema.clone()) {
+            Ok(index) => index,
+            Err(TantivyError::SchemaError(why)) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    tokenizer = tokenizer.name(),
+                    "text index schema differs ({why}); recreating it empty to be refilled"
+                );
+                std::fs::remove_dir_all(dir)
+                    .map_err(|e| Error::Index(format!("remove old tantivy dir: {e}")))?;
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| Error::Index(format!("create tantivy dir: {e}")))?;
+                let mmap = MmapDirectory::open(dir)
+                    .map_err(|e| Error::Index(format!("tantivy mmap dir: {e}")))?;
+                Index::create(mmap, schema, tantivy::IndexSettings::default())
+                    .map_err(|e| Error::Index(format!("tantivy create: {e}")))?
+            }
+            Err(e) => return Err(Error::Index(format!("tantivy open_or_create: {e}"))),
+        };
         Self::from_index(index, id_field, text_field, commit_every)
+    }
+
+    /// The tokenizer the text field was built with.
+    pub fn tokenizer(&self) -> TextTokenizer {
+        let name = match self
+            .index
+            .schema()
+            .get_field_entry(self.text_field)
+            .field_type()
+        {
+            tantivy::schema::FieldType::Str(opts) => opts
+                .get_indexing_options()
+                .map(|i| i.tokenizer().to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        if name == WORDS_TOKENIZER {
+            TextTokenizer::Words
+        } else {
+            TextTokenizer::Default
+        }
     }
 
     fn from_index(
@@ -80,6 +263,10 @@ impl TextIndex {
         text_field: Field,
         commit_every: usize,
     ) -> Result<Self> {
+        // Registered on every index, so one built with either tokenizer opens.
+        index
+            .tokenizers()
+            .register(WORDS_TOKENIZER, words_analyzer());
         let writer: IndexWriter = index
             .writer(50_000_000)
             .map_err(|e| Error::Index(format!("tantivy writer: {e}")))?;
@@ -176,11 +363,18 @@ impl TextIndex {
         }
         let searcher = self.reader.searcher();
         let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
-        let parsed = match parser.parse_query(query) {
+        // Plain text often is not valid query syntax: a title with a colon
+        // ("arrested: …" reads as a field name) or an unbalanced bracket or
+        // quote failed to parse, and the text side of recall returned
+        // nothing. Such a query is searched as its words instead.
+        let parsed: Box<dyn Query> = match parser.parse_query(query) {
             Ok(q) => q,
             Err(e) => {
-                tracing::debug!("query parse failed: {e}");
-                return Vec::new();
+                tracing::debug!("query parse failed ({e}); searching its words");
+                match self.words_query(query) {
+                    Some(q) => q,
+                    None => return Vec::new(),
+                }
             }
         };
         let docs = match searcher.search(&parsed, &TopDocs::with_limit(k)) {
@@ -200,6 +394,27 @@ impl TextIndex {
             .collect()
     }
 
+    /// Any of the query's words, split by the field's own analyzer, scored
+    /// by BM25: what the query parser makes of plain words, without its
+    /// syntax. `None` when the query has no words.
+    fn words_query(&self, query: &str) -> Option<Box<dyn Query>> {
+        let mut analyzer = self.index.tokenizer_for_field(self.text_field).ok()?;
+        let mut stream = analyzer.token_stream(query);
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        while stream.advance() {
+            let term = Term::from_field_text(self.text_field, &stream.token().text);
+            clauses.push((
+                Occur::Should,
+                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+            ));
+        }
+        if clauses.is_empty() {
+            None
+        } else {
+            Some(Box::new(BooleanQuery::new(clauses)))
+        }
+    }
+
     /// Number of documents — auto-flushes pending writes first.
     pub fn len(&self) -> usize {
         if self.flush().is_err() {
@@ -217,11 +432,20 @@ impl TextIndex {
 }
 
 /// Build the canonical (id_field, text_field, schema) triple. Matches
-/// the on-disk schema so re-opens succeed.
-fn build_schema() -> (Field, Field, Schema) {
+/// the on-disk schema so re-opens succeed. With [`TextTokenizer::Default`]
+/// it is exactly the 0.4.2 schema, so existing indexes open unchanged.
+fn build_schema(tokenizer: TextTokenizer) -> (Field, Field, Schema) {
     let mut sb = Schema::builder();
     let id_field = sb.add_u64_field("id", STORED | INDEXED | FAST);
-    let text_field = sb.add_text_field("text", TEXT);
+    let text_options = match tokenizer {
+        TextTokenizer::Default => TEXT,
+        TextTokenizer::Words => TEXT.set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(WORDS_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        ),
+    };
+    let text_field = sb.add_text_field("text", text_options);
     let schema = sb.build();
     (id_field, text_field, schema)
 }
@@ -343,6 +567,106 @@ mod tests {
             let hits = idx.search("refund", 5);
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].0, 1);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "duxx-tantivy-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn words_of(text: &str) -> Vec<String> {
+        let mut analyzer = words_analyzer();
+        let mut stream = analyzer.token_stream(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn words_tokenizer_keeps_indian_words_whole() {
+        assert_eq!(words_of("शिक्षा विभाग"), vec!["शिक्षा", "विभाग"]);
+        assert_eq!(
+            words_of("प्रधानमंत्री आवास योजना।"),
+            vec!["प्रधानमंत्री", "आवास", "योजना"]
+        );
+        assert_eq!(words_of("ಕರ್ನಾಟಕ ಸರ್ಕಾರ"), vec!["ಕರ್ನಾಟಕ", "ಸರ್ಕಾರ"]);
+        assert_eq!(words_of("കേരള സർക്കാർ"), vec!["കേരള", "സർക്കാർ"]);
+    }
+
+    #[test]
+    fn words_tokenizer_splits_latin_text_as_before() {
+        assert_eq!(
+            words_of("Hello, happy tax-payer! RRB 2026"),
+            vec!["hello", "happy", "tax", "payer", "rrb", "2026"]
+        );
+    }
+
+    #[test]
+    fn words_index_matches_whole_words_not_fragments() {
+        let mut idx = TextIndex::in_ram_with(1, TextTokenizer::Words).unwrap();
+        idx.insert(1, "शिक्षा विभाग बिहार".into()).unwrap();
+        idx.insert(2, "weather today".into()).unwrap();
+        assert_eq!(idx.search("शिक्षा", 10).first().map(|h| h.0), Some(1));
+        assert!(idx.search("षा", 10).is_empty(), "a fragment is not a word");
+
+        // The default tokenizer, unchanged, splits at the virama
+        let mut old = TextIndex::in_ram_with(1, TextTokenizer::Default).unwrap();
+        old.insert(1, "शिक्षा विभाग बिहार".into()).unwrap();
+        assert_eq!(old.search("षा", 10).first().map(|h| h.0), Some(1));
+    }
+
+    #[test]
+    fn query_that_is_not_valid_syntax_searches_its_words() {
+        for tokenizer in [TextTokenizer::Default, TextTokenizer::Words] {
+            let mut idx = TextIndex::in_ram_with(1, tokenizer).unwrap();
+            idx.insert(1, "Thomas Markle arrested in Florida".into())
+                .unwrap();
+            idx.insert(2, "Faculty strength statistics".into()).unwrap();
+            idx.insert(3, "weather today".into()).unwrap();
+            let colon = idx.search("Thomas Markle arrested: Meghan", 10);
+            assert_eq!(colon.first().map(|h| h.0), Some(1), "{tokenizer:?}");
+            let bracket = idx.search("Faculty (strength statistics", 10);
+            assert_eq!(bracket.first().map(|h| h.0), Some(2), "{tokenizer:?}");
+            assert!(idx.search("((", 10).is_empty(), "{tokenizer:?}");
+        }
+    }
+
+    #[test]
+    fn reopening_with_another_tokenizer_recreates_the_index_empty() {
+        let dir = temp_dir("retokenize");
+        {
+            let mut idx = TextIndex::open_with(&dir, 1, TextTokenizer::Default).unwrap();
+            idx.insert(1, "शिक्षा विभाग".into()).unwrap();
+            idx.insert(2, "weather today".into()).unwrap();
+            assert_eq!(idx.len(), 2);
+            assert_eq!(idx.tokenizer(), TextTokenizer::Default);
+        }
+        {
+            // Same tokenizer: the documents are kept
+            let idx = TextIndex::open_with(&dir, 1, TextTokenizer::Default).unwrap();
+            assert_eq!(idx.len(), 2);
+        }
+        {
+            // Another tokenizer: emptied, for the caller to refill from its rows
+            let mut idx = TextIndex::open_with(&dir, 1, TextTokenizer::Words).unwrap();
+            assert_eq!(idx.len(), 0);
+            assert_eq!(idx.tokenizer(), TextTokenizer::Words);
+            idx.insert(1, "शिक्षा विभाग".into()).unwrap();
+        }
+        {
+            let idx = TextIndex::open_with(&dir, 1, TextTokenizer::Words).unwrap();
+            assert_eq!(idx.len(), 1);
+            assert_eq!(idx.search("शिक्षा", 5).first().map(|h| h.0), Some(1));
+            assert!(idx.search("षा", 5).is_empty());
         }
         std::fs::remove_dir_all(&dir).ok();
     }
