@@ -1180,11 +1180,12 @@ impl Server {
 
     fn cmd_info(&self) -> Response {
         let info = format!(
-            "# Server\r\nserver:{SERVER_NAME}\r\nversion:{SERVER_VERSION}\r\n# Stats\r\nmemories:{}\r\nsessions:{}\r\ndim:{}\r\nlean_rows:{}\r\n",
+            "# Server\r\nserver:{SERVER_NAME}\r\nversion:{SERVER_VERSION}\r\n# Stats\r\nmemories:{}\r\nsessions:{}\r\ndim:{}\r\nlean_rows:{}\r\ntext_tokenizer:{}\r\n",
             self.memory.len(),
             self.sessions.len(),
             self.dim,
-            u8::from(self.memory.is_lean())
+            u8::from(self.memory.is_lean()),
+            self.memory.text_tokenizer()
         );
         Response::Reply(RespValue::BulkString(info.into_bytes()))
     }

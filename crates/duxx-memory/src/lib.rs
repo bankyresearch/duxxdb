@@ -293,6 +293,13 @@ impl MemoryStore {
         self.inner.lean
     }
 
+    /// Name of the tokenizer the text index was built with: `default`, or
+    /// `duxx_words` when `DUXX_TEXT_TOKENIZER=words` (see
+    /// [`duxx_index::text::TextTokenizer`]).
+    pub fn text_tokenizer(&self) -> &'static str {
+        self.inner.text_index.read().tokenizer().name()
+    }
+
     /// The full row for a lean in-memory row: text and embedding read back
     /// from the row store. A row whose stored copy cannot be read comes back
     /// as it is in memory (with empty text), and the failure is logged.
