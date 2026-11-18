@@ -109,7 +109,7 @@ impl Tokenizer for WordsTokenizer {
 
 impl WordsTokenStream<'_> {
     fn search_token_end(&mut self) -> usize {
-        (&mut self.chars)
+        self.chars
             .find(|(_, c)| !is_word_char(*c))
             .map(|(offset, _)| offset)
             .unwrap_or(self.text.len())
