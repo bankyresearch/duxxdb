@@ -33,6 +33,16 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     fn is_empty(&self) -> Result<bool> {
         self.len().map(|n| n == 0)
     }
+    /// Visit every (id, bytes) pair without first collecting them all.
+    /// Order is unspecified. The default goes through [`Storage::iter`];
+    /// durable backends override it to stream, so opening a large store
+    /// never holds a second copy of every row in memory.
+    fn for_each(&self, f: &mut dyn FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
+        for (id, bytes) in self.iter()? {
+            f(id, &bytes)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +213,24 @@ mod redb_impl {
             Ok(out)
         }
 
+        fn for_each(&self, f: &mut dyn FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| Error::Storage(format!("redb read txn: {e}")))?;
+            let t = txn
+                .open_table(TABLE)
+                .map_err(|e| Error::Storage(format!("redb open_table: {e}")))?;
+            for entry in t
+                .iter()
+                .map_err(|e| Error::Storage(format!("redb iter: {e}")))?
+            {
+                let (k, v) = entry.map_err(|e| Error::Storage(format!("redb iter: {e}")))?;
+                f(k.value(), v.value())?;
+            }
+            Ok(())
+        }
+
         fn len(&self) -> Result<usize> {
             let txn = self
                 .db
@@ -245,6 +273,26 @@ mod tests {
         // Overwrite.
         s.put(2, b"BETA").unwrap();
         assert_eq!(s.get(2).unwrap(), Some(b"BETA".to_vec()));
+
+        // Streaming visit sees exactly what iter() sees.
+        s.put(3, b"gamma").unwrap();
+        let mut seen: Vec<(u64, Vec<u8>)> = Vec::new();
+        s.for_each(&mut |id, bytes| {
+            seen.push((id, bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        seen.sort_by_key(|(id, _)| *id);
+        assert_eq!(seen, vec![(2, b"BETA".to_vec()), (3, b"gamma".to_vec())]);
+
+        // An error from the visitor stops the walk and comes back out.
+        let mut calls = 0;
+        let r = s.for_each(&mut |_, _| {
+            calls += 1;
+            Err(Error::Storage("stop".into()))
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]
