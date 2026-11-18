@@ -145,6 +145,13 @@ impl TextIndex {
         Ok(())
     }
 
+    /// Change how many inserts may wait between commits. A bulk load sets a
+    /// large value (each commit writes a segment and syncs it), then puts the
+    /// normal value back.
+    pub fn set_commit_every(&mut self, commit_every: usize) {
+        self.commit_every = commit_every.max(1);
+    }
+
     /// Force-commit any pending writes. Idempotent.
     pub fn flush(&self) -> Result<()> {
         if self.pending.load(Ordering::SeqCst) == 0 {

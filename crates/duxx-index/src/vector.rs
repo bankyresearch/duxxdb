@@ -270,6 +270,13 @@ impl VectorIndex {
         self.inner.read().id_map.len()
     }
 
+    /// Every external id that has at least one node in the graph. Used on
+    /// open to add only the rows a loaded dump is missing, instead of
+    /// re-inserting rows it already holds.
+    pub fn ids(&self) -> std::collections::HashSet<u64> {
+        self.inner.read().id_map.iter().copied().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

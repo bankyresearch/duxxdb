@@ -42,6 +42,11 @@ pub const DEFAULT_AUTO_COMPACT_RATIO: f32 = 0.20;
 /// [`MemoryStore::compact`] is unaffected by this floor.
 const AUTO_COMPACT_MIN_LIVE: usize = 64;
 
+/// Inserts between tantivy commits while `open_at` reloads the text index
+/// (the normal [`duxx_index::text::DEFAULT_COMMIT_EVERY`] would commit, and
+/// write a segment, every hundred rows of a multi-million-row reload).
+const BULK_TEXT_COMMIT_EVERY: usize = 50_000;
+
 /// A single stored memory.
 #[derive(Debug, Clone)]
 pub struct Memory {
@@ -741,24 +746,39 @@ impl MemoryStore {
         let text_index = TextIndex::open(dir.join("tantivy"))?;
         let vector_index = VectorIndex::open(dim, capacity, dir.join("hnsw"))?;
 
-        // 2. Decide: do the indices already match the row store?
-        //    If yes, we can skip the rebuild. If not (fresh dir, missing
-        //    dump, or stale after a crash), full rebuild is the safe choice.
+        // 2. Bring each index in line with the row store, never by adding
+        //    rows it already holds (that duplicated every row on each
+        //    restart after a hard kill).
+        //    - Vectors: keep the loaded graph and insert only the rows it is
+        //      missing (rows written after the last dump, or every row when
+        //      there is no dump). Nodes whose row is gone are harmless:
+        //      recall drops ids that are not in `by_id`.
+        //    - Text: tantivy cannot be checked row by row cheaply, so when
+        //      its document count differs from the row count it is cleared
+        //      and reloaded, committing in large batches.
         let row_count = storage.len()?;
-        let indices_intact =
-            row_count > 0 && vector_index.len() == row_count && text_index.len() == row_count;
-
-        // 3. Walk the row store. Always rebuild `by_id` (it's not persisted
-        //    independently). Only re-insert into the indices if they're
-        //    NOT intact.
-        let mut by_id: HashMap<u64, Memory> = HashMap::with_capacity(row_count);
-        let mut max_id = 0u64;
         let mut text_index = text_index;
         let mut vector_index = vector_index;
+        let have_vector = vector_index.ids();
+        let text_count = text_index.len();
+        let rebuild_text = text_count != row_count;
+        if rebuild_text {
+            text_index.rebuild(&[])?;
+            text_index.set_commit_every(BULK_TEXT_COMMIT_EVERY);
+        }
+
+        // 3. Walk the row store once: rebuild `by_id` (never persisted on its
+        //    own) and fill whatever step 2 found missing.
+        let mut by_id: HashMap<u64, Memory> = HashMap::with_capacity(row_count);
+        let mut max_id = 0u64;
+        let mut vectors_added = 0usize;
         storage.for_each(&mut |id, bytes| {
             let stored = decode_stored(id, bytes, dim)?;
-            if !indices_intact {
+            if !have_vector.contains(&id) {
                 vector_index.insert(id, stored.embedding.clone())?;
+                vectors_added += 1;
+            }
+            if rebuild_text {
                 text_index.insert(id, stored.text.clone())?;
             }
             let mem = Memory::from_stored(id, stored);
@@ -766,19 +786,20 @@ impl MemoryStore {
             max_id = max_id.max(id);
             Ok(())
         })?;
-        if !indices_intact && row_count > 0 {
-            tracing::info!(
-                rows = row_count,
-                lean,
-                "rebuilt indices from row store (cold path)"
-            );
-        } else if indices_intact {
-            tracing::info!(
-                rows = row_count,
-                lean,
-                "skipped index rebuild (loaded from disk)"
-            );
+        drop(have_vector);
+        if rebuild_text {
+            text_index.flush()?;
+            text_index.set_commit_every(duxx_index::text::DEFAULT_COMMIT_EVERY);
         }
+        tracing::info!(
+            rows = row_count,
+            vectors_loaded = vector_index.len() - vectors_added,
+            vectors_added,
+            text_docs_before = text_count,
+            text_rebuilt = rebuild_text,
+            lean,
+            "opened memory store"
+        );
 
         let inner = Arc::new(Self::persistent_inner(
             dim,
@@ -1455,6 +1476,84 @@ mod tests {
                 .unwrap();
             assert_eq!(hits[0].memory.text, "Tracking number DX-002341");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn open_at_clears_a_text_index_that_does_not_match_the_rows() {
+        // A hard kill used to leave tantivy with more documents than rows, and
+        // every later open re-added every row on top. Now a mismatched text
+        // index is cleared and reloaded, and the vector graph is left alone.
+        const DIM: usize = 16;
+        let dir = std::env::temp_dir().join(format!("duxx-text-dupes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, false).unwrap();
+            for t in LEAN_TEXTS {
+                store.remember("web", t, embed(t, DIM)).unwrap();
+            }
+        }
+        // Simulate the old duplication: every row indexed twice.
+        {
+            let mut t = TextIndex::open(dir.join("tantivy")).unwrap();
+            for (i, text) in LEAN_TEXTS.iter().enumerate() {
+                t.insert(i as u64 + 1, text.to_string()).unwrap();
+            }
+            t.flush().unwrap();
+            assert_eq!(t.len(), LEAN_TEXTS.len() * 2);
+        }
+        let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, true).unwrap();
+        assert_eq!(store.inner.text_index.read().len(), LEAN_TEXTS.len());
+        assert_eq!(store.inner.vector_index.read().len(), LEAN_TEXTS.len());
+        let hits = store
+            .recall("web", "wallet", &embed("lost my wallet", DIM), 3)
+            .unwrap();
+        assert_eq!(hits[0].memory.text, "I lost my wallet at the cafe");
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn open_at_adds_only_the_vectors_a_dump_is_missing() {
+        // Rows written after the last HNSW dump (a hard kill) are added on
+        // open; rows the dump already holds are not inserted again.
+        const DIM: usize = 16;
+        let dir = std::env::temp_dir().join(format!("duxx-vec-missing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, false).unwrap();
+            for t in LEAN_TEXTS {
+                store.remember("web", t, embed(t, DIM)).unwrap();
+            }
+        } // graceful: the dump holds every row so far
+        let late = "Late row written after the dump";
+        {
+            let s = duxx_storage::RedbStorage::open(dir.join("store.redb")).unwrap();
+            let row = StoredMemory {
+                id: 100,
+                key: "web".into(),
+                text: late.into(),
+                embedding: embed(late, DIM),
+                importance: 1.0,
+                created_at_unix_ns: 1,
+            };
+            s.put(100, &bincode::serialize(&row).unwrap()).unwrap();
+        }
+        let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, false).unwrap();
+        assert_eq!(store.len(), LEAN_TEXTS.len() + 1);
+        assert_eq!(
+            store.inner.vector_index.read().len(),
+            LEAN_TEXTS.len() + 1,
+            "one vector added, none duplicated"
+        );
+        assert_eq!(store.inner.text_index.read().len(), LEAN_TEXTS.len() + 1);
+        let hits = store
+            .recall("web", "late row", &embed(late, DIM), 3)
+            .unwrap();
+        assert_eq!(hits[0].memory.id, 100);
+        drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }
 
