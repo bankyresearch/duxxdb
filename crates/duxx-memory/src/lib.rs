@@ -1336,19 +1336,36 @@ mod tests {
     #[test]
     fn lean_and_full_rank_identically() {
         // The same directory (same HNSW dump, same tantivy index) opened in full
-        // mode and in lean mode must return the same rows in the same order.
+        // mode and in lean mode must return the same rows with the same scores.
+        // Rows with equal scores come back in no fixed order (the fusion step
+        // does not break ties), so both sides are ordered by score, then id.
         const DIM: usize = 16;
         let dir = std::env::temp_dir().join(format!("duxx-lean-rank-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let queries = ["wallet cafe", "train Pune", "railway results", "blue"];
-        let summary = |s: &MemoryStore, q: &str| -> Vec<(u64, String, usize)> {
-            s.recall("web", q, &embed(q, DIM), 10)
+        type Row = (u64, String, usize, f32);
+        let summary = |s: &MemoryStore, q: &str| -> Vec<Row> {
+            let mut rows: Vec<Row> = s
+                .recall("web", q, &embed(q, DIM), 10)
                 .unwrap()
                 .into_iter()
-                .map(|h| (h.memory.id, h.memory.text, h.memory.embedding.len()))
-                .collect()
+                .map(|h| {
+                    (
+                        h.memory.id,
+                        h.memory.text,
+                        h.memory.embedding.len(),
+                        h.score,
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                b.3.partial_cmp(&a.3)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            rows
         };
-        let full_results: Vec<Vec<(u64, String, usize)>> = {
+        let full_results: Vec<Vec<Row>> = {
             let full = MemoryStore::open_at_opts(DIM, 1_000, &dir, false).unwrap();
             for i in 0..40 {
                 let t = format!("{} note {i}", LEAN_TEXTS[i % LEAN_TEXTS.len()]);
