@@ -484,7 +484,7 @@ fn print_help() {
     println!("     DUXX_AUTH_KEYS, DUXX_AUDIT_LOG, DUXX_MAX_CONNECTIONS,");
     println!("     DUXX_MAX_COMMANDS_PER_SEC,");
     println!("     DUXX_METRICS_ADDR, DUXX_TLS_CERT, DUXX_TLS_KEY, DUXX_TLS_CLIENT_CA,");
-    println!("     DUXX_MAX_MEMORIES,");
+    println!("     DUXX_MAX_MEMORIES, DUXX_LEAN_ROWS (1 = keep row text on disk, not in RAM),");
     println!("     DUXX_MAX_BULK_BYTES, DUXX_MAX_ARRAY_ITEMS, DUXX_MAX_LINE_BYTES,");
     println!("     DUXX_MAX_INPUT_BUFFER_BYTES, DUXX_MAX_NESTING_DEPTH,");
     println!("     OPENAI_API_KEY, COHERE_API_KEY");

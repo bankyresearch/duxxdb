@@ -122,6 +122,65 @@ struct Inner {
     /// Tombstone ratio at which `remember` auto-triggers `compact`.
     /// `None` disables auto-compaction. Default [`DEFAULT_AUTO_COMPACT_RATIO`].
     auto_compact_ratio: RwLock<Option<f32>>,
+    /// Lean rows: `by_id` keeps each row's metadata but not its text or
+    /// embedding, which stay in `storage` and are read back only for the
+    /// rows a caller receives. Only ever `true` together with `storage`.
+    /// See [`lean_rows_from_env`].
+    lean: bool,
+}
+
+/// Whether the `DUXX_LEAN_ROWS` environment variable asks for lean rows
+/// (`1`, `true`, `on` or `yes`). Off when unset.
+///
+/// With lean rows a persistent store keeps only each row's metadata in
+/// memory (id, key, importance, timestamps); the text and the embedding
+/// are read from the row store for the few rows a recall returns. The
+/// vector and text indices are unchanged, so ranking is identical. For a
+/// store of web pages this cuts the row map from several kilobytes per
+/// row to about a hundred bytes, at the cost of one row-store read per
+/// returned hit.
+pub fn lean_rows_from_env() -> bool {
+    std::env::var("DUXX_LEAN_ROWS")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Decode one persisted row and check its dimension.
+fn decode_stored(id: u64, bytes: &[u8], dim: usize) -> Result<StoredMemory> {
+    let stored: StoredMemory = bincode::deserialize(bytes)
+        .map_err(|e| duxx_core::Error::Storage(format!("decode memory id={id}: {e}")))?;
+    if stored.embedding.len() != dim {
+        return Err(duxx_core::Error::Storage(format!(
+            "memory id={id} has dim {} but store expects {dim}",
+            stored.embedding.len()
+        )));
+    }
+    Ok(stored)
+}
+
+impl Memory {
+    fn from_stored(id: u64, stored: StoredMemory) -> Self {
+        Memory {
+            id,
+            key: stored.key,
+            text: stored.text,
+            embedding: stored.embedding,
+            importance: stored.importance,
+            created_at_unix_ns: stored.created_at_unix_ns,
+        }
+    }
+
+    /// The same row without its text and embedding (lean-rows mode).
+    fn into_lean(mut self) -> Self {
+        self.text = String::new();
+        self.embedding = Vec::new();
+        self
+    }
 }
 
 impl Drop for Inner {
@@ -192,7 +251,76 @@ impl MemoryStore {
                 evictions_total: std::sync::atomic::AtomicU64::new(0),
                 compactions_total: std::sync::atomic::AtomicU64::new(0),
                 auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
+                lean: false,
             }),
+        }
+    }
+
+    /// The `Inner` of a store opened over durable storage.
+    fn persistent_inner(
+        dim: usize,
+        by_id: HashMap<u64, Memory>,
+        vector_index: VectorIndex,
+        text_index: TextIndex,
+        next_id: u64,
+        storage: Arc<dyn Storage>,
+        lean: bool,
+    ) -> Inner {
+        Inner {
+            dim,
+            by_id: RwLock::new(by_id),
+            vector_index: RwLock::new(vector_index),
+            text_index: RwLock::new(text_index),
+            next_id: RwLock::new(next_id),
+            bus: ChangeBus::default(),
+            storage: Some(storage),
+            max_rows: RwLock::new(None),
+            evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
+            evictions_total: std::sync::atomic::AtomicU64::new(0),
+            compactions_total: std::sync::atomic::AtomicU64::new(0),
+            auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
+            lean,
+        }
+    }
+
+    /// Whether rows are kept lean in memory (see [`lean_rows_from_env`]).
+    pub fn is_lean(&self) -> bool {
+        self.inner.lean
+    }
+
+    /// The full row for a lean in-memory row: text and embedding read back
+    /// from the row store. A row whose stored copy cannot be read comes back
+    /// as it is in memory (with empty text), and the failure is logged.
+    fn hydrate(&self, m: &Memory) -> Memory {
+        if !self.inner.lean {
+            return m.clone();
+        }
+        let Some(s) = &self.inner.storage else {
+            return m.clone();
+        };
+        match s.get(m.id) {
+            Ok(Some(bytes)) => match bincode::deserialize::<StoredMemory>(&bytes) {
+                Ok(stored) => Memory {
+                    id: m.id,
+                    key: m.key.clone(),
+                    text: stored.text,
+                    embedding: stored.embedding,
+                    importance: m.importance,
+                    created_at_unix_ns: m.created_at_unix_ns,
+                },
+                Err(e) => {
+                    tracing::warn!(id = m.id, error = %e, "lean rows: stored row did not decode");
+                    m.clone()
+                }
+            },
+            Ok(None) => {
+                tracing::warn!(id = m.id, "lean rows: row missing from storage");
+                m.clone()
+            }
+            Err(e) => {
+                tracing::warn!(id = m.id, error = %e, "lean rows: storage read failed");
+                m.clone()
+            }
         }
     }
 
@@ -208,67 +336,44 @@ impl MemoryStore {
     /// For persisted indices that skip the rebuild on graceful-shutdown
     /// reopens, use [`MemoryStore::open_at`] instead.
     pub fn with_storage(dim: usize, capacity: usize, storage: Arc<dyn Storage>) -> Result<Self> {
-        let store = Self::with_capacity(dim, capacity);
-        let rows = storage.iter()?;
+        Self::with_storage_opts(dim, capacity, storage, lean_rows_from_env())
+    }
+
+    /// [`MemoryStore::with_storage`] with lean rows chosen explicitly
+    /// instead of from `DUXX_LEAN_ROWS`.
+    ///
+    /// Rows are streamed from storage one at a time, so opening never holds
+    /// a second copy of every row in memory.
+    pub fn with_storage_opts(
+        dim: usize,
+        capacity: usize,
+        storage: Arc<dyn Storage>,
+        lean: bool,
+    ) -> Result<Self> {
+        let mut vector_index = VectorIndex::with_capacity(dim, capacity);
+        let mut text_index = TextIndex::new();
+        let mut by_id: HashMap<u64, Memory> = HashMap::with_capacity(storage.len().unwrap_or(0));
         let mut max_id = 0u64;
-        let n = rows.len();
-        for (id, bytes) in rows {
-            let stored: StoredMemory = bincode::deserialize(&bytes)
-                .map_err(|e| duxx_core::Error::Storage(format!("decode memory id={id}: {e}")))?;
-            if stored.embedding.len() != dim {
-                return Err(duxx_core::Error::Storage(format!(
-                    "memory id={id} has dim {} but store expects {dim}",
-                    stored.embedding.len()
-                )));
-            }
-            store
-                .inner
-                .vector_index
-                .write()
-                .insert(id, stored.embedding.clone())?;
-            store
-                .inner
-                .text_index
-                .write()
-                .insert(id, stored.text.clone())?;
-            let mem = Memory {
-                id,
-                key: stored.key,
-                text: stored.text,
-                embedding: stored.embedding,
-                importance: stored.importance,
-                created_at_unix_ns: stored.created_at_unix_ns,
-            };
-            store.inner.by_id.write().insert(id, mem);
-            if id > max_id {
-                max_id = id;
-            }
-        }
-        *store.inner.next_id.write() = max_id + 1;
-        // Now wire the storage into Inner so future writes flow through.
-        // We have to re-build Inner because Inner owns storage and we
-        // already started constructing without it.
-        let inner = Arc::new(Inner {
+        storage.for_each(&mut |id, bytes| {
+            let stored = decode_stored(id, bytes, dim)?;
+            vector_index.insert(id, stored.embedding.clone())?;
+            text_index.insert(id, stored.text.clone())?;
+            let mem = Memory::from_stored(id, stored);
+            by_id.insert(id, if lean { mem.into_lean() } else { mem });
+            max_id = max_id.max(id);
+            Ok(())
+        })?;
+        let n = by_id.len();
+        let inner = Arc::new(Self::persistent_inner(
             dim,
-            by_id: RwLock::new(std::mem::take(&mut *store.inner.by_id.write())),
-            vector_index: RwLock::new(std::mem::replace(
-                &mut *store.inner.vector_index.write(),
-                VectorIndex::new(dim),
-            )),
-            text_index: RwLock::new(std::mem::replace(
-                &mut *store.inner.text_index.write(),
-                TextIndex::new(),
-            )),
-            next_id: RwLock::new(*store.inner.next_id.read()),
-            bus: ChangeBus::default(),
-            storage: Some(storage),
-            max_rows: RwLock::new(None),
-            evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
-            evictions_total: std::sync::atomic::AtomicU64::new(0),
-            compactions_total: std::sync::atomic::AtomicU64::new(0),
-            auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
-        });
-        tracing::info!(memories = n, "loaded memories from storage");
+            by_id,
+            vector_index,
+            text_index,
+            max_id + 1,
+            storage,
+            lean,
+        ));
+        tracing::info!(memories = n, lean, "loaded memories from storage");
         Ok(MemoryStore { inner })
     }
 
@@ -444,9 +549,24 @@ impl MemoryStore {
             let by_id = self.inner.by_id.read();
             survivors_vec.reserve(by_id.len());
             survivors_text.reserve(by_id.len());
-            for m in by_id.values() {
-                survivors_vec.push((m.id, m.embedding.clone()));
-                survivors_text.push((m.id, m.text.clone()));
+            match (&self.inner.storage, self.inner.lean) {
+                // Lean rows: the text and embedding live only in storage.
+                (Some(s), true) => {
+                    s.for_each(&mut |id, bytes| {
+                        if by_id.contains_key(&id) {
+                            let stored = decode_stored(id, bytes, self.inner.dim)?;
+                            survivors_vec.push((id, stored.embedding));
+                            survivors_text.push((id, stored.text));
+                        }
+                        Ok(())
+                    })?;
+                }
+                _ => {
+                    for m in by_id.values() {
+                        survivors_vec.push((m.id, m.embedding.clone()));
+                        survivors_text.push((m.id, m.text.clone()));
+                    }
+                }
             }
         }
         let live = survivors_vec.len();
@@ -502,9 +622,14 @@ impl MemoryStore {
     /// Snapshot every memory as a Vec. Order is by id ascending.
     /// Used by the cold-tier exporter; the cost is O(n) clones.
     pub fn all_memories(&self) -> Vec<Memory> {
-        let by_id = self.inner.by_id.read();
-        let mut out: Vec<Memory> = by_id.values().cloned().collect();
+        let mut out: Vec<Memory> = {
+            let by_id = self.inner.by_id.read();
+            by_id.values().cloned().collect()
+        };
         out.sort_by_key(|m| m.id);
+        if self.inner.lean {
+            out = out.iter().map(|m| self.hydrate(m)).collect();
+        }
         out
     }
 
@@ -545,6 +670,11 @@ impl MemoryStore {
                 .map_err(|e| duxx_core::Error::Storage(format!("encode memory id={id}: {e}")))?;
             s.put(id, &bytes)?;
         }
+        let mem = if self.inner.lean {
+            mem.into_lean()
+        } else {
+            mem
+        };
         self.inner.by_id.write().insert(id, mem);
         // Publish a change event. Lossy by design — slow subscribers
         // may miss events. Channel = "memory.<key>", so `PSUBSCRIBE
@@ -586,6 +716,19 @@ impl MemoryStore {
     /// store when they disagree.
     #[cfg(feature = "redb-store")]
     pub fn open_at(dim: usize, capacity: usize, dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_at_opts(dim, capacity, dir, lean_rows_from_env())
+    }
+
+    /// [`MemoryStore::open_at`] with lean rows chosen explicitly instead of
+    /// from `DUXX_LEAN_ROWS`. Rows are streamed from the row store one at a
+    /// time, so opening never holds a second copy of every row in memory.
+    #[cfg(feature = "redb-store")]
+    pub fn open_at_opts(
+        dim: usize,
+        capacity: usize,
+        dir: impl AsRef<std::path::Path>,
+        lean: bool,
+    ) -> Result<Self> {
         use duxx_index::{TextIndex, VectorIndex};
 
         let dir = dir.as_ref();
@@ -608,60 +751,44 @@ impl MemoryStore {
         // 3. Walk the row store. Always rebuild `by_id` (it's not persisted
         //    independently). Only re-insert into the indices if they're
         //    NOT intact.
-        let mut by_id = HashMap::with_capacity(row_count);
+        let mut by_id: HashMap<u64, Memory> = HashMap::with_capacity(row_count);
         let mut max_id = 0u64;
-        let rows = storage.iter()?;
         let mut text_index = text_index;
         let mut vector_index = vector_index;
-        for (id, bytes) in rows {
-            let stored: StoredMemory = bincode::deserialize(&bytes)
-                .map_err(|e| duxx_core::Error::Storage(format!("decode memory id={id}: {e}")))?;
-            if stored.embedding.len() != dim {
-                return Err(duxx_core::Error::Storage(format!(
-                    "memory id={id} has dim {} but store expects {dim}",
-                    stored.embedding.len()
-                )));
-            }
+        storage.for_each(&mut |id, bytes| {
+            let stored = decode_stored(id, bytes, dim)?;
             if !indices_intact {
                 vector_index.insert(id, stored.embedding.clone())?;
                 text_index.insert(id, stored.text.clone())?;
             }
-            let mem = Memory {
-                id,
-                key: stored.key,
-                text: stored.text,
-                embedding: stored.embedding,
-                importance: stored.importance,
-                created_at_unix_ns: stored.created_at_unix_ns,
-            };
-            by_id.insert(id, mem);
-            if id > max_id {
-                max_id = id;
-            }
-        }
+            let mem = Memory::from_stored(id, stored);
+            by_id.insert(id, if lean { mem.into_lean() } else { mem });
+            max_id = max_id.max(id);
+            Ok(())
+        })?;
         if !indices_intact && row_count > 0 {
             tracing::info!(
                 rows = row_count,
+                lean,
                 "rebuilt indices from row store (cold path)"
             );
         } else if indices_intact {
-            tracing::info!(rows = row_count, "skipped index rebuild (loaded from disk)");
+            tracing::info!(
+                rows = row_count,
+                lean,
+                "skipped index rebuild (loaded from disk)"
+            );
         }
 
-        let inner = Arc::new(Inner {
+        let inner = Arc::new(Self::persistent_inner(
             dim,
-            by_id: RwLock::new(by_id),
-            vector_index: RwLock::new(vector_index),
-            text_index: RwLock::new(text_index),
-            next_id: RwLock::new(max_id + 1),
-            bus: ChangeBus::default(),
-            storage: Some(storage),
-            max_rows: RwLock::new(None),
-            evict_half_life: RwLock::new(Duration::from_secs(24 * 60 * 60)),
-            evictions_total: std::sync::atomic::AtomicU64::new(0),
-            compactions_total: std::sync::atomic::AtomicU64::new(0),
-            auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
-        });
+            by_id,
+            vector_index,
+            text_index,
+            max_id + 1,
+            storage,
+            lean,
+        ));
         Ok(MemoryStore { inner })
     }
 
@@ -684,6 +811,16 @@ impl MemoryStore {
                     memory: m.clone(),
                     score: h.score,
                 });
+            }
+        }
+        if self.inner.lean {
+            // Read the returned rows' text and embedding back from storage,
+            // after letting go of every lock.
+            drop(by_id);
+            drop(t);
+            drop(v);
+            for hit in &mut out {
+                hit.memory = self.hydrate(&hit.memory);
             }
         }
         Ok(out)
@@ -1120,6 +1257,213 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every row in `by_id` is lean (no text, no embedding).
+    fn all_rows_lean(s: &MemoryStore) -> bool {
+        s.inner
+            .by_id
+            .read()
+            .values()
+            .all(|m| m.text.is_empty() && m.embedding.is_empty())
+    }
+
+    const LEAN_TEXTS: [&str; 6] = [
+        "I lost my wallet at the cafe",
+        "Favorite color is blue",
+        "Tracking number DX-002341",
+        "The train to Pune leaves at nine",
+        "Monsoon rainfall in Kerala this week",
+        "Railway recruitment results announced",
+    ];
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn lean_open_at_keeps_text_on_disk_and_recall_returns_full_rows() {
+        const DIM: usize = 16;
+        let dir = std::env::temp_dir().join(format!("duxx-lean-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, true).unwrap();
+            assert!(store.is_lean());
+            for t in LEAN_TEXTS {
+                store.remember("web", t, embed(t, DIM)).unwrap();
+            }
+            assert_eq!(store.len(), LEAN_TEXTS.len());
+            assert!(all_rows_lean(&store), "rows in memory must be lean");
+            let hits = store
+                .recall("web", "wallet", &embed("lost my wallet", DIM), 3)
+                .unwrap();
+            assert!(!hits.is_empty());
+            assert_eq!(hits[0].memory.text, "I lost my wallet at the cafe");
+            assert_eq!(hits[0].memory.embedding.len(), DIM);
+            assert!(all_rows_lean(&store), "recall must not fill rows back in");
+        }
+
+        // Reopen lean: the same answers, still lean.
+        {
+            let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, true).unwrap();
+            assert_eq!(store.len(), LEAN_TEXTS.len());
+            assert!(all_rows_lean(&store));
+            let hits = store
+                .recall("web", "monsoon", &embed("monsoon rainfall", DIM), 3)
+                .unwrap();
+            assert_eq!(hits[0].memory.text, "Monsoon rainfall in Kerala this week");
+            let all = store.all_memories();
+            assert_eq!(all.len(), LEAN_TEXTS.len());
+            assert!(all
+                .iter()
+                .all(|m| !m.text.is_empty() && m.embedding.len() == DIM));
+        }
+
+        // The same directory opens normally too: lean is a memory layout, not a file format.
+        {
+            let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, false).unwrap();
+            assert!(!store.is_lean());
+            assert!(store
+                .inner
+                .by_id
+                .read()
+                .values()
+                .all(|m| !m.text.is_empty() && m.embedding.len() == DIM));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn lean_and_full_rank_identically() {
+        // The same directory (same HNSW dump, same tantivy index) opened in full
+        // mode and in lean mode must return the same rows with the same scores.
+        // Rows with equal scores come back in no fixed order (the fusion step
+        // does not break ties), so both sides are ordered by score, then id.
+        const DIM: usize = 16;
+        let dir = std::env::temp_dir().join(format!("duxx-lean-rank-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let queries = ["wallet cafe", "train Pune", "railway results", "blue"];
+        type Row = (u64, String, usize, f32);
+        let summary = |s: &MemoryStore, q: &str| -> Vec<Row> {
+            let mut rows: Vec<Row> = s
+                .recall("web", q, &embed(q, DIM), 10)
+                .unwrap()
+                .into_iter()
+                .map(|h| {
+                    (
+                        h.memory.id,
+                        h.memory.text,
+                        h.memory.embedding.len(),
+                        h.score,
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                b.3.partial_cmp(&a.3)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            rows
+        };
+        let full_results: Vec<Vec<Row>> = {
+            let full = MemoryStore::open_at_opts(DIM, 1_000, &dir, false).unwrap();
+            for i in 0..40 {
+                let t = format!("{} note {i}", LEAN_TEXTS[i % LEAN_TEXTS.len()]);
+                full.remember("web", t.clone(), embed(&t, DIM)).unwrap();
+            }
+            drop(full); // graceful: dumps HNSW, commits tantivy
+            let full = MemoryStore::open_at_opts(DIM, 1_000, &dir, false).unwrap();
+            queries.iter().map(|q| summary(&full, q)).collect()
+        };
+        let lean = MemoryStore::open_at_opts(DIM, 1_000, &dir, true).unwrap();
+        for (q, expected) in queries.iter().zip(full_results) {
+            assert!(!expected.is_empty());
+            assert_eq!(
+                summary(&lean, q),
+                expected,
+                "ranking or rows changed for {q}"
+            );
+        }
+        drop(lean);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn lean_compact_rebuilds_from_storage() {
+        const DIM: usize = 16;
+        let dir = std::env::temp_dir().join(format!("duxx-lean-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, true).unwrap();
+        store.set_auto_compact_ratio(None);
+        let mut ids = Vec::new();
+        for i in 0..80 {
+            let t = format!("{} item {i}", LEAN_TEXTS[i % LEAN_TEXTS.len()]);
+            ids.push(store.remember("web", t.clone(), embed(&t, DIM)).unwrap());
+        }
+        for id in ids.iter().take(30) {
+            assert!(store.forget(*id));
+        }
+        let reclaimed = store.compact().unwrap();
+        assert_eq!(reclaimed, 30);
+        assert_eq!(store.inner.vector_index.read().len(), 50);
+        assert!(all_rows_lean(&store));
+        let hits = store
+            .recall(
+                "web",
+                "railway",
+                &embed("Railway recruitment results announced", DIM),
+                5,
+            )
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| !h.memory.text.is_empty()));
+        assert!(hits.iter().all(|h| !ids[..30].contains(&h.memory.id)));
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn lean_with_storage_roundtrip() {
+        const DIM: usize = 16;
+        let dir = std::env::temp_dir().join(format!("duxx-lean-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.redb");
+        {
+            let storage: Arc<dyn Storage> =
+                Arc::new(duxx_storage::RedbStorage::open(&path).unwrap());
+            let store = MemoryStore::with_storage_opts(DIM, 1_000, storage, true).unwrap();
+            for t in LEAN_TEXTS {
+                store.remember("web", t, embed(t, DIM)).unwrap();
+            }
+            assert!(all_rows_lean(&store));
+        }
+        {
+            let storage: Arc<dyn Storage> =
+                Arc::new(duxx_storage::RedbStorage::open(&path).unwrap());
+            let store = MemoryStore::with_storage_opts(DIM, 1_000, storage, true).unwrap();
+            assert_eq!(store.len(), LEAN_TEXTS.len());
+            assert!(all_rows_lean(&store));
+            let hits = store
+                .recall(
+                    "web",
+                    "tracking",
+                    &embed("Tracking number DX-002341", DIM),
+                    3,
+                )
+                .unwrap();
+            assert_eq!(hits[0].memory.text, "Tracking number DX-002341");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn in_memory_store_is_never_lean() {
+        let s = MemoryStore::new(8);
+        assert!(!s.is_lean());
+        s.remember("u", "kept in full", embed("kept", 8)).unwrap();
+        assert!(!all_rows_lean(&s));
     }
 
     #[cfg(feature = "redb-store")]
