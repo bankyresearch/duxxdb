@@ -200,6 +200,25 @@ redis-cli -p 6379
 127.0.0.1:6379> PSUBSCRIBE memory.*
 ```
 
+#### Ranking web pages: titles, priors and deadlines (0.4.4)
+
+```bash
+# Optional trailing pairs; a text whose first line is a URL gives its own
+# URL (line 1) and title (line 2), so TITLE and URL are rarely needed.
+127.0.0.1:6379> REMEMBER web "https://www.wipro.com/\nWipro\n..." PRIOR 0.82
+127.0.0.1:6379> REMEMBER web "Sign in" TITLE "DigiLocker login" URL https://www.digilocker.gov.in/
+# Stop after 150 ms and return the best hits found so far (same reply shape).
+127.0.0.1:6379> RECALL web "wipro" 10 TIMEOUT 150
+```
+
+The text side scores title and URL matches above body matches
+(`DUXX_TEXT_TITLE_BOOST`=3, `DUXX_TEXT_URL_BOOST`=1.5,
+`DUXX_TEXT_TITLE_PHRASE_BOOST`=2); rows without a title or URL score exactly
+as before. `DUXX_PRIOR_WEIGHT` and `DUXX_FIELD_MATCH_WEIGHT` (both 0 by
+default) weigh the prior and the title/URL match into the fused score. See
+[docs/RANKING.md](docs/RANKING.md), including the one-time text-index rebuild
+on upgrade.
+
 #### From Python
 
 ```python
@@ -343,6 +362,7 @@ patterns: [docs/PROJECT_OVERVIEW.md § 8](docs/PROJECT_OVERVIEW.md#8-competitive
 | [FAQ.md](docs/FAQ.md) | "Is DuxxDB right for me?" — when to use, when not to, framework support, migration |
 | [PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md) | Pitching DuxxDB to a teammate / making a build-vs-buy call |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Understanding the internals before contributing |
+| [RANKING.md](docs/RANKING.md) | Ranking web pages: title/URL fields, priors, `RECALL ... TIMEOUT` |
 | [ROADMAP.md](docs/ROADMAP.md) | Knowing what's shipped vs. planned |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Opening your first PR |
 
