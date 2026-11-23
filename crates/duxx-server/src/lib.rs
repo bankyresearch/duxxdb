@@ -35,7 +35,7 @@ use duxx_datasets::{DatasetRegistry, DatasetRow};
 use duxx_docs::DocumentStore;
 use duxx_embed::{Embedder, HashEmbedder};
 use duxx_eval::{EvalRegistry, EvalStart};
-use duxx_memory::{MemoryStore, SessionStore};
+use duxx_memory::{MemoryStore, RecallOptions, RememberOptions, SessionStore};
 use duxx_prompts::PromptRegistry;
 use duxx_reactive::{ChangeEvent, ChangeKind};
 use duxx_replay::{
@@ -1179,13 +1179,21 @@ impl Server {
     }
 
     fn cmd_info(&self) -> Response {
+        let boosts = self.memory.field_boosts();
         let info = format!(
-            "# Server\r\nserver:{SERVER_NAME}\r\nversion:{SERVER_VERSION}\r\n# Stats\r\nmemories:{}\r\nsessions:{}\r\ndim:{}\r\nlean_rows:{}\r\ntext_tokenizer:{}\r\n",
+            "# Server\r\nserver:{SERVER_NAME}\r\nversion:{SERVER_VERSION}\r\n# Stats\r\nmemories:{}\r\nsessions:{}\r\ndim:{}\r\nlean_rows:{}\r\ntext_tokenizer:{}\r\npriors:{}\r\nrecall_timeouts:{}\r\n# Ranking\r\ntext_title_boost:{}\r\ntext_url_boost:{}\r\ntext_title_phrase_boost:{}\r\nfield_match_weight:{}\r\nprior_weight:{}\r\n",
             self.memory.len(),
             self.sessions.len(),
             self.dim,
             u8::from(self.memory.is_lean()),
-            self.memory.text_tokenizer()
+            self.memory.text_tokenizer(),
+            self.memory.priors(),
+            self.memory.recall_timeouts_total(),
+            boosts.title,
+            boosts.url,
+            boosts.title_phrase,
+            self.memory.field_match_weight(),
+            self.memory.prior_weight()
         );
         Response::Reply(RespValue::BulkString(info.into_bytes()))
     }
@@ -1233,6 +1241,10 @@ impl Server {
         Response::Reply(RespValue::Integer(if removed { 1 } else { 0 }))
     }
 
+    /// `REMEMBER key text... [PRIOR p] [TITLE t] [URL u]`. The options are
+    /// trailing pairs, in any order, after at least one text argument; a
+    /// trailing `PRIOR` whose value is not a number is read as text, as
+    /// before 0.4.4.
     fn cmd_remember(&self, args: &[RespValue]) -> Response {
         if args.len() < 3 {
             return Response::Reply(err("ERR REMEMBER expects: key text..."));
@@ -1241,8 +1253,12 @@ impl Server {
             Some(s) => s.to_string(),
             None => return Response::Reply(err("ERR REMEMBER key must be a string")),
         };
+        let (text_args, opts) = match remember_options(&args[2..]) {
+            Ok(x) => x,
+            Err(e) => return Response::Reply(err(e)),
+        };
         // Concat remaining args with spaces, so REMEMBER alice hello world works.
-        let parts: Vec<String> = args[2..]
+        let parts: Vec<String> = text_args
             .iter()
             .filter_map(|v| arg_string(v).map(|s| s.to_string()))
             .collect();
@@ -1261,7 +1277,7 @@ impl Server {
                 self.dim
             )));
         }
-        match self.memory.remember(key, text, emb) {
+        match self.memory.remember_with(key, text, emb, opts) {
             Ok(id) => Response::Reply(RespValue::Integer(id as i64)),
             Err(e) => Response::Reply(err(format!("ERR {e}"))),
         }
@@ -1351,9 +1367,13 @@ impl Server {
         Response::PUnsubscribe { patterns, ack }
     }
 
+    /// `RECALL key query [k] [TIMEOUT ms]`. With `TIMEOUT`, the search stops
+    /// `ms` milliseconds after the command starts and the best hits found by
+    /// then are returned, in the usual shape; `TIMEOUT 0` means no limit.
     fn cmd_recall(&self, args: &[RespValue]) -> Response {
+        let started = std::time::Instant::now();
         if args.len() < 3 {
-            return Response::Reply(err("ERR RECALL expects: key query [k]"));
+            return Response::Reply(err("ERR RECALL expects: key query [k] [TIMEOUT ms]"));
         }
         let key = match arg_string(&args[1]) {
             Some(s) => s,
@@ -1363,12 +1383,12 @@ impl Server {
             Some(s) => s,
             None => return Response::Reply(err("ERR RECALL query must be a string")),
         };
-        let k = if args.len() >= 4 {
-            arg_string(&args[3])
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(10)
-        } else {
-            10
+        let (k, timeout_ms) = match recall_options(&args[3..]) {
+            Ok(x) => x,
+            Err(e) => return Response::Reply(err(e)),
+        };
+        let opts = RecallOptions {
+            deadline: timeout_ms.map(|ms| started + std::time::Duration::from_millis(ms)),
         };
         let qvec = match self.embedder.embed(query) {
             Ok(v) => v,
@@ -1381,8 +1401,17 @@ impl Server {
                 self.dim
             )));
         }
-        let hits = match self.memory.recall(key, query, &qvec, k) {
-            Ok(h) => h,
+        let hits = match self.memory.recall_with(key, query, &qvec, k, opts) {
+            Ok(r) => {
+                if r.timed_out {
+                    tracing::debug!(
+                        timeout_ms = timeout_ms.unwrap_or(0),
+                        hits = r.hits.len(),
+                        "RECALL cut short by TIMEOUT"
+                    );
+                }
+                r.hits
+            }
             Err(e) => return Response::Reply(err(format!("ERR {e}"))),
         };
         // Reply as an array of nested arrays: [id_int, score_str, text_str].
@@ -3370,6 +3399,79 @@ fn arg_string(v: &RespValue) -> Option<&str> {
     }
 }
 
+/// Split `REMEMBER`'s arguments after the key into the text arguments and
+/// the trailing option pairs `PRIOR p`, `TITLE t` and `URL u` (any order,
+/// each at most once, names in any case). At least one text argument always
+/// stays. A `PRIOR` whose value is not a number ends the options, so
+/// `REMEMBER k I like PRIOR art` still stores that text; a number outside
+/// 0..1 is an error.
+fn remember_options(args: &[RespValue]) -> Result<(&[RespValue], RememberOptions), String> {
+    let mut text = args;
+    let mut opts = RememberOptions::default();
+    while text.len() >= 3 {
+        let n = text.len();
+        let (Some(name), Some(value)) = (arg_string(&text[n - 2]), arg_string(&text[n - 1])) else {
+            break;
+        };
+        let value = value.trim();
+        match name.to_ascii_uppercase().as_str() {
+            "PRIOR" if opts.prior.is_none() => {
+                let Ok(p) = value.parse::<f32>() else {
+                    break;
+                };
+                if !duxx_memory::valid_prior(p) {
+                    return Err(format!(
+                        "ERR PRIOR must be a number from 0 to 1, got {value}"
+                    ));
+                }
+                opts.prior = Some(p);
+            }
+            "TITLE" if opts.fields.title.is_none() => {
+                opts.fields.title = Some(value.to_string()).filter(|v| !v.is_empty());
+            }
+            "URL" if opts.fields.url.is_none() => {
+                opts.fields.url = Some(value.to_string()).filter(|v| !v.is_empty());
+            }
+            _ => break,
+        }
+        text = &text[..n - 2];
+    }
+    Ok((text, opts))
+}
+
+/// `RECALL`'s arguments after the query: `[k] [TIMEOUT ms]`. A `k` that is
+/// not a number counts as 10, as before 0.4.4; other unknown trailing
+/// arguments are ignored, as before. `TIMEOUT 0` means no limit.
+fn recall_options(args: &[RespValue]) -> Result<(usize, Option<u64>), String> {
+    let is_timeout =
+        |v: &RespValue| arg_string(v).is_some_and(|s| s.eq_ignore_ascii_case("TIMEOUT"));
+    let mut rest = args;
+    let mut k = 10;
+    if let Some(first) = rest.first() {
+        if !is_timeout(first) {
+            k = arg_string(first)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(10);
+            rest = &rest[1..];
+        }
+    }
+    let mut timeout = None;
+    while let Some(name) = rest.first() {
+        if is_timeout(name) {
+            let ms = rest
+                .get(1)
+                .and_then(arg_string)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .ok_or_else(|| "ERR TIMEOUT expects a whole number of milliseconds".to_string())?;
+            timeout = (ms > 0).then_some(ms);
+            rest = &rest[2..];
+        } else {
+            rest = &rest[1..];
+        }
+    }
+    Ok((k, timeout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5322,5 +5424,210 @@ mod tests {
             }
             other => panic!("expected array, got {other:?}"),
         }
+    }
+
+    // -------- 0.4.4: PRIOR / TITLE / URL on REMEMBER, TIMEOUT on RECALL --------
+
+    fn cmd(s: &Server, parts: &[&str]) -> RespValue {
+        dispatch_array(s, parts.iter().map(|p| RespValue::bulk(*p)).collect())
+    }
+
+    fn info_field(s: &Server, name: &str) -> String {
+        let RespValue::BulkString(b) = cmd(s, &["INFO"]) else {
+            panic!("INFO is not a bulk string");
+        };
+        let info = String::from_utf8(b).unwrap();
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")).map(str::to_string))
+            .unwrap_or_else(|| panic!("INFO has no {name}: {info}"))
+    }
+
+    /// `[id, score, text]` rows of a RECALL reply.
+    fn recall_rows(reply: RespValue) -> Vec<(i64, f32, String)> {
+        let RespValue::Array(items) = reply else {
+            panic!("expected array, got {reply:?}");
+        };
+        items
+            .into_iter()
+            .map(|row| {
+                let RespValue::Array(row) = row else {
+                    panic!("expected nested array");
+                };
+                assert_eq!(row.len(), 3, "rows keep the [id, score, text] shape");
+                let id = match &row[0] {
+                    RespValue::Integer(i) => *i,
+                    other => panic!("id {other:?}"),
+                };
+                let score = match &row[1] {
+                    RespValue::BulkString(b) => std::str::from_utf8(b).unwrap().parse().unwrap(),
+                    other => panic!("score {other:?}"),
+                };
+                let text = match &row[2] {
+                    RespValue::BulkString(b) => String::from_utf8(b.clone()).unwrap(),
+                    other => panic!("text {other:?}"),
+                };
+                (id, score, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remember_accepts_prior_title_and_url() {
+        let s = Server::new();
+        let id = cmd(
+            &s,
+            &[
+                "REMEMBER",
+                "web",
+                "Sign in to your documents",
+                "PRIOR",
+                "0.8",
+                "title",
+                "Digilocker login",
+                "URL",
+                "https://www.digilocker.gov.in/",
+            ],
+        );
+        let RespValue::Integer(id) = id else {
+            panic!("REMEMBER -> {id:?}");
+        };
+        assert_eq!(info_field(&s, "priors"), "1");
+        let m = s
+            .memory
+            .all_memories()
+            .into_iter()
+            .find(|m| m.id as i64 == id)
+            .unwrap();
+        assert_eq!(m.text, "Sign in to your documents", "options are not text");
+        assert_eq!(m.prior, Some(0.8));
+        assert_eq!(m.fields.title.as_deref(), Some("Digilocker login"));
+        assert_eq!(
+            m.fields.url.as_deref(),
+            Some("https://www.digilocker.gov.in/")
+        );
+
+        // The plain forms still work as before.
+        assert!(matches!(
+            cmd(&s, &["REMEMBER", "web", "hello", "world"]),
+            RespValue::Integer(_)
+        ));
+        assert!(matches!(
+            cmd(&s, &["REMEMBER", "web", "PRIOR"]),
+            RespValue::Integer(_)
+        ));
+        // A trailing PRIOR that is not a number is text, as before.
+        cmd(&s, &["REMEMBER", "web", "I", "like", "PRIOR", "art"]);
+        assert!(s
+            .memory
+            .all_memories()
+            .iter()
+            .any(|m| m.text == "I like PRIOR art" && m.prior.is_none()));
+        assert_eq!(info_field(&s, "priors"), "1");
+    }
+
+    #[test]
+    fn remember_refuses_a_prior_outside_zero_to_one() {
+        let s = Server::new();
+        for bad in ["1.5", "-0.2", "NaN", "inf"] {
+            let r = cmd(&s, &["REMEMBER", "web", "text", "PRIOR", bad]);
+            assert!(
+                matches!(&r, RespValue::Error(e) if e.contains("PRIOR")),
+                "{bad}: {r:?}"
+            );
+        }
+        assert_eq!(s.memory.len(), 0);
+    }
+
+    #[test]
+    fn recall_ranks_the_page_titled_with_the_query_first() {
+        let s = Server::new();
+        s.memory.set_field_match_weight(1.0);
+        s.memory.set_prior_weight(0.6);
+        let pages = [
+            "https://www.wipro.com/\nWipro\nTechnology services and consulting\ngxm20261109Len\nExplore our services and industries.",
+            "https://www.wipro.com/investors/\nAnnual report 2025\nAnnual report\ngxm20261109Len\nwipro revenue grew. wipro margins held. wipro paid a dividend.",
+            "https://www.wipro.com/careers/\nCareers in India\nJobs\ngxm20261109Len\njoin wipro. wipro hires freshers. wipro campus drives.",
+        ];
+        let mut ids = Vec::new();
+        for p in pages {
+            // One site, so one prior for all its pages.
+            let RespValue::Integer(id) = cmd(&s, &["REMEMBER", "web", p, "PRIOR", "0.7"]) else {
+                panic!("REMEMBER failed");
+            };
+            ids.push(id);
+        }
+        let rows = recall_rows(cmd(&s, &["RECALL", "web", "wipro", "3"]));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, ids[0], "{rows:?}");
+        assert!(rows[0].2.starts_with("https://www.wipro.com/\nWipro\n"));
+    }
+
+    #[test]
+    fn recall_accepts_a_timeout() {
+        let s = Server::new();
+        for i in 0..50 {
+            cmd(
+                &s,
+                &["REMEMBER", "web", &format!("monsoon rainfall report {i}")],
+            );
+        }
+        let plain = recall_rows(cmd(&s, &["RECALL", "web", "monsoon", "5"]));
+        assert_eq!(plain.len(), 5);
+        // A generous limit: the usual answer, in the usual shape.
+        let roomy = recall_rows(cmd(
+            &s,
+            &["RECALL", "web", "monsoon", "5", "TIMEOUT", "30000"],
+        ));
+        assert_eq!(roomy.len(), 5);
+        // TIMEOUT without k, in any case; TIMEOUT 0 means no limit.
+        assert_eq!(
+            recall_rows(cmd(&s, &["RECALL", "web", "monsoon", "timeout", "30000"])).len(),
+            10
+        );
+        assert_eq!(
+            recall_rows(cmd(&s, &["RECALL", "web", "monsoon", "5", "TIMEOUT", "0"])).len(),
+            5
+        );
+        // A tiny limit is never an error: at most k rows, whatever was found.
+        let tiny = recall_rows(cmd(&s, &["RECALL", "web", "monsoon", "5", "TIMEOUT", "1"]));
+        assert!(tiny.len() <= 5);
+        // A bad value is an error.
+        for bad in [
+            vec!["TIMEOUT"],
+            vec!["TIMEOUT", "soon"],
+            vec!["TIMEOUT", "-5"],
+        ] {
+            let mut parts = vec!["RECALL", "web", "monsoon", "5"];
+            parts.extend(bad);
+            assert!(
+                matches!(cmd(&s, &parts), RespValue::Error(_)),
+                "{parts:?} accepted"
+            );
+        }
+        let timeouts: u64 = info_field(&s, "recall_timeouts").parse().unwrap();
+        assert!(timeouts <= 1);
+        assert_eq!(info_field(&s, "prior_weight"), "0");
+        assert_eq!(info_field(&s, "text_title_boost"), "3");
+    }
+
+    #[test]
+    fn recall_options_parse_as_before() {
+        let args = |parts: &[&str]| -> Vec<RespValue> {
+            parts.iter().map(|p| RespValue::bulk(*p)).collect()
+        };
+        assert_eq!(recall_options(&args(&[])), Ok((10, None)));
+        assert_eq!(recall_options(&args(&["3"])), Ok((3, None)));
+        assert_eq!(recall_options(&args(&["many"])), Ok((10, None)));
+        assert_eq!(recall_options(&args(&["3", "extra"])), Ok((3, None)));
+        assert_eq!(
+            recall_options(&args(&["3", "TIMEOUT", "40"])),
+            Ok((3, Some(40)))
+        );
+        assert_eq!(
+            recall_options(&args(&["TIMEOUT", "40"])),
+            Ok((10, Some(40)))
+        );
+        assert_eq!(recall_options(&args(&["3", "TIMEOUT", "0"])), Ok((3, None)));
+        assert!(recall_options(&args(&["3", "TIMEOUT"])).is_err());
     }
 }

@@ -12,15 +12,19 @@ pub mod session;
 pub mod tool_cache;
 
 use duxx_core::Result;
+use duxx_index::text::env_weight;
 use duxx_index::{TextIndex, VectorIndex};
-use duxx_query::{hybrid_recall, RecallHit};
+use duxx_query::{rrf_fuse, DEFAULT_RRF_K};
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
 use duxx_storage::Storage;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
+
+pub use duxx_index::text::{DocFields, FieldBoosts};
 
 // Re-export so users get the full Storage surface from one place.
 #[cfg(feature = "redb-store")]
@@ -62,6 +66,53 @@ pub struct Memory {
     /// Wall-clock so it survives process restart (a monotonic `Instant`
     /// would not). Tiny NTP-induced wobble is acceptable for decay use.
     pub created_at_unix_ns: u128,
+    /// Importance of the row's source in `0..=1` (e.g. a site prior), given
+    /// with `REMEMBER ... PRIOR p`. Recall multiplies the fused score by
+    /// `1 + prior_weight * prior` (see [`MemoryStore::set_prior_weight`]).
+    /// `None` counts as 0.
+    pub prior: Option<f32>,
+    /// Title and URL given with the row (`REMEMBER ... TITLE t URL u`), indexed
+    /// as their own text fields. Fields not given here are read from the
+    /// text's layout when it is indexed ([`DocFields::from_layout`]). Empty
+    /// in lean rows.
+    pub fields: DocFields,
+}
+
+/// What a row may carry beside its key, text and embedding.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RememberOptions {
+    /// Importance of the row's source, in `0..=1`. See [`Memory::prior`].
+    pub prior: Option<f32>,
+    /// Title and URL. See [`Memory::fields`].
+    pub fields: DocFields,
+}
+
+/// How a recall may be limited.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecallOptions {
+    /// Stop searching at this instant and fuse whatever each side found by
+    /// then. `None` waits for the full search.
+    pub deadline: Option<Instant>,
+}
+
+/// The hits of [`MemoryStore::recall_with`], and whether the search was cut
+/// short by its deadline.
+#[derive(Debug, Clone, Default)]
+pub struct Recall {
+    pub hits: Vec<MemoryHit>,
+    /// `true` when the deadline came before the vector search, the text
+    /// search or the title/URL search finished; `hits` are then the best of
+    /// what was found in time.
+    pub timed_out: bool,
+}
+
+/// The ranked candidates of each side of a hybrid search.
+#[derive(Default)]
+struct Sides {
+    vector: Vec<(u64, f32)>,
+    text: Vec<(u64, f32)>,
+    /// Title/URL-only scores (empty unless the field-match weight is on).
+    fields: Vec<(u64, f32)>,
 }
 
 /// Current wall-clock time as Unix-epoch nanoseconds.
@@ -132,6 +183,27 @@ struct Inner {
     /// rows a caller receives. Only ever `true` together with `storage`.
     /// See [`lean_rows_from_env`].
     lean: bool,
+    /// Weight of [`Memory::prior`] in recall (`DUXX_PRIOR_WEIGHT`, default 0).
+    prior_weight: RwLock<f32>,
+    /// Weight of the title/URL match in recall (`DUXX_FIELD_MATCH_WEIGHT`,
+    /// default 0). See [`MemoryStore::set_field_match_weight`].
+    field_match_weight: RwLock<f32>,
+    /// Number of live rows that carry a prior.
+    priors: AtomicU64,
+    /// Number of recalls cut short by their deadline.
+    recall_timeouts: AtomicU64,
+}
+
+/// `DUXX_PRIOR_WEIGHT`: how much [`Memory::prior`] counts in recall. Unset
+/// means 0 (priors are stored but do not change the ranking).
+pub fn prior_weight_from_env() -> f32 {
+    env_weight("DUXX_PRIOR_WEIGHT", 0.0)
+}
+
+/// `DUXX_FIELD_MATCH_WEIGHT`: how much the title/URL match counts in recall,
+/// on top of the text side's rank. Unset means 0.
+pub fn field_match_weight_from_env() -> f32 {
+    env_weight("DUXX_FIELD_MATCH_WEIGHT", 0.0)
 }
 
 /// Whether the `DUXX_LEAN_ROWS` environment variable asks for lean rows
@@ -155,21 +227,54 @@ pub fn lean_rows_from_env() -> bool {
         .unwrap_or(false)
 }
 
-/// Decode one persisted row and check its dimension.
-fn decode_stored(id: u64, bytes: &[u8], dim: usize) -> Result<StoredMemory> {
-    let stored: StoredMemory = bincode::deserialize(bytes)
+/// Decode one persisted row (either layout, see [`StoredExt`]).
+fn decode_row(id: u64, bytes: &[u8]) -> Result<(StoredMemory, StoredExt)> {
+    let mut rest: &[u8] = bytes;
+    let stored: StoredMemory = bincode::deserialize_from(&mut rest)
         .map_err(|e| duxx_core::Error::Storage(format!("decode memory id={id}: {e}")))?;
+    let ext = if rest.is_empty() {
+        StoredExt::default()
+    } else {
+        bincode::deserialize(rest)
+            .map_err(|e| duxx_core::Error::Storage(format!("decode memory id={id} extras: {e}")))?
+    };
+    Ok((stored, ext))
+}
+
+/// Decode one persisted row and check its dimension.
+fn decode_stored(id: u64, bytes: &[u8], dim: usize) -> Result<(StoredMemory, StoredExt)> {
+    let (stored, ext) = decode_row(id, bytes)?;
     if stored.embedding.len() != dim {
         return Err(duxx_core::Error::Storage(format!(
             "memory id={id} has dim {} but store expects {dim}",
             stored.embedding.len()
         )));
     }
-    Ok(stored)
+    Ok((stored, ext))
+}
+
+/// Encode one row for the row store. A row with no prior, title or URL is
+/// written exactly as 0.4.3 wrote it.
+fn encode_row(m: &Memory) -> Result<Vec<u8>> {
+    let mut bytes = bincode::serialize(&StoredMemory::from(m))
+        .map_err(|e| duxx_core::Error::Storage(format!("encode memory id={}: {e}", m.id)))?;
+    let ext = StoredExt::of(m);
+    if !ext.is_empty() {
+        let more = bincode::serialize(&ext).map_err(|e| {
+            duxx_core::Error::Storage(format!("encode memory id={} extras: {e}", m.id))
+        })?;
+        bytes.extend_from_slice(&more);
+    }
+    Ok(bytes)
+}
+
+/// Whether `prior` is a valid [`Memory::prior`]: a number in `0..=1`.
+pub fn valid_prior(prior: f32) -> bool {
+    prior.is_finite() && (0.0..=1.0).contains(&prior)
 }
 
 impl Memory {
-    fn from_stored(id: u64, stored: StoredMemory) -> Self {
+    fn from_stored(id: u64, stored: StoredMemory, ext: StoredExt) -> Self {
         Memory {
             id,
             key: stored.key,
@@ -177,13 +282,20 @@ impl Memory {
             embedding: stored.embedding,
             importance: stored.importance,
             created_at_unix_ns: stored.created_at_unix_ns,
+            prior: ext.prior,
+            fields: DocFields {
+                title: ext.title,
+                url: ext.url,
+            },
         }
     }
 
-    /// The same row without its text and embedding (lean-rows mode).
+    /// The same row without its text, embedding, title and URL (lean-rows
+    /// mode). The prior stays: recall needs it for every candidate.
     fn into_lean(mut self) -> Self {
         self.text = String::new();
         self.embedding = Vec::new();
+        self.fields = DocFields::default();
         self
     }
 }
@@ -219,6 +331,42 @@ struct StoredMemory {
     /// with near-zero decayed importance.
     #[serde(default)]
     created_at_unix_ns: u128,
+}
+
+/// What a row carries beyond [`StoredMemory`], written after it (0.4.4 and
+/// later) only when there is something to write.
+///
+/// bincode reads a struct field by field and ignores trailing bytes, so:
+/// a row written by 0.4.3 or earlier (no extras) reads here with
+/// `StoredExt::default()`, and a row written here reads in 0.4.3 as the
+/// same row without its prior, title and URL. The row store needs no
+/// migration in either direction. New members go at the end of this struct.
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
+struct StoredExt {
+    prior: Option<f32>,
+    title: Option<String>,
+    url: Option<String>,
+}
+
+impl StoredExt {
+    fn of(m: &Memory) -> Self {
+        StoredExt {
+            prior: m.prior,
+            title: m.fields.title.clone(),
+            url: m.fields.url.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.prior.is_none() && self.title.is_none() && self.url.is_none()
+    }
+
+    fn fields(&self) -> DocFields {
+        DocFields {
+            title: self.title.clone(),
+            url: self.url.clone(),
+        }
+    }
 }
 
 impl From<&Memory> for StoredMemory {
@@ -257,6 +405,10 @@ impl MemoryStore {
                 compactions_total: std::sync::atomic::AtomicU64::new(0),
                 auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
                 lean: false,
+                prior_weight: RwLock::new(prior_weight_from_env()),
+                field_match_weight: RwLock::new(field_match_weight_from_env()),
+                priors: AtomicU64::new(0),
+                recall_timeouts: AtomicU64::new(0),
             }),
         }
     }
@@ -271,6 +423,7 @@ impl MemoryStore {
         storage: Arc<dyn Storage>,
         lean: bool,
     ) -> Inner {
+        let priors = by_id.values().filter(|m| m.prior.is_some()).count() as u64;
         Inner {
             dim,
             by_id: RwLock::new(by_id),
@@ -285,6 +438,10 @@ impl MemoryStore {
             compactions_total: std::sync::atomic::AtomicU64::new(0),
             auto_compact_ratio: RwLock::new(Some(DEFAULT_AUTO_COMPACT_RATIO)),
             lean,
+            prior_weight: RwLock::new(prior_weight_from_env()),
+            field_match_weight: RwLock::new(field_match_weight_from_env()),
+            priors: AtomicU64::new(priors),
+            recall_timeouts: AtomicU64::new(0),
         }
     }
 
@@ -300,6 +457,57 @@ impl MemoryStore {
         self.inner.text_index.read().tokenizer().name()
     }
 
+    /// How title, URL and title-phrase matches weigh in the text side
+    /// (`DUXX_TEXT_TITLE_BOOST`, `DUXX_TEXT_URL_BOOST`,
+    /// `DUXX_TEXT_TITLE_PHRASE_BOOST`).
+    pub fn field_boosts(&self) -> FieldBoosts {
+        self.inner.text_index.read().field_boosts()
+    }
+
+    /// Change the text side's field boosts. [`FieldBoosts::OFF`] scores
+    /// text as 0.4.3 did.
+    pub fn set_field_boosts(&self, boosts: FieldBoosts) {
+        self.inner.text_index.write().set_field_boosts(boosts);
+    }
+
+    /// Weight `w` of [`Memory::prior`]: recall multiplies each fused score by
+    /// `1 + w * prior`. 0 (the default) leaves the ranking unchanged.
+    pub fn prior_weight(&self) -> f32 {
+        *self.inner.prior_weight.read()
+    }
+
+    /// Set the prior weight (negative or non-finite values count as 0).
+    pub fn set_prior_weight(&self, w: f32) {
+        *self.inner.prior_weight.write() = if w.is_finite() { w.max(0.0) } else { 0.0 };
+    }
+
+    /// Weight `w` of the title/URL match: recall multiplies each fused score
+    /// by `1 + w * m`, where `m` in `0..=1` is the row's title/URL score
+    /// relative to the best title/URL match for the query. Rank fusion
+    /// otherwise hides how much better a title match is than a body match
+    /// (it sees only the order of the text side). 0 (the default) leaves the
+    /// ranking to rank fusion alone.
+    pub fn field_match_weight(&self) -> f32 {
+        *self.inner.field_match_weight.read()
+    }
+
+    /// Set the title/URL match weight (negative or non-finite count as 0).
+    pub fn set_field_match_weight(&self, w: f32) {
+        *self.inner.field_match_weight.write() = if w.is_finite() { w.max(0.0) } else { 0.0 };
+    }
+
+    /// Number of live rows that carry a prior.
+    pub fn priors(&self) -> u64 {
+        self.inner.priors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of recalls cut short by their deadline since start.
+    pub fn recall_timeouts_total(&self) -> u64 {
+        self.inner
+            .recall_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The full row for a lean in-memory row: text and embedding read back
     /// from the row store. A row whose stored copy cannot be read comes back
     /// as it is in memory (with empty text), and the failure is logged.
@@ -311,14 +519,16 @@ impl MemoryStore {
             return m.clone();
         };
         match s.get(m.id) {
-            Ok(Some(bytes)) => match bincode::deserialize::<StoredMemory>(&bytes) {
-                Ok(stored) => Memory {
+            Ok(Some(bytes)) => match decode_row(m.id, &bytes) {
+                Ok((stored, ext)) => Memory {
                     id: m.id,
                     key: m.key.clone(),
                     text: stored.text,
                     embedding: stored.embedding,
                     importance: m.importance,
                     created_at_unix_ns: m.created_at_unix_ns,
+                    prior: m.prior,
+                    fields: ext.fields(),
                 },
                 Err(e) => {
                     tracing::warn!(id = m.id, error = %e, "lean rows: stored row did not decode");
@@ -367,10 +577,10 @@ impl MemoryStore {
         let mut by_id: HashMap<u64, Memory> = HashMap::with_capacity(storage.len().unwrap_or(0));
         let mut max_id = 0u64;
         storage.for_each(&mut |id, bytes| {
-            let stored = decode_stored(id, bytes, dim)?;
+            let (stored, ext) = decode_stored(id, bytes, dim)?;
             vector_index.insert(id, stored.embedding.clone())?;
-            text_index.insert(id, stored.text.clone())?;
-            let mem = Memory::from_stored(id, stored);
+            text_index.insert_with(id, stored.text.clone(), &ext.fields())?;
+            let mem = Memory::from_stored(id, stored, ext);
             by_id.insert(id, if lean { mem.into_lean() } else { mem });
             max_id = max_id.max(id);
             Ok(())
@@ -481,8 +691,14 @@ impl MemoryStore {
     /// results. Reclaiming the index memory itself requires HNSW
     /// tombstones + tantivy deletes, which is Phase 6.3 work.
     pub fn forget(&self, id: u64) -> bool {
-        let removed = self.inner.by_id.write().remove(&id).is_some();
-        if removed {
+        let removed_row = self.inner.by_id.write().remove(&id);
+        let removed = removed_row.is_some();
+        if let Some(m) = removed_row {
+            if m.prior.is_some() {
+                self.inner
+                    .priors
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(s) = &self.inner.storage {
                 let _ = s.delete(id);
             }
@@ -556,7 +772,7 @@ impl MemoryStore {
 
         let before_indexed = v.len();
         let mut survivors_vec: Vec<(u64, Vec<f32>)> = Vec::new();
-        let mut survivors_text: Vec<(u64, String)> = Vec::new();
+        let mut survivors_text: Vec<(u64, String, DocFields)> = Vec::new();
         {
             let by_id = self.inner.by_id.read();
             survivors_vec.reserve(by_id.len());
@@ -566,9 +782,9 @@ impl MemoryStore {
                 (Some(s), true) => {
                     s.for_each(&mut |id, bytes| {
                         if by_id.contains_key(&id) {
-                            let stored = decode_stored(id, bytes, self.inner.dim)?;
+                            let (stored, ext) = decode_stored(id, bytes, self.inner.dim)?;
                             survivors_vec.push((id, stored.embedding));
-                            survivors_text.push((id, stored.text));
+                            survivors_text.push((id, stored.text, ext.fields()));
                         }
                         Ok(())
                     })?;
@@ -576,7 +792,7 @@ impl MemoryStore {
                 _ => {
                     for m in by_id.values() {
                         survivors_vec.push((m.id, m.embedding.clone()));
-                        survivors_text.push((m.id, m.text.clone()));
+                        survivors_text.push((m.id, m.text.clone(), m.fields.clone()));
                     }
                 }
             }
@@ -585,7 +801,7 @@ impl MemoryStore {
         let reclaimed = before_indexed.saturating_sub(live);
 
         v.rebuild(&survivors_vec)?;
-        t.rebuild(&survivors_text)?;
+        t.rebuild_with(&survivors_text)?;
 
         // Persist the freshly compacted indices when durable, so a later
         // reopen sees the compacted form rather than re-loading tombstones.
@@ -652,6 +868,25 @@ impl MemoryStore {
         text: impl Into<String>,
         embedding: Vec<f32>,
     ) -> Result<u64> {
+        self.remember_with(key, text, embedding, RememberOptions::default())
+    }
+
+    /// [`MemoryStore::remember`] with a prior and a title and URL. A prior
+    /// outside `0..=1` is refused.
+    pub fn remember_with(
+        &self,
+        key: impl Into<String>,
+        text: impl Into<String>,
+        embedding: Vec<f32>,
+        opts: RememberOptions,
+    ) -> Result<u64> {
+        if let Some(p) = opts.prior {
+            if !valid_prior(p) {
+                return Err(duxx_core::Error::Schema(format!(
+                    "prior must be a number from 0 to 1, got {p}"
+                )));
+            }
+        }
         let key = key.into();
         let text = text.into();
         let id = {
@@ -664,7 +899,10 @@ impl MemoryStore {
             .vector_index
             .write()
             .insert(id, embedding.clone())?;
-        self.inner.text_index.write().insert(id, text.clone())?;
+        self.inner
+            .text_index
+            .write()
+            .insert_with(id, text.clone(), &opts.fields)?;
         let mem = Memory {
             id,
             key: key.clone(),
@@ -672,15 +910,19 @@ impl MemoryStore {
             embedding,
             importance: 1.0,
             created_at_unix_ns: now_unix_ns(),
+            prior: opts.prior,
+            fields: opts.fields,
         };
         // Write through to durable storage BEFORE inserting into the
         // in-memory cache. If the persistence write fails, we don't
         // want a phantom row in memory.
         if let Some(s) = &self.inner.storage {
-            let stored = StoredMemory::from(&mem);
-            let bytes = bincode::serialize(&stored)
-                .map_err(|e| duxx_core::Error::Storage(format!("encode memory id={id}: {e}")))?;
-            s.put(id, &bytes)?;
+            s.put(id, &encode_row(&mem)?)?;
+        }
+        if mem.prior.is_some() {
+            self.inner
+                .priors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let mem = if self.inner.lean {
             mem.into_lean()
@@ -780,15 +1022,15 @@ impl MemoryStore {
         let mut max_id = 0u64;
         let mut vectors_added = 0usize;
         storage.for_each(&mut |id, bytes| {
-            let stored = decode_stored(id, bytes, dim)?;
+            let (stored, ext) = decode_stored(id, bytes, dim)?;
             if !have_vector.contains(&id) {
                 vector_index.insert(id, stored.embedding.clone())?;
                 vectors_added += 1;
             }
             if rebuild_text {
-                text_index.insert(id, stored.text.clone())?;
+                text_index.insert_with(id, stored.text.clone(), &ext.fields())?;
             }
-            let mem = Memory::from_stored(id, stored);
+            let mem = Memory::from_stored(id, stored, ext);
             by_id.insert(id, if lean { mem.into_lean() } else { mem });
             max_id = max_id.max(id);
             Ok(())
@@ -820,38 +1062,228 @@ impl MemoryStore {
         Ok(MemoryStore { inner })
     }
 
-    /// Hybrid recall (vector + BM25, RRF-fused).
+    /// Hybrid recall (vector + BM25, RRF-fused). With a prior weight or a
+    /// title/URL match weight set, the fused scores are then multiplied by
+    /// them (see [`MemoryStore::recall_with`]).
     pub fn recall(
+        &self,
+        key: &str,
+        query_text: &str,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        Ok(self
+            .recall_with(key, query_text, query_vec, k, RecallOptions::default())?
+            .hits)
+    }
+
+    /// Hybrid recall with options.
+    ///
+    /// Each side (vector and BM25) yields `max(3k, 32)` candidates, fused by
+    /// reciprocal rank. When [`MemoryStore::prior_weight`] `wp` or
+    /// [`MemoryStore::field_match_weight`] `wf` is above 0, every fused
+    /// candidate's score is multiplied by `(1 + wf * field_match) * (1 + wp *
+    /// prior)` and the best `k` are returned; with both at 0 this is the
+    /// plain fusion of 0.4.3.
+    ///
+    /// With a deadline, the two sides run in parallel and the call returns
+    /// at the deadline with what each side found by then (the text side
+    /// stops between index segments); [`Recall::timed_out`] says so.
+    pub fn recall_with(
         &self,
         _key: &str,
         query_text: &str,
         query_vec: &[f32],
         k: usize,
-    ) -> Result<Vec<MemoryHit>> {
-        let v = self.inner.vector_index.read();
-        let t = self.inner.text_index.read();
-        let hits: Vec<RecallHit> = hybrid_recall(&v, &t, query_vec, query_text, k)?;
-        let by_id = self.inner.by_id.read();
-        let mut out = Vec::with_capacity(hits.len());
-        for h in hits {
-            if let Some(m) = by_id.get(&h.id) {
-                out.push(MemoryHit {
-                    memory: m.clone(),
-                    score: h.score,
-                });
+        opts: RecallOptions,
+    ) -> Result<Recall> {
+        let prior_w = self.prior_weight();
+        let field_w = self.field_match_weight();
+        let rerank = prior_w > 0.0 || field_w > 0.0;
+        let per = (k * 3).max(32);
+        let (sides, timed_out) = match opts.deadline {
+            None => (
+                self.search_sides(query_text, query_vec, per, field_w > 0.0),
+                false,
+            ),
+            Some(deadline) => {
+                self.search_sides_until(query_text, query_vec, per, field_w > 0.0, deadline)
             }
+        };
+        if timed_out {
+            self.inner
+                .recall_timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tracing::debug!(
+            v = sides.vector.len(),
+            t = sides.text.len(),
+            timed_out,
+            "recall pre-fusion"
+        );
+        let pool = if rerank { per * 2 } else { k };
+        let fused = rrf_fuse(vec![sides.vector, sides.text], DEFAULT_RRF_K, pool);
+
+        // Title/URL match of each candidate, relative to the best one.
+        let field_match: HashMap<u64, f32> = {
+            let best = sides.fields.iter().map(|h| h.1).fold(0.0f32, f32::max);
+            if best > 0.0 {
+                sides.fields.iter().map(|(id, s)| (*id, s / best)).collect()
+            } else {
+                HashMap::new()
+            }
+        };
+
+        let mut out = Vec::with_capacity(fused.len().min(k.max(1) * 2));
+        {
+            let by_id = self.inner.by_id.read();
+            for h in fused {
+                if let Some(m) = by_id.get(&h.id) {
+                    let mut score = h.score;
+                    if field_w > 0.0 {
+                        score *= 1.0 + field_w * field_match.get(&h.id).copied().unwrap_or(0.0);
+                    }
+                    if prior_w > 0.0 {
+                        score *= 1.0 + prior_w * m.prior.unwrap_or(0.0);
+                    }
+                    out.push(MemoryHit {
+                        memory: m.clone(),
+                        score,
+                    });
+                }
+            }
+        }
+        if rerank {
+            out.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.memory.id.cmp(&b.memory.id))
+            });
+            out.truncate(k);
         }
         if self.inner.lean {
             // Read the returned rows' text and embedding back from storage,
             // after letting go of every lock.
-            drop(by_id);
-            drop(t);
-            drop(v);
             for hit in &mut out {
                 hit.memory = self.hydrate(&hit.memory);
             }
         }
-        Ok(out)
+        Ok(Recall {
+            hits: out,
+            timed_out,
+        })
+    }
+
+    /// Both sides of a hybrid search, run one after the other.
+    fn search_sides(
+        &self,
+        query_text: &str,
+        query_vec: &[f32],
+        per: usize,
+        with_fields: bool,
+    ) -> Sides {
+        let v = self.inner.vector_index.read();
+        let t = self.inner.text_index.read();
+        Sides {
+            vector: v.search(query_vec, per),
+            text: t.search(query_text, per),
+            fields: if with_fields {
+                t.field_search(query_text, per)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Both sides of a hybrid search, run in parallel on their own threads,
+    /// taking what each has found at `deadline`. A side still running then
+    /// finishes in the background (the text side stops at its next segment)
+    /// and its result is dropped. Returns `true` with the sides when any
+    /// part was cut short.
+    fn search_sides_until(
+        &self,
+        query_text: &str,
+        query_vec: &[f32],
+        per: usize,
+        with_fields: bool,
+        deadline: Instant,
+    ) -> (Sides, bool) {
+        if Instant::now() >= deadline {
+            return (Sides::default(), true);
+        }
+        let (vector_tx, vector_rx) = std::sync::mpsc::channel();
+        let store = self.clone();
+        let qvec = query_vec.to_vec();
+        let vector_thread = std::thread::Builder::new()
+            .name("duxx-recall-vector".into())
+            .spawn(move || {
+                let hits = store.inner.vector_index.read().search(&qvec, per);
+                let _ = vector_tx.send(hits);
+            });
+
+        let found: Arc<Mutex<Vec<(u64, f32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let (text_tx, text_rx) = std::sync::mpsc::channel();
+        let store = self.clone();
+        let query = query_text.to_string();
+        let text_found = Arc::clone(&found);
+        let text_thread = std::thread::Builder::new()
+            .name("duxx-recall-text".into())
+            .spawn(move || {
+                let t = store.inner.text_index.read();
+                let complete = t.search_until(&query, per, deadline, &text_found);
+                let fields = if complete && with_fields && Instant::now() < deadline {
+                    Some(t.field_search(&query, per))
+                } else {
+                    None
+                };
+                let _ = text_tx.send((complete, fields));
+            });
+        if vector_thread.is_err() || text_thread.is_err() {
+            // No thread to be had: search in this one, without a deadline.
+            tracing::warn!("recall: could not start search threads; searching without a deadline");
+            return (
+                self.search_sides(query_text, query_vec, per, with_fields),
+                false,
+            );
+        }
+
+        let mut timed_out = false;
+        let left = || deadline.saturating_duration_since(Instant::now());
+        let vector = match vector_rx.recv_timeout(left()) {
+            Ok(hits) => hits,
+            Err(_) => {
+                timed_out = true;
+                Vec::new()
+            }
+        };
+        let fields = match text_rx.recv_timeout(left()) {
+            Ok((complete, fields)) => {
+                if !complete || (with_fields && fields.is_none()) {
+                    timed_out = true;
+                }
+                fields.unwrap_or_default()
+            }
+            Err(_) => {
+                timed_out = true;
+                Vec::new()
+            }
+        };
+        let mut text = std::mem::take(&mut *found.lock());
+        text.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        text.truncate(per);
+        (
+            Sides {
+                vector,
+                text,
+                fields,
+            },
+            timed_out,
+        )
     }
 
     /// Recall with importance-decay reranking.
@@ -1230,6 +1662,8 @@ mod tests {
             embedding: vec![0.0; 4],
             importance: 1.0,
             created_at_unix_ns: 0, // 1970 — extremely old
+            prior: None,
+            fields: DocFields::default(),
         };
         let eff = m.effective_importance(std::time::Duration::from_secs(60 * 60));
         assert!(eff < 1e-10, "expected near-zero decay, got {eff}");
@@ -1615,5 +2049,299 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -------- 0.4.4: title/URL fields, priors, recall deadline --------
+
+    /// A page as Gaelxe writes it: URL, title, description, marker, body.
+    fn page(url: &str, title: &str, description: &str, body: &str) -> String {
+        format!("{url}\n{title}\n{description}\ngxm20261109Len\n{body}")
+    }
+
+    /// One site: the home page titled "Wipro", and two deep pages that repeat
+    /// the name in their body (so both the text side and the bag-of-words
+    /// vector side prefer them) but not in their title.
+    fn wipro_pages() -> [String; 3] {
+        [
+            page(
+                "https://www.wipro.com/",
+                "Wipro",
+                "Technology services and consulting company helping clients build better businesses",
+                "Explore our services, industries, insights and careers across the world.",
+            ),
+            page(
+                "https://www.wipro.com/investors/annual-report/",
+                "Annual report 2025",
+                "Annual report",
+                "wipro revenue grew. wipro margins held. wipro board met. wipro paid a dividend.",
+            ),
+            page(
+                "https://www.wipro.com/careers/india/",
+                "Careers in India",
+                "Jobs",
+                "join wipro. wipro hires freshers. wipro campus drives. wipro offices.",
+            ),
+        ]
+    }
+
+    #[test]
+    fn page_titled_with_the_query_comes_first() {
+        const DIM: usize = 64;
+        let s = MemoryStore::new(DIM);
+        let mut ids = Vec::new();
+        for t in wipro_pages() {
+            ids.push(s.remember("web", t.clone(), embed(&t, DIM)).unwrap());
+        }
+        let home = ids[0];
+        let q = "wipro";
+
+        // 0.4.3 ranking: no field boosts, no field-match weight.
+        s.set_field_boosts(FieldBoosts::OFF);
+        s.set_field_match_weight(0.0);
+        let before = s.recall("web", q, &embed(q, DIM), 3).unwrap();
+        assert_eq!(before.len(), 3);
+        assert_ne!(
+            before[0].memory.id, home,
+            "body mentions win without fields"
+        );
+
+        // Title and URL fields on, and their match weighed into the fusion.
+        s.set_field_boosts(FieldBoosts::default());
+        s.set_field_match_weight(1.0);
+        let after = s.recall("web", q, &embed(q, DIM), 3).unwrap();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].memory.id, home, "{after:?}");
+        assert!(after[0].score > after[1].score);
+    }
+
+    #[test]
+    fn prior_lifts_an_otherwise_equal_row() {
+        const DIM: usize = 32;
+        let s = MemoryStore::new(DIM);
+        let text = "india post tracking consignment status";
+        let low = s
+            .remember_with(
+                "web",
+                text,
+                embed(text, DIM),
+                RememberOptions {
+                    prior: Some(0.1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let high = s
+            .remember_with(
+                "web",
+                text,
+                embed(text, DIM),
+                RememberOptions {
+                    prior: Some(0.9),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let plain = s.remember("web", text, embed(text, DIM)).unwrap();
+        assert_eq!(s.priors(), 2);
+        let q = "india post tracking";
+
+        // Weight 0 (the default): priors are stored but change nothing.
+        assert_eq!(s.prior_weight(), 0.0);
+        let unweighted = s.recall("web", q, &embed(q, DIM), 3).unwrap();
+        assert_eq!(unweighted.len(), 3);
+
+        s.set_prior_weight(0.6);
+        let hits = s.recall("web", q, &embed(q, DIM), 3).unwrap();
+        let order: Vec<u64> = hits.iter().map(|h| h.memory.id).collect();
+        assert_eq!(order, vec![high, low, plain], "{hits:?}");
+        assert_eq!(hits[0].memory.prior, Some(0.9));
+        // The three rows fuse to nearly the same score, so the prior decides.
+        assert!(hits[0].score > hits[1].score * 1.3, "{hits:?}");
+
+        // Forgetting a row with a prior updates the count.
+        assert!(s.forget(high));
+        assert_eq!(s.priors(), 1);
+    }
+
+    #[test]
+    fn prior_outside_zero_to_one_is_refused() {
+        let s = MemoryStore::new(8);
+        for bad in [-0.1f32, 1.5, f32::NAN, f32::INFINITY] {
+            let r = s.remember_with(
+                "u",
+                "text",
+                embed("text", 8),
+                RememberOptions {
+                    prior: Some(bad),
+                    ..Default::default()
+                },
+            );
+            assert!(r.is_err(), "{bad} accepted");
+        }
+        assert_eq!(s.len(), 0);
+        assert!(valid_prior(0.0) && valid_prior(1.0));
+    }
+
+    #[test]
+    fn rows_without_extras_are_written_as_before() {
+        let m = Memory {
+            id: 7,
+            key: "k".into(),
+            text: "hello".into(),
+            embedding: vec![0.5; 4],
+            importance: 1.0,
+            created_at_unix_ns: 42,
+            prior: None,
+            fields: DocFields::default(),
+        };
+        // Byte for byte the 0.4.3 row.
+        let old = bincode::serialize(&StoredMemory::from(&m)).unwrap();
+        assert_eq!(encode_row(&m).unwrap(), old);
+        let (stored, ext) = decode_row(7, &old).unwrap();
+        assert_eq!(stored.text, "hello");
+        assert_eq!(ext, StoredExt::default());
+
+        // A row with extras: 0.4.3's decoder (plain bincode, trailing bytes
+        // allowed) still reads it, and this version reads the extras back.
+        let rich = Memory {
+            prior: Some(0.75),
+            fields: DocFields {
+                title: Some("Hello".into()),
+                url: Some("https://hello.example/".into()),
+            },
+            ..m
+        };
+        let bytes = encode_row(&rich).unwrap();
+        let as_043: StoredMemory = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(as_043.text, "hello");
+        assert_eq!(as_043.created_at_unix_ns, 42);
+        let (_, ext) = decode_row(7, &bytes).unwrap();
+        assert_eq!(ext.prior, Some(0.75));
+        assert_eq!(ext.title.as_deref(), Some("Hello"));
+        assert_eq!(ext.url.as_deref(), Some("https://hello.example/"));
+    }
+
+    #[cfg(feature = "redb-store")]
+    #[test]
+    fn prior_and_fields_survive_reopen_and_compaction() {
+        const DIM: usize = 16;
+        let dir = std::env::temp_dir().join(format!("duxx-prior-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fields = DocFields {
+            title: Some("Digilocker login".into()),
+            url: Some("https://www.digilocker.gov.in/".into()),
+        };
+        let rich_id;
+        {
+            let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, true).unwrap();
+            store.set_auto_compact_ratio(None);
+            for t in LEAN_TEXTS {
+                store.remember("web", t, embed(t, DIM)).unwrap();
+            }
+            rich_id = store
+                .remember_with(
+                    "web",
+                    "Sign in to your documents",
+                    embed("sign in documents", DIM),
+                    RememberOptions {
+                        prior: Some(0.8),
+                        fields: fields.clone(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(store.priors(), 1);
+            assert!(store.forget(1));
+            assert_eq!(store.compact().unwrap(), 1);
+            let t = store.inner.text_index.read();
+            assert_eq!(
+                t.field_search("login", 5).first().map(|h| h.0),
+                Some(rich_id)
+            );
+        }
+        for lean in [true, false] {
+            let store = MemoryStore::open_at_opts(DIM, 1_000, &dir, lean).unwrap();
+            assert_eq!(store.priors(), 1, "lean={lean}");
+            let m = store.inner.by_id.read().get(&rich_id).cloned().unwrap();
+            assert_eq!(m.prior, Some(0.8), "lean={lean}");
+            let all = store.all_memories();
+            let full = all.iter().find(|m| m.id == rich_id).unwrap();
+            assert_eq!(full.fields, fields, "lean={lean}");
+            assert_eq!(full.prior, Some(0.8));
+            let t = store.inner.text_index.read();
+            assert_eq!(
+                t.field_search("digilocker", 5).first().map(|h| h.0),
+                Some(rich_id),
+                "lean={lean}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recall_deadline_returns_what_was_found_in_time() {
+        const DIM: usize = 16;
+        let s = MemoryStore::new(DIM);
+        for i in 0..200 {
+            let t = format!("{} entry {i}", LEAN_TEXTS[i % LEAN_TEXTS.len()]);
+            s.remember("web", t.clone(), embed(&t, DIM)).unwrap();
+        }
+        // The query is one row's own text, so that row is first either way
+        // (many other rows tie with each other, and ties have no fixed order).
+        let q = format!("{} entry 4", LEAN_TEXTS[4]);
+        let q = q.as_str();
+        let qv = embed(q, DIM);
+        let plain = s.recall("web", q, &qv, 10).unwrap();
+        assert_eq!(plain.len(), 10);
+        assert_eq!(plain[0].memory.text, q);
+
+        // Plenty of time: the same rows, not cut short.
+        let roomy = s
+            .recall_with(
+                "web",
+                q,
+                &qv,
+                10,
+                RecallOptions {
+                    deadline: Some(Instant::now() + Duration::from_secs(30)),
+                },
+            )
+            .unwrap();
+        assert!(!roomy.timed_out);
+        assert_eq!(roomy.hits.len(), 10);
+        assert_eq!(roomy.hits[0].memory.id, plain[0].memory.id);
+        assert_eq!(s.recall_timeouts_total(), 0);
+
+        // A deadline already passed: no error, nothing found, counted.
+        let late = s
+            .recall_with(
+                "web",
+                q,
+                &qv,
+                10,
+                RecallOptions {
+                    deadline: Some(Instant::now()),
+                },
+            )
+            .unwrap();
+        assert!(late.timed_out);
+        assert!(late.hits.is_empty());
+        assert_eq!(s.recall_timeouts_total(), 1);
+
+        // A short deadline returns promptly, with at most k rows, whatever
+        // each side managed in time.
+        let start = Instant::now();
+        let short = s
+            .recall_with(
+                "web",
+                q,
+                &qv,
+                10,
+                RecallOptions {
+                    deadline: Some(start + Duration::from_millis(5)),
+                },
+            )
+            .unwrap();
+        assert!(short.hits.len() <= 10);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

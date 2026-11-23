@@ -7,6 +7,18 @@
 //!
 //! Defaults to `commit_every = 100`. Override at construction with
 //! [`TextIndex::with_commit_every`].
+//!
+//! ## Fields
+//!
+//! Every document is indexed in three fields: `text` (the whole text, exactly
+//! as in 0.4.3 and earlier), `title` and `url`. A query is scored as BM25 over
+//! `text`, plus `title` and `url` matches weighted by [`FieldBoosts`], plus a
+//! bonus when the whole query appears as a phrase in the title. A document
+//! with no title and no URL matches only in `text`, so it scores exactly as
+//! before. The title and URL come from the caller ([`DocFields`]) or, when
+//! the caller gives none, from the text's own layout: a text whose first line
+//! is an `http(s)://` URL has that URL as its `url` and its second line as
+//! its `title` (see [`DocFields::from_layout`]).
 
 use duxx_core::{Error, Result};
 use parking_lot::Mutex;
@@ -14,20 +26,164 @@ use std::path::Path;
 use std::str::CharIndices;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tantivy::{
-    collector::TopDocs,
+    collector::{Collector, TopDocs},
     directory::MmapDirectory,
     doc,
-    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    query::{
+        BooleanQuery, BoostQuery, EnableScoring, Occur, PhraseQuery, Query, QueryParser, TermQuery,
+    },
     schema::{
-        Field, IndexRecordOption, Schema, TextFieldIndexing, Value, FAST, INDEXED, STORED, TEXT,
+        Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED,
+        STORED, TEXT,
     },
     tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenStream, Tokenizer},
-    Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, TantivyError, Term,
+    DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument,
+    TantivyError, Term,
 };
 
 /// Default insert count between forced commits.
 pub const DEFAULT_COMMIT_EVERY: usize = 100;
+
+/// Default weight of a title match (`DUXX_TEXT_TITLE_BOOST`).
+pub const DEFAULT_TITLE_BOOST: f32 = 3.0;
+/// Default weight of a URL match (`DUXX_TEXT_URL_BOOST`).
+pub const DEFAULT_URL_BOOST: f32 = 1.5;
+/// Default weight of the whole query appearing as a phrase in the title
+/// (`DUXX_TEXT_TITLE_PHRASE_BOOST`).
+pub const DEFAULT_TITLE_PHRASE_BOOST: f32 = 2.0;
+
+/// How much a match in each field counts, relative to a match in the body
+/// text (which always counts 1). A boost of 0 leaves that field out of the
+/// query entirely; [`FieldBoosts::OFF`] scores every document exactly as
+/// 0.4.3 did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FieldBoosts {
+    /// Weight of a match in the title.
+    pub title: f32,
+    /// Weight of a match in the URL.
+    pub url: f32,
+    /// Weight of the whole query (two words or more) appearing, in order and
+    /// adjacent, in the title. Added on top of the per-word title matches.
+    pub title_phrase: f32,
+}
+
+impl FieldBoosts {
+    /// Body text only: the scoring of 0.4.3 and earlier.
+    pub const OFF: FieldBoosts = FieldBoosts {
+        title: 0.0,
+        url: 0.0,
+        title_phrase: 0.0,
+    };
+
+    /// `DUXX_TEXT_TITLE_BOOST`, `DUXX_TEXT_URL_BOOST` and
+    /// `DUXX_TEXT_TITLE_PHRASE_BOOST`, each a number >= 0. Unset (or not a
+    /// number >= 0, which is logged) means the default: 3, 1.5 and 2.
+    pub fn from_env() -> Self {
+        FieldBoosts {
+            title: env_weight("DUXX_TEXT_TITLE_BOOST", DEFAULT_TITLE_BOOST),
+            url: env_weight("DUXX_TEXT_URL_BOOST", DEFAULT_URL_BOOST),
+            title_phrase: env_weight("DUXX_TEXT_TITLE_PHRASE_BOOST", DEFAULT_TITLE_PHRASE_BOOST),
+        }
+    }
+
+    /// Whether no field but the body text is scored.
+    pub fn is_off(&self) -> bool {
+        self.title <= 0.0 && self.url <= 0.0 && self.title_phrase <= 0.0
+    }
+}
+
+impl Default for FieldBoosts {
+    fn default() -> Self {
+        FieldBoosts {
+            title: DEFAULT_TITLE_BOOST,
+            url: DEFAULT_URL_BOOST,
+            title_phrase: DEFAULT_TITLE_PHRASE_BOOST,
+        }
+    }
+}
+
+/// A non-negative number from the environment variable `name`, or `default`
+/// when it is unset or invalid (logged).
+pub fn env_weight(name: &str, default: f32) -> f32 {
+    match std::env::var(name) {
+        Ok(v) => match v.trim().parse::<f32>() {
+            Ok(x) if x.is_finite() && x >= 0.0 => x,
+            _ => {
+                tracing::warn!("{name}={v:?} is not a number >= 0; using the default {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+/// The title and URL of a document, indexed beside its body text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocFields {
+    pub title: Option<String>,
+    pub url: Option<String>,
+}
+
+impl DocFields {
+    /// The fields a text's own layout gives: when its first line is an
+    /// `http://` or `https://` URL (one word, no spaces), that line is the
+    /// URL and the second line, if any, the title. Any other text has no
+    /// fields. This is the layout Gaelxe writes: URL, title, description,
+    /// body, one per line.
+    pub fn from_layout(text: &str) -> Self {
+        let mut lines = text.lines();
+        let first = lines.next().unwrap_or("").trim();
+        let lower = first.get(..8).map(str::to_ascii_lowercase);
+        let is_url = matches!(lower.as_deref(), Some(p) if p.starts_with("http://") || p == "https://")
+            && first.len() > 8
+            && !first.chars().any(char::is_whitespace);
+        if !is_url {
+            return DocFields::default();
+        }
+        let title = lines
+            .next()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        DocFields {
+            title,
+            url: Some(first.to_string()),
+        }
+    }
+
+    /// These fields where given, the text's layout ([`DocFields::from_layout`])
+    /// for any field not given.
+    pub fn or_layout(&self, text: &str) -> Self {
+        if self.title.is_some() && self.url.is_some() {
+            return self.clone();
+        }
+        let layout = DocFields::from_layout(text);
+        DocFields {
+            title: self.title.clone().or(layout.title),
+            url: self.url.clone().or(layout.url),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.url.is_none()
+    }
+}
+
+/// The part of a URL worth matching: without the scheme and a leading
+/// `www.`. The analyzer then splits it at dots, slashes and hyphens, so
+/// `https://www.digilocker.gov.in/` is indexed as `digilocker gov in`.
+fn url_words(url: &str) -> &str {
+    let rest = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => url,
+    };
+    match rest.get(..4) {
+        Some(p) if p.eq_ignore_ascii_case("www.") => &rest[4..],
+        _ => rest,
+    }
+}
 
 /// Name under which the [`TextTokenizer::Words`] analyzer is registered.
 pub const WORDS_TOKENIZER: &str = "duxx_words";
@@ -149,10 +305,22 @@ pub fn words_analyzer() -> TextAnalyzer {
         .build()
 }
 
+/// The fields of the index schema.
+#[derive(Clone, Copy, Debug)]
+struct Fields {
+    id: Field,
+    text: Field,
+    title: Field,
+    url: Field,
+}
+
 /// BM25 full-text index, in-memory, Send + Sync.
 pub struct TextIndex {
     id_field: Field,
     text_field: Field,
+    title_field: Field,
+    url_field: Field,
+    boosts: FieldBoosts,
     index: Index,
     writer: Arc<Mutex<IndexWriter>>,
     reader: IndexReader,
@@ -180,9 +348,9 @@ impl TextIndex {
     /// In-RAM index with an explicit tokenizer instead of the one
     /// `DUXX_TEXT_TOKENIZER` names.
     pub fn in_ram_with(commit_every: usize, tokenizer: TextTokenizer) -> Result<Self> {
-        let (id_field, text_field, schema) = build_schema(tokenizer);
+        let (fields, schema) = build_schema(tokenizer);
         let index = Index::create_in_ram(schema);
-        Self::from_index(index, id_field, text_field, commit_every)
+        Self::from_index(index, fields, commit_every)
     }
 
     /// Open a disk-backed tantivy index at `dir`. The directory is
@@ -191,9 +359,11 @@ impl TextIndex {
     /// caller can immediately commit new docs without rebuild.
     ///
     /// The tokenizer comes from `DUXX_TEXT_TOKENIZER`. When the index on
-    /// disk was built with another tokenizer, it is recreated empty: the
-    /// text index is derived from the rows, and `MemoryStore::open_at`
-    /// refills it from the row store because its count no longer matches.
+    /// disk was built with another tokenizer, or with another schema (an
+    /// index written by 0.4.3 or earlier has no `title` and `url` fields), it
+    /// is recreated empty: the text index is derived from the rows, and
+    /// `MemoryStore::open_at` refills it from the row store because its
+    /// count no longer matches.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_commit_every(dir, DEFAULT_COMMIT_EVERY)
     }
@@ -211,7 +381,7 @@ impl TextIndex {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::Index(format!("create tantivy dir: {e}")))?;
-        let (id_field, text_field, schema) = build_schema(tokenizer);
+        let (fields, schema) = build_schema(tokenizer);
         let mmap =
             MmapDirectory::open(dir).map_err(|e| Error::Index(format!("tantivy mmap dir: {e}")))?;
         let index = match Index::open_or_create(mmap, schema.clone()) {
@@ -233,7 +403,7 @@ impl TextIndex {
             }
             Err(e) => return Err(Error::Index(format!("tantivy open_or_create: {e}"))),
         };
-        Self::from_index(index, id_field, text_field, commit_every)
+        Self::from_index(index, fields, commit_every)
     }
 
     /// The tokenizer the text field was built with.
@@ -257,12 +427,7 @@ impl TextIndex {
         }
     }
 
-    fn from_index(
-        index: Index,
-        id_field: Field,
-        text_field: Field,
-        commit_every: usize,
-    ) -> Result<Self> {
+    fn from_index(index: Index, fields: Fields, commit_every: usize) -> Result<Self> {
         // Registered on every index, so one built with either tokenizer opens.
         index
             .tokenizers()
@@ -277,8 +442,11 @@ impl TextIndex {
             .map_err(|e| Error::Index(format!("tantivy reader: {e}")))?;
 
         Ok(Self {
-            id_field,
-            text_field,
+            id_field: fields.id,
+            text_field: fields.text,
+            title_field: fields.title,
+            url_field: fields.url,
+            boosts: FieldBoosts::from_env(),
             index,
             writer: Arc::new(Mutex::new(writer)),
             reader,
@@ -287,10 +455,44 @@ impl TextIndex {
         })
     }
 
-    /// Insert a document. Commits if the threshold is reached.
+    /// How title, URL and title-phrase matches are weighted (see
+    /// [`FieldBoosts`]). Read from the environment at construction.
+    pub fn field_boosts(&self) -> FieldBoosts {
+        self.boosts
+    }
+
+    /// Change how title, URL and title-phrase matches are weighted. Takes
+    /// effect on the next search; the index itself does not change.
+    pub fn set_field_boosts(&mut self, boosts: FieldBoosts) {
+        self.boosts = boosts;
+    }
+
+    /// The tantivy document for one row: the whole text in `text`, and the
+    /// title and URL (given, else from the text's layout) in their fields.
+    fn make_doc(&self, id: u64, text: String, fields: &DocFields) -> TantivyDocument {
+        let fields = fields.or_layout(&text);
+        let mut d = doc!(self.id_field => id, self.text_field => text);
+        if let Some(title) = fields.title {
+            d.add_text(self.title_field, title);
+        }
+        if let Some(url) = fields.url {
+            d.add_text(self.url_field, url_words(&url));
+        }
+        d
+    }
+
+    /// Insert a document. Commits if the threshold is reached. Its title and
+    /// URL come from its layout ([`DocFields::from_layout`]).
     pub fn insert(&mut self, id: u64, text: String) -> Result<()> {
+        self.insert_with(id, text, &DocFields::default())
+    }
+
+    /// Insert a document with a title and URL given by the caller. A field
+    /// left `None` still comes from the text's layout.
+    pub fn insert_with(&mut self, id: u64, text: String, fields: &DocFields) -> Result<()> {
+        let d = self.make_doc(id, text, fields);
         let mut w = self.writer.lock();
-        w.add_document(doc!(self.id_field => id, self.text_field => text))
+        w.add_document(d)
             .map_err(|e| Error::Index(format!("add_document: {e}")))?;
         let n = self.pending.fetch_add(1, Ordering::SeqCst) + 1;
         if n >= self.commit_every {
@@ -308,6 +510,24 @@ impl TextIndex {
     /// (it deletes all docs and re-adds the survivors in one commit, so a
     /// disk-backed directory is reused rather than orphaned).
     pub fn rebuild(&mut self, survivors: &[(u64, String)]) -> Result<()> {
+        let docs: Vec<TantivyDocument> = survivors
+            .iter()
+            .map(|(id, text)| self.make_doc(*id, text.clone(), &DocFields::default()))
+            .collect();
+        self.rebuild_from(docs)
+    }
+
+    /// [`TextIndex::rebuild`] for documents with a title and URL given by
+    /// the caller.
+    pub fn rebuild_with(&mut self, survivors: &[(u64, String, DocFields)]) -> Result<()> {
+        let docs: Vec<TantivyDocument> = survivors
+            .iter()
+            .map(|(id, text, fields)| self.make_doc(*id, text.clone(), fields))
+            .collect();
+        self.rebuild_from(docs)
+    }
+
+    fn rebuild_from(&mut self, docs: Vec<TantivyDocument>) -> Result<()> {
         let mut w = self.writer.lock();
         // Flush any batched-but-uncommitted inserts into segments first, so
         // `delete_all_documents` (which only targets committed docs) actually
@@ -316,8 +536,8 @@ impl TextIndex {
             .map_err(|e| Error::Index(format!("commit (flush pending): {e}")))?;
         w.delete_all_documents()
             .map_err(|e| Error::Index(format!("delete_all_documents: {e}")))?;
-        for (id, text) in survivors {
-            w.add_document(doc!(self.id_field => *id, self.text_field => text.clone()))
+        for d in docs {
+            w.add_document(d)
                 .map_err(|e| Error::Index(format!("add_document: {e}")))?;
         }
         // Single commit applies the delete (to the pre-delete docs) and the
@@ -351,39 +571,95 @@ impl TextIndex {
         Ok(())
     }
 
-    /// BM25 search; auto-flushes pending writes first.
-    pub fn search(&self, query: &str, k: usize) -> Vec<(u64, f32)> {
+    /// A searcher over everything inserted so far: pending writes are
+    /// committed and the reader reloaded first.
+    fn fresh_searcher(&self) -> Option<Searcher> {
         if let Err(e) = self.flush() {
             tracing::warn!("flush before search failed: {e}");
-            return Vec::new();
+            return None;
         }
         if let Err(e) = self.reader.reload() {
             tracing::warn!("tantivy reader reload failed: {e}");
-            return Vec::new();
+            return None;
         }
-        let searcher = self.reader.searcher();
-        let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
-        // Plain text often is not valid query syntax: a title with a colon
-        // ("arrested: …" reads as a field name) or an unbalanced bracket or
-        // quote failed to parse, and the text side of recall returned
-        // nothing. Such a query is searched as its words instead.
-        let parsed: Box<dyn Query> = match parser.parse_query(query) {
-            Ok(q) => q,
-            Err(e) => {
-                tracing::debug!("query parse failed ({e}); searching its words");
-                match self.words_query(query) {
-                    Some(q) => q,
-                    None => return Vec::new(),
-                }
-            }
+        Some(self.reader.searcher())
+    }
+
+    /// BM25 search; auto-flushes pending writes first. The body text counts
+    /// 1, title and URL matches count as [`FieldBoosts`] says, and the whole
+    /// query appearing as a phrase in the title adds a bonus.
+    pub fn search(&self, query: &str, k: usize) -> Vec<(u64, f32)> {
+        self.run(query, k, true)
+    }
+
+    /// How well the query matches each document's title and URL alone, with
+    /// the title-phrase bonus, best first: the part of [`TextIndex::search`]'s
+    /// score that does not come from the body text. Empty when every field
+    /// boost is 0 or no document has a title or URL that matches.
+    pub fn field_search(&self, query: &str, k: usize) -> Vec<(u64, f32)> {
+        self.run(query, k, false)
+    }
+
+    fn run(&self, query: &str, k: usize, with_body: bool) -> Vec<(u64, f32)> {
+        let Some(searcher) = self.fresh_searcher() else {
+            return Vec::new();
         };
-        let docs = match searcher.search(&parsed, &TopDocs::with_limit(k)) {
-            Ok(d) => d,
+        let Some(q) = self.scored_query(query, with_body) else {
+            return Vec::new();
+        };
+        match searcher.search(&q, &TopDocs::with_limit(k)) {
+            Ok(docs) => self.ids(&searcher, docs),
             Err(e) => {
                 tracing::warn!("tantivy search failed: {e}");
-                return Vec::new();
+                Vec::new()
+            }
+        }
+    }
+
+    /// [`TextIndex::search`] that stops at `deadline`. The index's segments
+    /// are searched one at a time; the best `k` hits of each finished segment
+    /// are appended to `found` (unsorted, at most `k` per segment), so a
+    /// caller that stops waiting at the deadline can use what is there.
+    /// Returns `true` when every segment was searched, `false` when the
+    /// deadline came first.
+    pub fn search_until(
+        &self,
+        query: &str,
+        k: usize,
+        deadline: Instant,
+        found: &Mutex<Vec<(u64, f32)>>,
+    ) -> bool {
+        let Some(searcher) = self.fresh_searcher() else {
+            return true;
+        };
+        let Some(q) = self.scored_query(query, true) else {
+            return true;
+        };
+        let weight = match q.weight(EnableScoring::enabled_from_searcher(&searcher)) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("tantivy weight failed: {e}");
+                return true;
             }
         };
+        let collector = TopDocs::with_limit(k);
+        for (ord, segment) in searcher.segment_readers().iter().enumerate() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            match collector.collect_segment(weight.as_ref(), ord as u32, segment) {
+                Ok(docs) => {
+                    let hits = self.ids(&searcher, docs);
+                    found.lock().extend(hits);
+                }
+                Err(e) => tracing::warn!("tantivy segment search failed: {e}"),
+            }
+        }
+        true
+    }
+
+    /// Row ids and scores of tantivy hits.
+    fn ids(&self, searcher: &Searcher, docs: Vec<(f32, DocAddress)>) -> Vec<(u64, f32)> {
         docs.into_iter()
             .filter_map(|(score, addr)| {
                 let d: TantivyDocument = searcher.doc(addr).ok()?;
@@ -394,25 +670,126 @@ impl TextIndex {
             .collect()
     }
 
-    /// Any of the query's words, split by the field's own analyzer, scored
-    /// by BM25: what the query parser makes of plain words, without its
-    /// syntax. `None` when the query has no words.
-    fn words_query(&self, query: &str) -> Option<Box<dyn Query>> {
-        let mut analyzer = self.index.tokenizer_for_field(self.text_field).ok()?;
+    /// The query to run: the words (or query syntax) over the body text when
+    /// `with_body`, the title and the URL, each with its boost, plus the
+    /// title-phrase bonus. With [`FieldBoosts::OFF`] and `with_body` this is
+    /// exactly the body-only query of 0.4.3.
+    fn scored_query(&self, query: &str, with_body: bool) -> Option<Box<dyn Query>> {
+        let b = self.boosts;
+        let mut fields: Vec<(Field, f32)> = Vec::with_capacity(3);
+        if with_body {
+            fields.push((self.text_field, 1.0));
+        }
+        if b.title > 0.0 {
+            fields.push((self.title_field, b.title));
+        }
+        if b.url > 0.0 {
+            fields.push((self.url_field, b.url));
+        }
+        let words = if fields.is_empty() {
+            None
+        } else {
+            self.parsed_query(query, &fields)
+        };
+        let phrase: Option<Box<dyn Query>> = if b.title_phrase > 0.0 {
+            self.title_phrase_query(query)
+                .map(|p| Box::new(BoostQuery::new(p, b.title_phrase)) as Box<dyn Query>)
+        } else {
+            None
+        };
+        match (words, phrase) {
+            (Some(w), None) => Some(w),
+            (None, p) => p,
+            (Some(w), Some(p)) => {
+                // With the body, the phrase only adds to documents the query
+                // matches (so `-word` exclusions still hold).
+                let occur = if with_body {
+                    Occur::Must
+                } else {
+                    Occur::Should
+                };
+                Some(Box::new(BooleanQuery::new(vec![
+                    (occur, w),
+                    (Occur::Should, p),
+                ])))
+            }
+        }
+    }
+
+    /// The query parsed as tantivy query syntax over `fields`, each with its
+    /// boost. Plain text often is not valid query syntax: a title with a
+    /// colon ("arrested: …" reads as a field name) or an unbalanced bracket
+    /// or quote failed to parse, and the text side of recall returned
+    /// nothing. Such a query is searched as its words instead.
+    fn parsed_query(&self, query: &str, fields: &[(Field, f32)]) -> Option<Box<dyn Query>> {
+        let mut parser =
+            QueryParser::for_index(&self.index, fields.iter().map(|(f, _)| *f).collect());
+        for (field, boost) in fields {
+            if *boost != 1.0 {
+                parser.set_field_boost(*field, *boost);
+            }
+        }
+        match parser.parse_query(query) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                tracing::debug!("query parse failed ({e}); searching its words");
+                self.words_query(query, fields)
+            }
+        }
+    }
+
+    /// The query's words, split by the text field's analyzer (every field
+    /// uses the same one).
+    fn query_words(&self, query: &str) -> Vec<String> {
+        let Ok(mut analyzer) = self.index.tokenizer_for_field(self.text_field) else {
+            return Vec::new();
+        };
         let mut stream = analyzer.token_stream(query);
-        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        let mut words = Vec::new();
         while stream.advance() {
-            let term = Term::from_field_text(self.text_field, &stream.token().text);
-            clauses.push((
-                Occur::Should,
-                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
-            ));
+            words.push(stream.token().text.clone());
+        }
+        words
+    }
+
+    /// Any of the query's words in any of `fields`, scored by BM25 with each
+    /// field's boost: what the query parser makes of plain words, without
+    /// its syntax. `None` when the query has no words.
+    fn words_query(&self, query: &str, fields: &[(Field, f32)]) -> Option<Box<dyn Query>> {
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for word in self.query_words(query) {
+            for (field, boost) in fields {
+                let term = Term::from_field_text(*field, &word);
+                let q: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                let q = if *boost != 1.0 {
+                    Box::new(BoostQuery::new(q, *boost))
+                } else {
+                    q
+                };
+                clauses.push((Occur::Should, q));
+            }
         }
         if clauses.is_empty() {
             None
         } else {
             Some(Box::new(BooleanQuery::new(clauses)))
         }
+    }
+
+    /// The query's words, in order and adjacent, in the title. `None` for a
+    /// query of fewer than two words (a one-word query gets its title weight
+    /// from the per-word title match).
+    fn title_phrase_query(&self, query: &str) -> Option<Box<dyn Query>> {
+        let words = self.query_words(query);
+        if words.len() < 2 {
+            return None;
+        }
+        let terms: Vec<Term> = words
+            .iter()
+            .map(|w| Term::from_field_text(self.title_field, w))
+            .collect();
+        Some(Box::new(PhraseQuery::new(terms)))
     }
 
     /// Number of documents — auto-flushes pending writes first.
@@ -431,13 +808,15 @@ impl TextIndex {
     }
 }
 
-/// Build the canonical (id_field, text_field, schema) triple. Matches
-/// the on-disk schema so re-opens succeed. With [`TextTokenizer::Default`]
-/// it is exactly the 0.4.2 schema, so existing indexes open unchanged.
-fn build_schema(tokenizer: TextTokenizer) -> (Field, Field, Schema) {
+/// Build the canonical fields and schema. The `id` and `text` fields are
+/// those of 0.4.3 and earlier; `title` and `url` were added in 0.4.4 and use
+/// the same tokenizer as `text`. An index written before 0.4.4 has another
+/// schema, so [`TextIndex::open_with`] recreates it empty and the memory
+/// store refills it from its rows.
+fn build_schema(tokenizer: TextTokenizer) -> (Fields, Schema) {
     let mut sb = Schema::builder();
-    let id_field = sb.add_u64_field("id", STORED | INDEXED | FAST);
-    let text_options = match tokenizer {
+    let id = sb.add_u64_field("id", STORED | INDEXED | FAST);
+    let text_options: TextOptions = match tokenizer {
         TextTokenizer::Default => TEXT,
         TextTokenizer::Words => TEXT.set_indexing_options(
             TextFieldIndexing::default()
@@ -445,9 +824,19 @@ fn build_schema(tokenizer: TextTokenizer) -> (Field, Field, Schema) {
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         ),
     };
-    let text_field = sb.add_text_field("text", text_options);
+    let text = sb.add_text_field("text", text_options.clone());
+    let title = sb.add_text_field("title", text_options.clone());
+    let url = sb.add_text_field("url", text_options);
     let schema = sb.build();
-    (id_field, text_field, schema)
+    (
+        Fields {
+            id,
+            text,
+            title,
+            url,
+        },
+        schema,
+    )
 }
 
 impl Default for TextIndex {
@@ -668,6 +1057,281 @@ mod tests {
             assert_eq!(idx.search("शिक्षा", 5).first().map(|h| h.0), Some(1));
             assert!(idx.search("षा", 5).is_empty());
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -------- 0.4.4: title and URL fields --------
+
+    /// A page as Gaelxe writes it: URL, title, description, marker, body.
+    fn page(url: &str, title: &str, description: &str, body: &str) -> String {
+        format!("{url}\n{title}\n{description}\ngxm20261109Len\n{body}")
+    }
+
+    /// One site: its home page titled with the site's name, and two deep
+    /// pages that mention the name often in their body but not in their title.
+    fn wipro_site() -> Vec<(u64, String)> {
+        vec![
+            (
+                1,
+                page(
+                    "https://www.wipro.com/",
+                    "Wipro",
+                    "Technology services and consulting company helping clients build better businesses",
+                    "Explore our services, industries, insights and careers across the world.",
+                ),
+            ),
+            (
+                2,
+                page(
+                    "https://www.wipro.com/investors/annual-report/",
+                    "Annual report 2025",
+                    "Annual report",
+                    "Wipro revenue grew. Wipro margins held. Wipro board met. Wipro paid a dividend.",
+                ),
+            ),
+            (
+                3,
+                page(
+                    "https://www.wipro.com/careers/india/",
+                    "Careers in India",
+                    "Jobs",
+                    "Join Wipro. Wipro hires freshers. Wipro campus drives. Wipro offices.",
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn layout_gives_url_and_title() {
+        let v2 = page(
+            "https://www.india.gov.in/",
+            "National Portal of India",
+            "d",
+            "b",
+        );
+        assert_eq!(
+            DocFields::from_layout(&v2),
+            DocFields {
+                title: Some("National Portal of India".into()),
+                url: Some("https://www.india.gov.in/".into()),
+            }
+        );
+        // v1 (no marker line) has the same first two lines
+        let v1 = "http://example.in/a\nExample title\ndescription\nbody";
+        assert_eq!(
+            DocFields::from_layout(v1).title.as_deref(),
+            Some("Example title")
+        );
+        // A text that does not start with a URL has no fields
+        assert!(DocFields::from_layout("I lost my wallet at the cafe").is_empty());
+        assert!(DocFields::from_layout("https is a protocol\nnot a title").is_empty());
+        assert!(DocFields::from_layout("https://\ntitle").is_empty());
+        assert!(DocFields::from_layout("").is_empty());
+        // Given fields win; missing ones come from the layout
+        let given = DocFields {
+            title: Some("Given".into()),
+            url: None,
+        };
+        assert_eq!(
+            given.or_layout(&v2),
+            DocFields {
+                title: Some("Given".into()),
+                url: Some("https://www.india.gov.in/".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn url_is_split_into_words_without_scheme_and_www() {
+        assert_eq!(
+            url_words("https://www.digilocker.gov.in/"),
+            "digilocker.gov.in/"
+        );
+        assert_eq!(
+            url_words("http://nad.digilocker.gov.in"),
+            "nad.digilocker.gov.in"
+        );
+        assert_eq!(url_words("WWW.example.com"), "example.com");
+        let mut idx = TextIndex::in_ram_with(1, TextTokenizer::Words).unwrap();
+        idx.set_field_boosts(FieldBoosts::default());
+        idx.insert(1, page("https://www.digilocker.gov.in/", "Home", "d", "b"))
+            .unwrap();
+        idx.insert(2, "a page about something else".into()).unwrap();
+        let hits = idx.field_search("digilocker", 10);
+        assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), vec![1]);
+        assert!(idx.field_search("www", 10).is_empty(), "www is dropped");
+        assert!(
+            idx.field_search("https", 10).is_empty(),
+            "the scheme is dropped"
+        );
+    }
+
+    #[test]
+    fn title_match_outranks_body_mentions() {
+        for tokenizer in [TextTokenizer::Default, TextTokenizer::Words] {
+            let mut idx = TextIndex::in_ram_with(1, tokenizer).unwrap();
+            for (id, text) in wipro_site() {
+                idx.insert(id, text).unwrap();
+            }
+            // Fields on: the page titled "Wipro" comes first.
+            idx.set_field_boosts(FieldBoosts::default());
+            let on = idx.search("wipro", 10);
+            assert_eq!(on.len(), 3, "{tokenizer:?}");
+            assert_eq!(on[0].0, 1, "{tokenizer:?}: {on:?}");
+            // Fields off (0.4.3 scoring): the pages that repeat the word win.
+            idx.set_field_boosts(FieldBoosts::OFF);
+            let off = idx.search("wipro", 10);
+            assert_eq!(off.len(), 3, "{tokenizer:?}");
+            assert_ne!(off[0].0, 1, "{tokenizer:?}: {off:?}");
+            assert_eq!(off.last().map(|h| h.0), Some(1), "{tokenizer:?}: {off:?}");
+        }
+    }
+
+    #[test]
+    fn whole_query_in_the_title_earns_the_phrase_bonus() {
+        let mut idx = TextIndex::in_ram_with(1, TextTokenizer::Default).unwrap();
+        // Same words, same lengths; only doc 1 has them in the query's order.
+        idx.insert(
+            1,
+            page("https://cars.example/a", "tata nexon price list", "d", "b"),
+        )
+        .unwrap();
+        idx.insert(
+            2,
+            page("https://cars.example/b", "price list nexon tata", "d", "b"),
+        )
+        .unwrap();
+        let score = |hits: &[(u64, f32)], id: u64| hits.iter().find(|h| h.0 == id).unwrap().1;
+
+        idx.set_field_boosts(FieldBoosts::default());
+        let on = idx.search("tata nexon price", 10);
+        assert_eq!(on[0].0, 1, "{on:?}");
+        assert!(score(&on, 1) > score(&on, 2) + 0.1, "{on:?}");
+
+        idx.set_field_boosts(FieldBoosts {
+            title_phrase: 0.0,
+            ..FieldBoosts::default()
+        });
+        let no_phrase = idx.search("tata nexon price", 10);
+        assert!(
+            (score(&no_phrase, 1) - score(&no_phrase, 2)).abs() < 1e-4,
+            "{no_phrase:?}"
+        );
+        // A one-word query has no phrase
+        assert!(idx.title_phrase_query("nexon").is_none());
+    }
+
+    #[test]
+    fn documents_without_fields_score_exactly_as_before() {
+        let texts = [
+            "refund refund my order",
+            "refund please",
+            "weather forecast for Pune",
+            "Thomas Markle arrested in Florida",
+        ];
+        for tokenizer in [TextTokenizer::Default, TextTokenizer::Words] {
+            let mut idx = TextIndex::in_ram_with(1, tokenizer).unwrap();
+            for (i, t) in texts.iter().enumerate() {
+                idx.insert(i as u64 + 1, t.to_string()).unwrap();
+            }
+            for q in [
+                "refund",
+                "refund order",
+                "weather Pune",
+                "arrested: Markle",
+                "\"refund my\"",
+            ] {
+                idx.set_field_boosts(FieldBoosts::OFF);
+                let before = idx.search(q, 10);
+                idx.set_field_boosts(FieldBoosts::default());
+                let after = idx.search(q, 10);
+                assert!(!before.is_empty(), "{tokenizer:?} {q}");
+                assert_eq!(before.len(), after.len(), "{tokenizer:?} {q}");
+                for (b, a) in before.iter().zip(&after) {
+                    assert_eq!(b.0, a.0, "{tokenizer:?} {q}");
+                    assert!(
+                        (b.1 - a.1).abs() < 1e-6,
+                        "{tokenizer:?} {q}: {b:?} vs {a:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_fields_are_indexed_and_kept_by_rebuild() {
+        let mut idx = TextIndex::in_ram_with(1, TextTokenizer::Default).unwrap();
+        idx.set_field_boosts(FieldBoosts::default());
+        let fields = DocFields {
+            title: Some("Digilocker login".into()),
+            url: Some("https://www.digilocker.gov.in/".into()),
+        };
+        idx.insert_with(1, "Sign in to your documents".into(), &fields)
+            .unwrap();
+        idx.insert(2, "unrelated text".into()).unwrap();
+        assert_eq!(idx.field_search("login", 10).first().map(|h| h.0), Some(1));
+        idx.rebuild_with(&[(1, "Sign in to your documents".into(), fields)])
+            .unwrap();
+        assert_eq!(idx.len(), 1);
+        assert_eq!(
+            idx.field_search("digilocker", 10).first().map(|h| h.0),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn search_until_stops_at_the_deadline() {
+        // One segment per document (commit_every = 1, no merges this small).
+        let mut idx = TextIndex::in_ram_with(1, TextTokenizer::Default).unwrap();
+        for i in 0..20u64 {
+            idx.insert(i, format!("monsoon rainfall report {i}"))
+                .unwrap();
+        }
+        let full = idx.search("monsoon", 50);
+        assert_eq!(full.len(), 20);
+
+        // Deadline already passed: nothing is searched, and it says so.
+        let found = Mutex::new(Vec::new());
+        let complete = idx.search_until("monsoon", 50, Instant::now(), &found);
+        assert!(!complete);
+        assert!(found.lock().is_empty());
+
+        // Time to spare: the same hits as a full search.
+        let found = Mutex::new(Vec::new());
+        let later = Instant::now() + std::time::Duration::from_secs(30);
+        assert!(idx.search_until("monsoon", 50, later, &found));
+        let mut got: Vec<u64> = found.lock().iter().map(|h| h.0).collect();
+        let mut want: Vec<u64> = full.iter().map(|h| h.0).collect();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn index_from_before_the_title_field_is_recreated() {
+        // An index written by 0.4.3: only `id` and `text`.
+        let dir = temp_dir("old-schema");
+        {
+            let mut sb = Schema::builder();
+            let id = sb.add_u64_field("id", STORED | INDEXED | FAST);
+            let text = sb.add_text_field("text", TEXT);
+            std::fs::create_dir_all(&dir).unwrap();
+            let index = Index::create_in_dir(&dir, sb.build()).unwrap();
+            let mut w: IndexWriter = index.writer_with_num_threads(1, 20_000_000).unwrap();
+            w.add_document(doc!(id => 1u64, text => "old row")).unwrap();
+            w.commit().unwrap();
+        }
+        let mut idx = TextIndex::open_with(&dir, 1, TextTokenizer::Default).unwrap();
+        assert_eq!(
+            idx.len(),
+            0,
+            "emptied, for the store to refill from its rows"
+        );
+        idx.insert(1, page("https://www.wipro.com/", "Wipro", "d", "b"))
+            .unwrap();
+        drop(idx);
+        let idx = TextIndex::open_with(&dir, 1, TextTokenizer::Default).unwrap();
+        assert_eq!(idx.len(), 1, "the new schema opens as it is");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
