@@ -563,7 +563,7 @@ fn newest_dump(dir: &Path) -> Option<String> {
         let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
             continue;
         };
-        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+        if best.as_ref().map_or(true, |(t, _)| modified > *t) {
             best = Some((modified, base.to_string()));
         }
     }
