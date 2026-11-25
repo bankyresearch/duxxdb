@@ -38,7 +38,7 @@ jobs:
           EN: ${{ inputs.english || '150000' }}
           HI: ${{ inputs.hindi || '50000' }}
         run: |
-          pip install --quiet pyarrow==17.0.0
+          pip install --quiet pyarrow
           mkdir -p corpus
           curl -sSfL -o corpus/en.parquet https://huggingface.co/datasets/wikimedia/wikipedia/resolve/main/20231101.en/train-00000-of-00041.parquet
           curl -sSfL -o corpus/hi.parquet https://huggingface.co/datasets/wikimedia/wikipedia/resolve/main/20231101.hi/train-00000-of-00002.parquet
