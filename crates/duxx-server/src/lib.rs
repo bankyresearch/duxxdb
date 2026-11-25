@@ -1179,13 +1179,18 @@ impl Server {
     }
 
     fn cmd_info(&self) -> Response {
+        let (vector_bytes, row_bytes) = self.memory.index_memory_bytes();
+        let known = |b: Option<usize>| b.map(|b| b.to_string()).unwrap_or_else(|| "unknown".into());
         let info = format!(
-            "# Server\r\nserver:{SERVER_NAME}\r\nversion:{SERVER_VERSION}\r\n# Stats\r\nmemories:{}\r\nsessions:{}\r\ndim:{}\r\nlean_rows:{}\r\ntext_tokenizer:{}\r\n",
+            "# Server\r\nserver:{SERVER_NAME}\r\nversion:{SERVER_VERSION}\r\n# Stats\r\nmemories:{}\r\nsessions:{}\r\ndim:{}\r\nlean_rows:{}\r\ntext_tokenizer:{}\r\nvector_index:{}\r\nvector_index_bytes:{}\r\nrow_map_bytes:{}\r\n",
             self.memory.len(),
             self.sessions.len(),
             self.dim,
             u8::from(self.memory.is_lean()),
-            self.memory.text_tokenizer()
+            self.memory.text_tokenizer(),
+            self.memory.vector_index_kind(),
+            known(vector_bytes),
+            known(row_bytes)
         );
         Response::Reply(RespValue::BulkString(info.into_bytes()))
     }

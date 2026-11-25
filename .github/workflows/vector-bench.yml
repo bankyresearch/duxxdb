@@ -1,0 +1,60 @@
+name: vector-bench
+
+# Compares the hnsw_rs graph with the compact graph on 200,000 Wikipedia
+# articles (English and Hindi) embedded with hash:128, and writes the numbers
+# to the job summary. Manual or on pushes that touch the vector index.
+on:
+  workflow_dispatch:
+    inputs:
+      english:
+        description: English articles
+        default: '150000'
+      hindi:
+        description: Hindi articles
+        default: '50000'
+  push:
+    branches: ['feat/scale-memory-0.4']
+    paths:
+      - 'crates/duxx-index/**'
+      - '.github/workflows/vector-bench.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vector-bench
+      - name: Build the example
+        run: cargo build --release -p duxx-index --example vector_compare
+      - name: Fetch a Wikipedia sample
+        env:
+          EN: ${{ inputs.english || '150000' }}
+          HI: ${{ inputs.hindi || '50000' }}
+        run: |
+          pip install --quiet pyarrow
+          mkdir -p corpus
+          curl -sSfL -o corpus/en.parquet https://huggingface.co/datasets/wikimedia/wikipedia/resolve/main/20231101.en/train-00000-of-00041.parquet
+          curl -sSfL -o corpus/hi.parquet https://huggingface.co/datasets/wikimedia/wikipedia/resolve/main/20231101.hi/train-00000-of-00002.parquet
+          python3 scripts/vector_bench_corpus.py corpus/en.parquet corpus/hi.parquet "$EN" "$HI" corpus/wiki
+      - name: hnsw_rs
+        run: ./target/release/examples/vector_compare corpus/wiki hnsw 128 | tee hnsw.txt
+      - name: compact (ef 256)
+        run: ./target/release/examples/vector_compare corpus/wiki compact 128 | tee compact.txt
+      - name: compact (ef 512)
+        env:
+          DUXX_VECTOR_EF: '512'
+        run: ./target/release/examples/vector_compare corpus/wiki compact 128 | tee compact512.txt
+      - name: Summary
+        run: |
+          {
+            echo '### hnsw_rs (production today)'; echo '```'; cat hnsw.txt; echo '```'
+            echo '### compact, DUXX_VECTOR_EF=256 (default)'; echo '```'; cat compact.txt; echo '```'
+            echo '### compact, DUXX_VECTOR_EF=512'; echo '```'; cat compact512.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
