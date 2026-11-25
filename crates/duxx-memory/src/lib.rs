@@ -8,16 +8,17 @@
 //! - [`SessionStore`] — hot KV with sliding TTL for per-conversation
 //!   working state.
 
+mod rows;
 pub mod session;
 pub mod tool_cache;
 
 use duxx_core::Result;
-use duxx_index::{TextIndex, VectorIndex};
+use duxx_index::{TextIndex, VectorIndex, VectorKind};
 use duxx_query::{hybrid_recall, RecallHit};
 use duxx_reactive::{ChangeBus, ChangeEvent, ChangeKind};
 use duxx_storage::Storage;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use rows::RowMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -104,7 +105,7 @@ pub struct MemoryStore {
 #[derive(Debug)]
 struct Inner {
     dim: usize,
-    by_id: RwLock<HashMap<u64, Memory>>,
+    by_id: RwLock<RowMap>,
     vector_index: RwLock<VectorIndex>,
     text_index: RwLock<TextIndex>,
     next_id: RwLock<u64>,
@@ -245,7 +246,7 @@ impl MemoryStore {
         Self {
             inner: Arc::new(Inner {
                 dim,
-                by_id: RwLock::new(HashMap::new()),
+                by_id: RwLock::new(RowMap::new(false, 0)),
                 vector_index: RwLock::new(VectorIndex::with_capacity(dim, capacity)),
                 text_index: RwLock::new(TextIndex::new()),
                 next_id: RwLock::new(1),
@@ -264,7 +265,7 @@ impl MemoryStore {
     /// The `Inner` of a store opened over durable storage.
     fn persistent_inner(
         dim: usize,
-        by_id: HashMap<u64, Memory>,
+        by_id: RowMap,
         vector_index: VectorIndex,
         text_index: TextIndex,
         next_id: u64,
@@ -291,6 +292,20 @@ impl MemoryStore {
     /// Whether rows are kept lean in memory (see [`lean_rows_from_env`]).
     pub fn is_lean(&self) -> bool {
         self.inner.lean
+    }
+
+    /// The vector graph in use: `hnsw` or `compact` (`DUXX_VECTOR_INDEX`).
+    pub fn vector_index_kind(&self) -> &'static str {
+        self.inner.vector_index.read().kind().name()
+    }
+
+    /// Bytes held by the vector index (compact kind only) and by the lean
+    /// row map (lean rows only); `None` where the size is not known.
+    pub fn index_memory_bytes(&self) -> (Option<usize>, Option<usize>) {
+        (
+            self.inner.vector_index.read().memory_bytes(),
+            self.inner.by_id.read().lean_bytes(),
+        )
     }
 
     /// Name of the tokenizer the text index was built with: `default`, or
@@ -362,16 +377,17 @@ impl MemoryStore {
         storage: Arc<dyn Storage>,
         lean: bool,
     ) -> Result<Self> {
-        let mut vector_index = VectorIndex::with_capacity(dim, capacity);
+        let mut vector_index =
+            VectorIndex::with_capacity_kind(dim, capacity, VectorKind::from_env());
         let mut text_index = TextIndex::new();
-        let mut by_id: HashMap<u64, Memory> = HashMap::with_capacity(storage.len().unwrap_or(0));
+        let mut by_id = RowMap::new(lean, storage.len().unwrap_or(0));
         let mut max_id = 0u64;
         storage.for_each(&mut |id, bytes| {
             let stored = decode_stored(id, bytes, dim)?;
             vector_index.insert(id, stored.embedding.clone())?;
             text_index.insert(id, stored.text.clone())?;
             let mem = Memory::from_stored(id, stored);
-            by_id.insert(id, if lean { mem.into_lean() } else { mem });
+            by_id.insert(if lean { mem.into_lean() } else { mem });
             max_id = max_id.max(id);
             Ok(())
         })?;
@@ -481,7 +497,7 @@ impl MemoryStore {
     /// results. Reclaiming the index memory itself requires HNSW
     /// tombstones + tantivy deletes, which is Phase 6.3 work.
     pub fn forget(&self, id: u64) -> bool {
-        let removed = self.inner.by_id.write().remove(&id).is_some();
+        let removed = self.inner.by_id.write().remove(id);
         if removed {
             if let Some(s) = &self.inner.storage {
                 let _ = s.delete(id);
@@ -518,10 +534,7 @@ impl MemoryStore {
         // takes the write lock.
         let mut scored: Vec<(u64, f32)> = {
             let by_id = self.inner.by_id.read();
-            by_id
-                .values()
-                .map(|m| (m.id, m.effective_importance(half_life)))
-                .collect()
+            by_id.importances(half_life)
         };
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -565,7 +578,7 @@ impl MemoryStore {
                 // Lean rows: the text and embedding live only in storage.
                 (Some(s), true) => {
                     s.for_each(&mut |id, bytes| {
-                        if by_id.contains_key(&id) {
+                        if by_id.contains(id) {
                             let stored = decode_stored(id, bytes, self.inner.dim)?;
                             survivors_vec.push((id, stored.embedding));
                             survivors_text.push((id, stored.text));
@@ -574,9 +587,9 @@ impl MemoryStore {
                     })?;
                 }
                 _ => {
-                    for m in by_id.values() {
-                        survivors_vec.push((m.id, m.embedding.clone()));
-                        survivors_text.push((m.id, m.text.clone()));
+                    for m in by_id.all() {
+                        survivors_vec.push((m.id, m.embedding));
+                        survivors_text.push((m.id, m.text));
                     }
                 }
             }
@@ -636,7 +649,7 @@ impl MemoryStore {
     pub fn all_memories(&self) -> Vec<Memory> {
         let mut out: Vec<Memory> = {
             let by_id = self.inner.by_id.read();
-            by_id.values().cloned().collect()
+            by_id.all()
         };
         out.sort_by_key(|m| m.id);
         if self.inner.lean {
@@ -687,7 +700,7 @@ impl MemoryStore {
         } else {
             mem
         };
-        self.inner.by_id.write().insert(id, mem);
+        self.inner.by_id.write().insert(mem);
         // Publish a change event. Lossy by design — slow subscribers
         // may miss events. Channel = "memory.<key>", so `PSUBSCRIBE
         // memory.*` filters by user/agent key.
@@ -751,7 +764,8 @@ impl MemoryStore {
         let storage: Arc<dyn Storage> =
             Arc::new(duxx_storage::RedbStorage::open(dir.join("store.redb"))?);
         let text_index = TextIndex::open(dir.join("tantivy"))?;
-        let vector_index = VectorIndex::open(dim, capacity, dir.join("hnsw"))?;
+        let vector_index =
+            VectorIndex::open_kind(dim, capacity, dir.join("hnsw"), VectorKind::from_env())?;
 
         // 2. Bring each index in line with the row store, never by adding
         //    rows it already holds (that duplicated every row on each
@@ -776,7 +790,7 @@ impl MemoryStore {
 
         // 3. Walk the row store once: rebuild `by_id` (never persisted on its
         //    own) and fill whatever step 2 found missing.
-        let mut by_id: HashMap<u64, Memory> = HashMap::with_capacity(row_count);
+        let mut by_id = RowMap::new(lean, row_count);
         let mut max_id = 0u64;
         let mut vectors_added = 0usize;
         storage.for_each(&mut |id, bytes| {
@@ -789,7 +803,7 @@ impl MemoryStore {
                 text_index.insert(id, stored.text.clone())?;
             }
             let mem = Memory::from_stored(id, stored);
-            by_id.insert(id, if lean { mem.into_lean() } else { mem });
+            by_id.insert(if lean { mem.into_lean() } else { mem });
             max_id = max_id.max(id);
             Ok(())
         })?;
@@ -834,9 +848,9 @@ impl MemoryStore {
         let by_id = self.inner.by_id.read();
         let mut out = Vec::with_capacity(hits.len());
         for h in hits {
-            if let Some(m) = by_id.get(&h.id) {
+            if let Some(m) = by_id.get(h.id) {
                 out.push(MemoryHit {
-                    memory: m.clone(),
+                    memory: m,
                     score: h.score,
                 });
             }
@@ -953,8 +967,8 @@ mod tests {
 
         // The first two (oldest -> lowest decayed importance) are gone.
         let by_id = s.inner.by_id.read();
-        assert!(!by_id.contains_key(&id_a), "alpha should be evicted");
-        assert!(!by_id.contains_key(&id_b), "beta should be evicted");
+        assert!(!by_id.contains(id_a), "alpha should be evicted");
+        assert!(!by_id.contains(id_b), "beta should be evicted");
     }
 
     #[test]
@@ -1038,7 +1052,7 @@ mod tests {
 
         // A survivor is still recallable; no forgotten row can surface.
         let survivor = ids[25];
-        let m = s.inner.by_id.read().get(&survivor).cloned().unwrap();
+        let m = s.inner.by_id.read().get(survivor).unwrap();
         let hits = s.recall("u", &m.text, &m.embedding, 10).unwrap();
         assert!(
             hits.iter().any(|h| h.memory.id == survivor),
@@ -1211,7 +1225,7 @@ mod tests {
         // Half-life 1ms → after a few ms, importance should be near zero.
         let s = MemoryStore::new(8);
         let id = s.remember("u", "test", embed("test", 8)).unwrap();
-        let m = s.inner.by_id.read().get(&id).cloned().unwrap();
+        let m = s.inner.by_id.read().get(id).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         let eff = m.effective_importance(std::time::Duration::from_millis(1));
         assert!(
@@ -1292,7 +1306,8 @@ mod tests {
         s.inner
             .by_id
             .read()
-            .values()
+            .all()
+            .iter()
             .all(|m| m.text.is_empty() && m.embedding.is_empty())
     }
 
@@ -1353,7 +1368,8 @@ mod tests {
                 .inner
                 .by_id
                 .read()
-                .values()
+                .all()
+                .iter()
                 .all(|m| !m.text.is_empty() && m.embedding.len() == DIM));
         }
 
@@ -1592,7 +1608,7 @@ mod tests {
             id = store
                 .remember("u", "remembered_long_ago", embed("ancient", DIM))
                 .unwrap();
-            let m = store.inner.by_id.read().get(&id).cloned().unwrap();
+            let m = store.inner.by_id.read().get(id).unwrap();
             original_ts = m.created_at_unix_ns;
             assert!(original_ts > 0);
         }
@@ -1604,7 +1620,7 @@ mod tests {
             let storage: Arc<dyn Storage> =
                 Arc::new(duxx_storage::RedbStorage::open(&path).unwrap());
             let store = MemoryStore::with_storage(DIM, 1_000, storage).unwrap();
-            let m = store.inner.by_id.read().get(&id).cloned().unwrap();
+            let m = store.inner.by_id.read().get(id).unwrap();
             assert_eq!(
                 m.created_at_unix_ns, original_ts,
                 "timestamp must be preserved across restart"

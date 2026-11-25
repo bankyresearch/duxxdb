@@ -8,10 +8,12 @@
 //!
 //! [tantivy]: https://github.com/quickwit-oss/tantivy
 
+pub mod compact;
 pub mod text;
 pub mod vector;
 
+pub use compact::CompactHnsw;
 pub use text::TextIndex;
-pub use vector::{cosine, VectorIndex};
+pub use vector::{cosine, VectorIndex, VectorKind};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
