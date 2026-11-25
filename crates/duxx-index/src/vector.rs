@@ -260,10 +260,10 @@ impl VectorIndex {
     pub fn open(dim: usize, capacity: usize, dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| Error::Index(format!("create hnsw dir: {e}")))?;
-        let graph_path = dir.join(format!("{HNSW_NAME}.hnsw.graph"));
+        let basename = newest_dump(&dir);
         let meta_path = dir.join(META_FILE);
 
-        let inner = if graph_path.exists() && meta_path.exists() {
+        let inner = if let (Some(basename), true) = (basename, meta_path.exists()) {
             // Restore.
             let meta_bytes = std::fs::read(&meta_path)
                 .map_err(|e| Error::Index(format!("read hnsw meta: {e}")))?;
@@ -281,19 +281,39 @@ impl VectorIndex {
             // per VectorIndex::open call — bounded by the number of
             // re-opens in a process, which is finite. The leaked memory
             // is reclaimed at process exit.
-            let io: &'static mut HnswIo = Box::leak(Box::new(HnswIo::new(&dir, HNSW_NAME)));
+            let io: &'static mut HnswIo = Box::leak(Box::new(HnswIo::new(&dir, &basename)));
             let hnsw: Hnsw<'static, f32, DistCosine> = io
                 .load_hnsw()
                 .map_err(|e| Error::Index(format!("hnsw load: {e}")))?;
+            // The graph and the id map are written separately. If the graph
+            // holds fewer points than the map lists (an older graph file was
+            // loaded, see `newest_dump`), keep only the map entries the graph
+            // really has: the caller re-inserts the rest from the row store.
+            let mut id_map = meta.id_map;
+            let in_graph = hnsw.get_nb_point();
+            if in_graph < id_map.len() {
+                tracing::warn!(
+                    graph_points = in_graph,
+                    id_map = id_map.len(),
+                    "hnsw graph on disk is older than its id map; the missing vectors will be re-added from rows"
+                );
+                id_map.truncate(in_graph);
+            } else if in_graph > id_map.len() {
+                return Err(Error::Index(format!(
+                    "hnsw graph has {in_graph} points but its id map only {}",
+                    id_map.len()
+                )));
+            }
             tracing::info!(
                 dir = %dir.display(),
-                points = meta.next_internal,
+                basename = %basename,
+                points = id_map.len(),
                 "loaded hnsw from disk"
             );
             HnswInner {
                 hnsw: Graph::Rs(hnsw),
-                next_internal: meta.next_internal,
-                id_map: meta.id_map,
+                next_internal: id_map.len(),
+                id_map,
             }
         } else {
             HnswInner {
@@ -352,8 +372,23 @@ impl VectorIndex {
                 return Ok(true);
             }
         };
-        hnsw.file_dump(dir, HNSW_NAME)
+        // hnsw_rs does not overwrite the files a graph was loaded from: it
+        // writes `<name>-<random>.hnsw.*` instead and returns that name.
+        // Move the new files over the usual name, so the next open reads the
+        // graph that matches the id map written below (before this, every
+        // restart after the first reloaded the first dump).
+        let written = hnsw
+            .file_dump(dir, HNSW_NAME)
             .map_err(|e| Error::Index(format!("hnsw file_dump: {e}")))?;
+        if written != HNSW_NAME {
+            for ext in ["hnsw.graph", "hnsw.data"] {
+                std::fs::rename(
+                    dir.join(format!("{written}.{ext}")),
+                    dir.join(format!("{HNSW_NAME}.{ext}")),
+                )
+                .map_err(|e| Error::Index(format!("move hnsw dump {written}.{ext}: {e}")))?;
+            }
+        }
         let meta = PersistedMeta {
             dim: self.dim,
             next_internal: inner.next_internal,
@@ -507,6 +542,32 @@ impl Drop for VectorIndex {
             }
         }
     }
+}
+
+/// The basename of the newest complete `hnsw_rs` dump in `dir`: `duxx_hnsw`,
+/// or a `duxx_hnsw-<n>` that hnsw_rs wrote beside it when it would not
+/// overwrite the files it had loaded (stores written by 0.4.0-0.4.3).
+fn newest_dump(dir: &Path) -> Option<String> {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(base) = name.strip_suffix(".hnsw.graph") else {
+            continue;
+        };
+        if !(base == HNSW_NAME || base.starts_with(&format!("{HNSW_NAME}-"))) {
+            continue;
+        }
+        if !dir.join(format!("{base}.hnsw.data")).exists() {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+            best = Some((modified, base.to_string()));
+        }
+    }
+    best.map(|(_, b)| b)
 }
 
 /// Cosine similarity between two equal-length vectors.
@@ -667,6 +728,72 @@ mod tests {
             assert!(!hits.is_empty(), "loaded hnsw must be searchable");
             assert_eq!(hits[0].0, 10, "self id must come back top-1");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn second_restart_keeps_vectors_added_after_the_first() {
+        // hnsw_rs will not overwrite the files a graph was loaded from, so a
+        // reloaded index used to dump to `duxx_hnsw-<n>` and the next open read
+        // the first dump again, losing every vector added in between.
+        let dir = std::env::temp_dir().join(format!(
+            "duxx-vec-restarts-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut idx = VectorIndex::open(3, 100, &dir).unwrap();
+            idx.insert(1, vec![1.0, 0.0, 0.0]).unwrap();
+        }
+        {
+            let mut idx = VectorIndex::open(3, 100, &dir).unwrap();
+            assert_eq!(idx.len(), 1);
+            idx.insert(2, vec![0.0, 1.0, 0.0]).unwrap();
+            idx.insert(3, vec![0.0, 0.0, 1.0]).unwrap();
+        }
+        {
+            let idx = VectorIndex::open(3, 100, &dir).unwrap();
+            assert_eq!(
+                idx.len(),
+                3,
+                "vectors added after the first reload must survive"
+            );
+            assert_eq!(idx.search(&[0.0, 0.0, 1.0], 1)[0].0, 3);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_graph_with_newer_id_map_is_truncated_not_trusted() {
+        // A store already in the broken state: an old graph under the usual
+        // name and an id map that lists more points.
+        let dir = std::env::temp_dir().join(format!(
+            "duxx-vec-stale-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut idx = VectorIndex::open(3, 100, &dir).unwrap();
+            idx.insert(1, vec![1.0, 0.0, 0.0]).unwrap();
+        }
+        let meta = PersistedMeta {
+            dim: 3,
+            next_internal: 3,
+            id_map: vec![1, 2, 3],
+        };
+        std::fs::write(dir.join(META_FILE), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let idx = VectorIndex::open(3, 100, &dir).unwrap();
+        assert_eq!(
+            idx.len(),
+            1,
+            "ids the graph lacks are dropped so they get re-added"
+        );
+        assert!(idx.ids().contains(&1) && !idx.ids().contains(&3));
+        drop(idx);
         std::fs::remove_dir_all(&dir).ok();
     }
 
