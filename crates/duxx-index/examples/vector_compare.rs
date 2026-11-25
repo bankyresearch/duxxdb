@@ -72,7 +72,7 @@ fn main() {
     let docs = read_strings(&format!("{base}.docs"));
     let queries = read_strings(&format!("{base}.queries"));
     let data: Vec<Vec<f32>> = docs.iter().map(|d| embed(d, dim)).collect();
-    drop(docs);
+    // `docs` stays alive until the end: freeing it here would let the index reuse that heap and hide its size.
     let qv: Vec<Vec<f32>> = queries.iter().map(|q| embed(q, dim)).collect();
 
     let before = rss_bytes();
@@ -114,4 +114,5 @@ fn main() {
             lat[lat.len() * 9 / 10]
         );
     }
+    std::hint::black_box(&docs);
 }
